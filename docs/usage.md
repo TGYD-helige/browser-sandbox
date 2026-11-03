@@ -89,7 +89,7 @@ Stop the execution's automation workers first. Then submit takeover with an acti
 
 Use action op: frame to obtain a screenshot, targetId, origin, and frameRevision. pointer, text, and key consume that revision, require the matching target/origin and lease, and reject frames older than 30 seconds or from a changed document. Coordinates must fit the viewport. release returns control to automation; clients reconnect normally. Expired or uncertain control requires safe lifecycle recovery rather than silently resuming automation.
 
-Authenticated GET/PUT requests to the execution endpoint's /files/name suffix transfer files, with the same kernel UID check as CDP. Convert the ws: endpoint scheme to http:. Filenames are single-level ASCII names, uploads cannot overwrite, and files are limited to 16 MiB. PUT returns the browser-side absolute path for a CDP upload operation; downloads configured by the launcher land in this directory. Browser-owned links and non-regular files are rejected. Failed uploads may leave partial files until execution cleanup; use a new name for a retry. Finalization aborts active transfers before deleting the directory.
+Authenticated GET/PUT requests to the execution endpoint's /files/name suffix transfer files, with the same kernel UID check as CDP. Convert the ws: endpoint scheme to http:. Filenames are single-level ASCII names, uploads cannot overwrite, and files are limited to 16 MiB. PUT returns the browser-side absolute path for a CDP upload operation; downloads configured by the launcher land in this directory. Browser-owned links and non-regular files are rejected. Failed uploads may leave partial files until execution cleanup; use a new name for a retry. Downloads stream with backpressure and stay tracked until the HTTP response finishes or is cancelled. The runtime admits at most 16 simultaneous file transfers, returns 429 when full, and enforces a 30-second transfer deadline. Finalization aborts active transfers before deleting the directory.
 
 ## Settings
 
@@ -141,7 +141,7 @@ An optional allowedDomains list at registration restricts Chrome's hostname reso
 
 ## Run the client integration checks
 
-Runtime CI checks Biome, workflow formatting, TypeScript, and Linux tests on Node 22 and 24. Browser integration builds sandboxed AMD64 and ARM64 images and exercises the published Pi browser extension, DSH browser registry plus Chrome DevTools MCP provider, and OpenCode CLI with Chrome DevTools MCP against the runtime. Client checks verify a real browser form submission and live-page handoff rather than just a successful connection.
+Runtime CI checks Biome, workflow formatting, TypeScript, and Linux tests on Node 22 and 24. Browser integration builds sandboxed AMD64 and ARM64 images and exercises the published Pi browser extension, DSH browser registry plus Chrome DevTools MCP provider, OpenCode CLI with Chrome DevTools MCP, and the agent-browser CLI/daemon against the runtime. Client checks verify a real browser form submission and live-page handoff rather than just a successful connection.
 
 ```sh
 pnpm build
@@ -150,10 +150,22 @@ docker build -f Dockerfile.e2e -t browser-sandbox-e2e:local .
 node .github/scripts/e2e.mjs pi
 node .github/scripts/e2e.mjs dsh
 node .github/scripts/e2e.mjs opencode
+node .github/scripts/e2e.mjs agent-browser
 ```
 
 OpenCode runs its actual CLI and MCP tool loop in both modes. The secret-free tools check uses scripted OpenAI-compatible responses; the model check uses the configured provider. Both verify a zero-client handoff, renewal of the original browser generation, and form submission. Its test-only session MCP server exposes the same runtime session API used by the other harnesses.
 
+Each harness verifies real file upload and download bytes. The agent-browser job also checks screenshots, daemon reuse across CLI calls, daemon exit, and restart; it has no model step.
+
 The model jobs use `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and `OPENAI_MODEL_NAME`. Store the API key in a repository Actions secret; base URL and model name can be Actions variables or secrets. Model tests run on same-repository pull requests, master pushes, or a manual Browser integration dispatch with run_model enabled. Fork pull requests run without model secrets. Missing model configuration fails the model job explicitly. Local model runs use the same environment variables with `E2E_MODE=model`.
 
 For local plugin-contract checks against an installed Chrome, install the separately locked test dependencies with `pnpm --dir .github/scripts/e2e install --frozen-lockfile`, then use Node 24 to run `CHROME_EXECUTABLE=/absolute/path/to/chrome node .github/scripts/e2e-local.mjs`. This tests the current gateway and real Pi/DSH/OpenCode clients; it does not validate the Browserless container or Linux isolation.
+
+
+## Measure real browser lifecycle costs
+
+Image CI publishes `browser-performance-<runner>` JSON artifacts for AMD64 and ARM64. Each workload has three warmups and 20 measured samples: a temporary browser, a small encrypted remote Profile, and an 8 MiB IndexedDB Profile. The runner verifies restored data and real screenshots. It reports median/P95 and counts for registration, first browser readiness, finalization, and streaming archive HTTP transfers, together with the browser, Node, CPU, architecture, and container limits.
+
+First readiness includes the CDP client, archive restoration, Chrome startup, navigation, and screenshot. Finalization includes checkpoint, browser exit, archive/encryption, upload, and reference commit. Storage runs over local HTTP in the test namespace; these measurements do not establish production storage latency, an optimization speedup, or an agreed production performance threshold. `scripts/benchmark.mjs` remains a separate synthetic gateway diagnostic.
+
+To collect the image benchmark locally, build the image and run `BENCHMARK_OUTPUT=/tmp/browser-performance.json bash .github/scripts/verify-image.sh browser-sandbox:local`. Set `BENCHMARK_SAMPLES` between 10 and 100 to change the measured sample count.

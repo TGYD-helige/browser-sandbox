@@ -12,7 +12,15 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { sessionRequest } from "../../../dist/session.js";
-import { complete, fixture, HANDOFF_MS, inspect, pageId } from "./fixture.mjs";
+import {
+  complete,
+  fixture,
+  HANDOFF_MS,
+  inspect,
+  pageId,
+  prepareFiles,
+  uploadUid,
+} from "./fixture.mjs";
 
 const require = createRequire(import.meta.url);
 const cli = join(
@@ -30,6 +38,7 @@ if (modelMode)
     assert(process.env[key], `${key} is required`);
 const home = await mkdtemp(join(tmpdir(), "browser-opencode-"));
 const site = await fixture();
+const files = await prepareFiles(site, endpoint);
 let scripted;
 let plan = [];
 let step = 0;
@@ -46,7 +55,12 @@ try {
         let args = next?.[1];
         if (
           next &&
-          ["browser_evaluate_script", "browser_select_page"].includes(next[0])
+          [
+            "browser_evaluate_script",
+            "browser_select_page",
+            "browser_upload_file",
+            "browser_take_snapshot",
+          ].includes(next[0])
         ) {
           const pages = request.messages
             .filter((message) => message.role === "tool")
@@ -55,6 +69,16 @@ try {
           args = {
             ...args,
             pageId: pageId({ content: [{ type: "text", text: pages }] }, site.url),
+          };
+        }
+        if (next?.[0] === "browser_upload_file") {
+          const snapshot = request.messages
+            .filter((message) => message.role === "tool")
+            .map((message) => String(message.content))
+            .join("\n");
+          args = {
+            ...args,
+            uid: uploadUid({ content: [{ type: "text", text: snapshot }] }),
           };
         }
         const delta = next
@@ -154,6 +178,15 @@ try {
         ? [
             ["browser_new_page", { url: site.url }],
             ["browser_evaluate_script", { function: inspect }],
+            ["browser_take_snapshot", {}],
+            ["browser_upload_file", { filePaths: [files.path] }],
+            [
+              "browser_evaluate_script",
+              {
+                function:
+                  "() => { document.querySelector('#download').click(); return 'downloading'; }",
+              },
+            ],
             session("retain"),
           ]
         : [
@@ -168,7 +201,7 @@ try {
     step = 0;
     const prompt =
       phase === "retain"
-        ? `Open ${site.url} using browser_new_page, inspect the page using browser_take_snapshot, then call runtime_session action retain with durationMs ${HANDOFF_MS}. Finish this turn leaving the page unchanged for another agent.`
+        ? `Open ${site.url} using browser_new_page, inspect the page using browser_take_snapshot, upload ${files.path} through the Upload test file input using browser_upload_file, click Download test file, then call runtime_session action retain with durationMs ${HANDOFF_MS}. Finish this turn leaving the page unchanged for another agent.`
         : `First call runtime_session action status and then renew with durationMs ${HANDOFF_MS}. Use browser_list_pages and browser_select_page to find the existing page at ${site.url}. Read its displayed challenge, fill the Answer field, and click Finish using browser tools. Confirm Completed, then call runtime_session action release. Preserve the existing page until submission.`;
     let output;
     try {
@@ -247,8 +280,9 @@ try {
     }
   }
   await site.verify();
+  await files.verify();
   console.log(
-    `OpenCode ${process.env.E2E_MODE ?? "tools"}: real CLI, MCP browser tools, session handoff, and form submission passed`,
+    `OpenCode ${process.env.E2E_MODE ?? "tools"}: real CLI, MCP browser tools, session handoff, upload/download, and form submission passed`,
   );
 } finally {
   scripted?.closeAllConnections();

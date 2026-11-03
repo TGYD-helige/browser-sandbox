@@ -16,12 +16,15 @@ import {
   HANDOFF_MS,
   inspect,
   pageId,
+  prepareFiles,
+  transferFiles,
 } from "./fixture.mjs";
 
 const home = await mkdtemp(join(tmpdir(), "browser-dsh-"));
 process.env.DSH_HOME = home;
 const site = await fixture();
 const endpoint = process.env.BROWSER_WS_ENDPOINT;
+const files = await prepareFiles(site, endpoint);
 const resolveCore = createRequire(import.meta.resolve("@deepseek-ai/dsh-sdk-minimal"));
 const plugin = (name) => {
   try {
@@ -179,7 +182,7 @@ try {
       }
     };
     await phase(
-      `Call mcp__chrome-devtools-mcp__new_page to open ${site.url} and wait for success. Inspect that page. Then call browser_session action retain with durationMs ${HANDOFF_MS}. Verify retained state and finish this turn, leaving the original page ready for a handoff.`,
+      `Call mcp__chrome-devtools-mcp__new_page to open ${site.url} and wait for success. Inspect that page, use mcp__chrome-devtools-mcp__upload_file to upload ${files.path} through the Upload test file input, and click Download test file. Then call browser_session action retain with durationMs ${HANDOFF_MS}. Verify retained state and finish this turn, leaving the original page ready for a handoff.`,
     );
     assert(sessionCalls.some((call) => call.action === "retain"));
     const retained = await sessionRequest(endpoint);
@@ -211,6 +214,7 @@ try {
   } else {
     const opened = await call("new_page", { url: site.url });
     const id = pageId(opened, site.url);
+    await transferFiles(call, id, files);
     const before = evaluated(
       await call("evaluate_script", { pageId: id, function: inspect }),
     );
@@ -230,8 +234,9 @@ try {
     await sessionRequest(endpoint, "release");
   }
   await site.verify();
+  await files.verify();
   console.log(
-    `DSH ${process.env.E2E_MODE ?? "tools"}: real provider, browser tools, and form submission passed`,
+    `DSH ${process.env.E2E_MODE ?? "tools"}: real provider, browser tools, upload/download, and form submission passed`,
   );
 } finally {
   await handle?.dispose();

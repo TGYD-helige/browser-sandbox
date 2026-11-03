@@ -15,6 +15,8 @@ import {
   HANDOFF_MS,
   inspect,
   pageId,
+  prepareFiles,
+  transferFiles,
 } from "./fixture.mjs";
 
 const run = promisify(execFile);
@@ -23,6 +25,7 @@ process.env.PI_CODING_AGENT_DIR = home;
 process.env.PI_AGENT_HOME = home;
 const site = await fixture();
 const endpoint = process.env.BROWSER_WS_ENDPOINT;
+const files = await prepareFiles(site, endpoint);
 const config = {
   sessionMode: "existing",
   wsEndpoint: endpoint,
@@ -69,7 +72,7 @@ try {
     for (const phase of ["retain", "resume"]) {
       const prompt =
         phase === "retain"
-          ? `Use browser tools to open ${site.url}. Inspect its page, then call browser_session action retain and finish. Leave the page unchanged for the next agent.`
+          ? `Use browser tools to open ${site.url}. Inspect its page, upload the file at ${files.path} using browser_upload_file to the Upload test file input, and click Download test file. Then call browser_session action retain and finish. Leave the page unchanged for the next agent.`
           : `Call browser_session action status, find the existing page at ${site.url}, copy its displayed challenge into the Answer field, and click Finish using browser tools. Then call browser_session action release. Do not open a new challenge page or navigate before completing the form.`;
       let output;
       try {
@@ -97,7 +100,7 @@ try {
             "--no-builtin-tools",
             "--tools",
             phase === "retain"
-              ? "browser_list_pages,browser_new_page,browser_take_snapshot,browser_evaluate_script,browser_session"
+              ? "browser_list_pages,browser_new_page,browser_take_snapshot,browser_evaluate_script,browser_upload_file,browser_click,browser_session"
               : "browser_list_pages,browser_take_snapshot,browser_evaluate_script,browser_fill,browser_click,browser_session",
             "-p",
             prompt,
@@ -131,6 +134,7 @@ try {
           "browser_new_page",
           "browser_take_snapshot",
           "browser_evaluate_script",
+          "browser_upload_file",
           "browser_fill",
           "browser_click",
           "browser_session",
@@ -196,6 +200,7 @@ try {
       const opened = await client.callTool("new_page", { url: site.url });
       assert(!opened.isError);
       const id = pageId(opened, site.url);
+      await transferFiles((name, args) => client.callTool(name, args), id, files);
       const before = evaluated(
         await client.callTool("evaluate_script", { pageId: id, function: inspect }),
       );
@@ -242,8 +247,9 @@ try {
     }
   }
   await site.verify();
+  await files.verify();
   console.log(
-    `Pi ${process.env.E2E_MODE ?? "tools"}: real browser tools, session handoff, and form submission passed`,
+    `Pi ${process.env.E2E_MODE ?? "tools"}: real browser tools, session handoff, upload/download, and form submission passed`,
   );
 } finally {
   const client = new DevToolsClient(config);

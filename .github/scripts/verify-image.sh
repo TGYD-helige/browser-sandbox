@@ -26,3 +26,7 @@ docker exec -e PROFILE_ID=example/persistent "$container_id" node /opt/browser-s
 docker exec -e PROFILE_ID=example/persistent "$container_id" node /opt/browser-sandbox/examples/host.mjs
 
 docker exec "$container_id" node /opt/browser-sandbox/.github/scripts/image-smoke.mjs
+if [[ -n "${BENCHMARK_OUTPUT:-}" ]]; then
+  docker exec -e SAMPLES="${BENCHMARK_SAMPLES:-20}" "$container_id" \
+    node /opt/browser-sandbox/.github/scripts/benchmark-image.mjs > "$BENCHMARK_OUTPUT"
+fi

@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
 import WebSocket, { WebSocketServer } from "ws";
+import { connectCdp } from "../../dist/cdp.js";
 import { createGateway } from "../../dist/gateway.js";
 
 const executable = process.env.CHROME_EXECUTABLE;
@@ -20,7 +21,7 @@ const gateway = await createGateway({
   dataRoot: join(root, "data"),
   socketPath: join(root, "control.sock"),
   healthy: async () => true,
-  async launch({ profileDir, signal }) {
+  async launch({ profileDir, filesDir, signal }) {
     const child = spawn(
       executable,
       [
@@ -54,12 +55,18 @@ const gateway = await createGateway({
         }
       }
       if (!endpoint) throw Error("Local Chrome startup timed out");
+      const downloads = await connectCdp(endpoint);
+      await downloads.call("Browser.setDownloadBehavior", {
+        behavior: "allow",
+        downloadPath: filesDir,
+      });
       return {
         endpoint,
         closed: exited,
         async close() {
           child.kill("SIGTERM");
           await exited;
+          downloads.close();
           signal.removeEventListener("abort", abort);
         },
       };
@@ -73,9 +80,9 @@ const gateway = await createGateway({
 try {
   for (const harness of process.argv.slice(2).length
     ? process.argv.slice(2)
-    : ["pi", "dsh", "opencode"]) {
-    if (!["pi", "dsh", "opencode"].includes(harness))
-      throw Error("Choose pi, dsh, or opencode");
+    : ["pi", "dsh", "opencode", "agent-browser"]) {
+    if (!["pi", "dsh", "opencode", "agent-browser"].includes(harness))
+      throw Error("Choose pi, dsh, opencode, or agent-browser");
     const executionId = randomUUID();
     const { wsEndpoint } = await gateway.command({ op: "register", executionId });
     try {
@@ -99,7 +106,7 @@ try {
   const diagnostic = error.stderr
     ?.split("\n")
     .find((line) =>
-      /^E2E_FAILURE [A-Za-z]+ at (\.github\/scripts\/e2e\/(pi|dsh|opencode|session-mcp|fixture)\.mjs:\d+:\d+|unknown)$/.test(
+      /^E2E_FAILURE [A-Za-z]+ at (\.github\/scripts\/e2e\/(pi|dsh|opencode|agent-browser|session-mcp|fixture)\.mjs:\d+:\d+|unknown)$/.test(
         line,
       ),
     );

@@ -14,7 +14,10 @@ const run = (args, input) => {
   return work;
 };
 const harness = process.argv[2];
-assert(["pi", "dsh", "opencode"].includes(harness), "Choose pi, dsh, or opencode");
+assert(
+  ["pi", "dsh", "opencode", "agent-browser"].includes(harness),
+  "Choose pi, dsh, opencode, or agent-browser",
+);
 const mode = process.env.E2E_MODE ?? "tools";
 assert(["tools", "model"].includes(mode), "Choose tools or model");
 if (mode === "model")
@@ -138,7 +141,7 @@ try {
   const diagnostic = error.stderr
     ?.split("\n")
     .find((line) =>
-      /^E2E_FAILURE [A-Za-z]+ at (\.github\/scripts\/e2e\/(pi|dsh|opencode|session-mcp|fixture)\.mjs:\d+:\d+|unknown)$/.test(
+      /^E2E_FAILURE [A-Za-z]+ at (\.github\/scripts\/e2e\/(pi|dsh|opencode|agent-browser|session-mcp|fixture)\.mjs:\d+:\d+|unknown)$/.test(
         line,
       ),
     );
