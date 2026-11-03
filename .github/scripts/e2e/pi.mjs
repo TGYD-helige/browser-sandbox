@@ -28,6 +28,7 @@ const endpoint = process.env.BROWSER_WS_ENDPOINT;
 const files = await prepareFiles(site, endpoint);
 const config = {
   sessionMode: "existing",
+  toolProfile: "full",
   wsEndpoint: endpoint,
   session: { enabled: true, key: home, retentionMs: HANDOFF_MS },
 };
@@ -114,7 +115,10 @@ try {
         );
         task.child.stdin.end();
         output = (await task).stdout;
-      } catch {
+      } catch (error) {
+        console.error(
+          `E2E_TOOL_FAILURE ${phase} unknown ${error.killed ? "timeout" : "process_failed"}`,
+        );
         throw Error(`Pi model ${phase} failed; raw provider output withheld`);
       }
       const events = output
