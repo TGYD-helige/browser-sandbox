@@ -1,0 +1,86 @@
+<p align="center">
+  <img src="./preview.png" alt="browser-sandbox — One browser runtime. Any harness." width="100%" />
+</p>
+
+# browser-sandbox
+
+**One browser runtime. Any harness.**
+
+A shared browser runtime for AI agents, built on **Browserless + CloakBrowser Chromium**. The goal is to let Pi, DSH, Codex, and other CDP-compatible clients share reliable browser infrastructure while keeping their own tools and workflows.
+
+> **Status: planning.** This repository currently contains project guidance and the implementation specification. Runtime code, packages, images, and installation commands are not available yet. The capabilities below describe the target design, not a released feature set. Follow [issue #1](https://github.com/TGYD-helige/browser-sandbox/issues/1) for scope and acceptance criteria.
+
+## Why
+
+Agent harnesses need many of the same browser capabilities: isolated connections, reusable login state, predictable cleanup, and time to complete a human login. Reimplementing these in each harness creates duplicate lifecycle logic and inconsistent behavior.
+
+browser-sandbox brings that behavior into one runtime. Harnesses connect through standard Chrome DevTools Protocol (CDP); host adapters provide authorization and deployment integration. The core stays independent of model tool loops and platform business models.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    H["Pi / DSH / Codex / other CDP clients"]
+    R["browser-sandbox"]
+    B["Browserless"]
+    C["CloakBrowser Chromium"]
+    A["Trusted host adapter"]
+    S["Optional storage adapter"]
+
+    H <-->|"Standard CDP WebSocket"| R
+    A -->|"Authorization and lifecycle"| R
+    R --> B --> C
+    R <-->|"Profile restore and save"| S
+```
+
+| Layer | Responsibility |
+|---|---|
+| **Browserless** | Browser startup, concurrency, queueing, and total session timeouts |
+| **CloakBrowser** | Chromium binary and browser fingerprint defaults |
+| **browser-sandbox** | Execution-scoped access, Profile lifecycle, cancellation, reliable cleanup, and optional integrations |
+| **Host adapter** | Identity authorization, Profile mapping, execution isolation, deployment, and storage capabilities |
+| **Harness** | Browser tools, model interaction, and client-side session handling |
+
+## Planned capabilities
+
+| Area | Target behavior |
+|---|---|
+| **Standard CDP** | A separate authorized WebSocket endpoint for each execution |
+| **Lazy startup** | Start Chrome and prepare Profile data on first connection; unused browsers skip storage work |
+| **Resource control** | Bounded concurrency and queues, cancellation, timeouts, and idle reclamation |
+| **Profile reuse** | Temporary Profiles by default; optional stable profileId for persistent login state |
+| **Reliable shutdown** | Confirm process exit before Profile reuse; preserve recoverable data when saving fails |
+| **Persistent site data** | Native Profile data and persistent Cookie checkpoints, including deletion and expiry semantics |
+| **Optional remote storage** | Restore and save through a host-provided adapter without a platform SDK dependency |
+| **Live sessions** | Preserve running pages while clients maintain a connection, within the browser timeout |
+| **Human takeover** | Coordinate automation and human control with leases and stale-frame protection |
+| **Files and rendering** | Execution-scoped upload/download handling, screenshots, and Chinese/Emoji font support |
+
+## Profiles
+
+Execution identity and persistent browser identity are separate. The host authorizes access; knowing a profileId does not grant access to its data.
+
+| Configuration | During use | At execution end |
+|---|---|---|
+| No profileId | Create a temporary Profile | Close and remove temporary data |
+| profileId, no remote storage | Reuse a local persistent Profile | Close gracefully and retain the Profile |
+| profileId with remote storage | Restore the latest confirmed archive on demand | Save and confirm before releasing the execution copy |
+
+Only one execution may use a Profile at a time. Persistent data survives execution cleanup according to its storage configuration. Live page retention and cold Profile restoration are different: restoring site data does not restore an in-memory page or its JavaScript state.
+
+## Design principles
+
+- **Generic by default.** Express differences through data and adapters. Keep harness-, customer-, and workflow-specific branches out of the shared core.
+- **Small interfaces, clear ownership.** Keep browser lifecycle state inside the runtime and expose accurate outcomes to the host.
+- **Reuse before adding.** Build on Browserless and existing platform facilities; keep the implementation concise and readable.
+- **Pay for work when used.** Defer browser startup and storage work until needed; keep slow transfers off unrelated control paths.
+- **Preserve safety and data.** Keep sandboxing, authorization, cancellation, exclusive Profile access, and recoverable failure handling intact.
+
+## References
+
+- [Browserless](https://github.com/browserless/browserless) — upstream browser infrastructure used for startup, concurrency, queueing, and session timeouts.
+- [CloakBrowser](https://github.com/CloakHQ/CloakBrowser) — upstream project providing the Chromium integration and fingerprint defaults.
+
+## License
+
+The code in this repository is licensed under [MIT](./LICENSE). Browserless, CloakBrowser, and their browser binaries remain subject to their respective licenses. This repository's license does not grant rights to redistribute upstream binaries or operate an upstream-based hosted offering; verify the applicable terms for your distribution and deployment.
