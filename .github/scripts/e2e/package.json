@@ -19,7 +19,8 @@
   },
   "pnpm": {
     "onlyBuiltDependencies": [
-      "opencode-ai"
+      "opencode-ai",
+      "agent-browser"
     ]
   }
 }

@@ -27,7 +27,7 @@ const root = await mkdtemp(join(tmpdir(), "browser-e2e-"));
 const image = process.env.BROWSER_IMAGE ?? "browser-sandbox:local";
 let container, extraction, filesVolume;
 const executionId = randomUUID();
-const executionFiles = `/browser-data/${executionId}/files`;
+const executionFiles = `/tmp/browser-data/${executionId}/files`;
 const control = async (request) =>
   JSON.parse(
     (
@@ -79,6 +79,8 @@ try {
       "2g",
       "--mount",
       `type=volume,src=${filesVolume},dst=/browser-data`,
+      "--mount",
+      `type=volume,src=${filesVolume},dst=/tmp/browser-data`,
       image,
     ])
   ).stdout.trim();
@@ -123,6 +125,8 @@ try {
     `BROWSER_WS_ENDPOINT=${wsEndpoint}`,
     "-e",
     `E2E_MODE=${mode}`,
+    "-e",
+    `BROWSER_FILES_DIRECTORY=${executionFiles}`,
   ];
   if (mode === "model")
     for (const key of ["OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL_NAME"])

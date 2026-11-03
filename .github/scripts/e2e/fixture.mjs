@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createServer } from "node:http";
+import { basename, join } from "node:path";
 
 export async function fixture() {
   const challenge = randomUUID();
@@ -122,7 +123,9 @@ export async function prepareFiles(site, endpoint) {
   assert.equal(response.status, 201);
   const { path } = await response.json();
   return {
-    path,
+    path: process.env.BROWSER_FILES_DIRECTORY
+      ? join(process.env.BROWSER_FILES_DIRECTORY, basename(path))
+      : path,
     async verify() {
       await site.verifyFiles();
       for (let i = 0; i < 100; i++) {
