@@ -1,0 +1,14 @@
+ARG BROWSER_IMAGE=browser-sandbox:local
+FROM ${BROWSER_IMAGE} AS browser-runtime
+FROM node:24.22.1-bookworm-slim@sha256:be8204d4bd327363357f532187b752ff62759c31bedf98e9e18fc08c9cbd605c
+RUN npm install --global pnpm@10.28.2
+WORKDIR /project
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile --prod
+COPY .github/scripts/e2e/package.json .github/scripts/e2e/pnpm-lock.yaml ./.github/scripts/e2e/
+RUN pnpm --dir .github/scripts/e2e install --frozen-lockfile
+COPY --from=browser-runtime /opt/browser-sandbox/dist ./dist
+COPY .github/scripts/e2e/*.mjs ./.github/scripts/e2e/
+ENV HOME=/tmp/e2e
+USER 100001:100001
+ENTRYPOINT ["node"]

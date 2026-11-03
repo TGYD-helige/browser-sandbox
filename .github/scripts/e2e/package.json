@@ -1,0 +1,24 @@
+{
+  "name": "browser-sandbox-e2e",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@amaster.ai/pi-browser-use": "0.1.35",
+    "@deepseek-ai/dsh-app-boot": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-browser-use": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-experimental-browser-use-chrome-devtools-mcp": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-llm-pi-ai": "0.2.1-rc.5",
+    "@deepseek-ai/dsh-sdk-minimal": "0.2.1-rc.5",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "chrome-devtools-mcp": "1.9.0",
+    "opencode-ai": "1.19.5",
+    "yaml": "2.9.0",
+    "zod": "4.6.7"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "opencode-ai"
+    ]
+  }
+}

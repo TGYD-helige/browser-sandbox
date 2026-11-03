@@ -8,7 +8,7 @@
 
 A shared browser runtime for AI agents, built on **Browserless + CloakBrowser Chromium**. The goal is to let Pi, DSH, Codex, and other CDP-compatible clients share reliable browser infrastructure while keeping their own tools and workflows.
 
-> **Status: planning.** This repository currently contains project guidance and the implementation specification. Runtime code, packages, images, and installation commands are not available yet. The capabilities below describe the target design, not a released feature set. Follow [issue #1](https://github.com/TGYD-helige/browser-sandbox/issues/1) for scope and acceptance criteria.
+> **Status: development preview.** The standalone TypeScript runtime, lifecycle tests, host client, and container build are now present. This is not a published package or production release. See [usage](./docs/usage.md), and [issue #1](https://github.com/TGYD-helige/browser-sandbox/issues/1) for the contract and remaining acceptance work.
 
 ## Why
 
@@ -41,9 +41,9 @@ flowchart LR
 | **Host adapter** | Identity authorization, Profile mapping, execution isolation, deployment, and storage capabilities |
 | **Harness** | Browser tools, model interaction, and client-side session handling |
 
-## Planned capabilities
+## Runtime capabilities
 
-| Area | Target behavior |
+| Area | Behavior |
 |---|---|
 | **Standard CDP** | A separate authorized WebSocket endpoint for each execution |
 | **Lazy startup** | Start Chrome and prepare Profile data on first connection; unused browsers skip storage work |
@@ -52,7 +52,7 @@ flowchart LR
 | **Reliable shutdown** | Confirm process exit before Profile reuse; preserve recoverable data when saving fails |
 | **Persistent site data** | Native Profile data and persistent Cookie checkpoints, including deletion and expiry semantics |
 | **Optional remote storage** | Restore and save through a host-provided adapter without a platform SDK dependency |
-| **Live sessions** | Preserve running pages while clients maintain a connection, within the browser timeout |
+| **Live sessions** | Query, retain, renew, release, or stop the current browser; keep original pages across client disconnects within the hard timeout |
 | **Human takeover** | Coordinate automation and human control with leases and stale-frame protection |
 | **Files and rendering** | Execution-scoped upload/download handling, screenshots, and Chinese/Emoji font support |
 

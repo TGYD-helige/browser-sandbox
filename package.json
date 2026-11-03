@@ -1,0 +1,50 @@
+{
+  "name": "@amaster.ai/browser-sandbox",
+  "version": "0.1.0",
+  "description": "Shared Browserless and CloakBrowser runtime for agent harnesses",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.16"
+  },
+  "packageManager": "pnpm@10.28.2",
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "config",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "pnpm build && node --test tests/*.test.mjs",
+    "format": "biome check --write . && prettier --write .github/workflows",
+    "lint": "biome check . --diagnostic-level=warn && prettier --check .github/workflows",
+    "start": "node dist/main.js",
+    "docker:build": "docker build -t browser-sandbox:local .",
+    "test:image": "bash .github/scripts/verify-image.sh browser-sandbox:local",
+    "test:linux": "docker build -f Dockerfile.test -t browser-sandbox-tests:local . && docker run --rm --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID browser-sandbox-tests:local",
+    "test:e2e": "node .github/scripts/e2e.mjs",
+    "test:e2e:local": "node .github/scripts/e2e-local.mjs"
+  },
+  "dependencies": {
+    "tar-stream": "3.2.2",
+    "ws": "8.22.1"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.4",
+    "@types/node": "22.20.5",
+    "@types/tar-stream": "3.1.5",
+    "@types/ws": "8.18.2",
+    "playwright-core": "1.64.1",
+    "prettier": "3.9.10",
+    "typescript": "5.9.3"
+  },
+  "bin": {
+    "browser-session": "./dist/session-cli.js"
+  }
+}

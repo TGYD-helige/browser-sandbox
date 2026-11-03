@@ -14,14 +14,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
-      # Read metadata only; never check out or execute code from the pull request.
+      # Execute only the trusted base-commit script; PR code is never loaded.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/validate-pr-title.sh
+          sparse-checkout-cone-mode: false
       - name: Validate Conventional Commit title
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
-        shell: bash
-        run: |
-          pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?(!)?: [^[:space:]].*$'
-          if [[ ! "$PR_TITLE" =~ $pattern ]]; then
-            echo '::error::Use a Conventional Commit title, for example: feat(browser): support persistent profiles'
-            exit 1
-          fi
+        run: bash .github/scripts/validate-pr-title.sh
