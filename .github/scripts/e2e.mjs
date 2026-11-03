@@ -78,7 +78,7 @@ try {
       "--memory",
       "2g",
       "--mount",
-      `type=volume,src=${filesVolume},dst=${executionFiles}`,
+      `type=volume,src=${filesVolume},dst=/browser-data`,
       image,
     ])
   ).stdout.trim();
@@ -116,7 +116,7 @@ try {
     "--memory",
     "2g",
     "--mount",
-    `type=volume,src=${filesVolume},dst=${executionFiles},readonly`,
+    `type=volume,src=${filesVolume},volume-subpath=${executionId}/files,dst=${executionFiles},readonly`,
     "--tmpfs",
     "/tmp:rw,size=256m,mode=1777",
     "-e",
