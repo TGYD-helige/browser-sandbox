@@ -2,7 +2,7 @@ import "./diagnostics.mjs";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, stat } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -35,6 +35,7 @@ const call = async (...args) => {
   try {
     output = (await work).stdout;
   } catch {
+    console.error(`E2E_TOOL_FAILURE files browser_cli_${args[0]} unclassified`);
     throw Error(`agent_browser_${args[0]}_failed`);
   }
   const result = JSON.parse(output);
@@ -50,9 +51,7 @@ try {
   const screenshot = join(home, "page.png");
   await call("screenshot", screenshot);
   assert((await stat(screenshot)).size > 0);
-  const upload = join(home, "upload.txt");
-  await writeFile(upload, site.uploadBody);
-  await call("upload", "input[type=file]", upload);
+  await call("upload", "input[type=file]", files.path);
   await call("click", "#download");
   await files.verify();
   const after = await call("eval", `(${inspect})()`);

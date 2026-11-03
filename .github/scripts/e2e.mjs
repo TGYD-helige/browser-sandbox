@@ -25,8 +25,9 @@ if (mode === "model")
     assert(process.env[key], `${key} is required`);
 const root = await mkdtemp(join(tmpdir(), "browser-e2e-"));
 const image = process.env.BROWSER_IMAGE ?? "browser-sandbox:local";
-let container, extraction;
+let container, extraction, filesVolume;
 const executionId = randomUUID();
+const executionFiles = `/browser-data/${executionId}/files`;
 const control = async (request) =>
   JSON.parse(
     (
@@ -45,6 +46,7 @@ const control = async (request) =>
     ).stdout,
   );
 try {
+  filesVolume = (await run(["volume", "create"])).stdout.trim();
   extraction = (await run(["create", image])).stdout.trim();
   await run([
     "cp",
@@ -75,6 +77,8 @@ try {
       "512m",
       "--memory",
       "2g",
+      "--mount",
+      `type=volume,src=${filesVolume},dst=${executionFiles}`,
       image,
     ])
   ).stdout.trim();
@@ -111,6 +115,8 @@ try {
     "no-new-privileges",
     "--memory",
     "2g",
+    "--mount",
+    `type=volume,src=${filesVolume},dst=${executionFiles},readonly`,
     "--tmpfs",
     "/tmp:rw,size=256m,mode=1777",
     "-e",
@@ -133,7 +139,7 @@ try {
   const toolFailure = error.stderr
     ?.split("\n")
     .find((line) =>
-      /^E2E_TOOL_FAILURE (retain|resume) (browser_[a-z_]+|unknown) [a-z0-9_,]+$/.test(
+      /^E2E_TOOL_FAILURE (retain|resume|files) (browser_[a-z_]+|unknown) [a-z0-9_,]+$/.test(
         line,
       ),
     );
@@ -155,5 +161,6 @@ try {
 } finally {
   if (container) await run(["rm", "-f", container]);
   if (extraction) await run(["rm", "-f", extraction]);
+  if (filesVolume) await run(["volume", "rm", filesVolume]);
   await rm(root, { recursive: true, force: true });
 }
