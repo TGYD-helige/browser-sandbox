@@ -1,11 +1,22 @@
 import { randomBytes } from "node:crypto";
-import { once } from "node:events";
-import { setTimeout as delay } from "node:timers/promises";
+import timers from "node:timers/promises";
 import { createCookieStore } from "./cookies.js";
 import {
   BrowserCleanupUnconfirmed,
   VerifiedBrowserCheckpointFailure,
 } from "./lifecycle-errors.js";
+
+async function waitForExit(exited: Promise<unknown>, timeoutMs: number) {
+  const timer = new AbortController();
+  try {
+    return await Promise.race([
+      exited.then(() => true),
+      timers.setTimeout(timeoutMs, false, { signal: timer.signal }),
+    ]);
+  } finally {
+    timer.abort();
+  }
+}
 
 async function requestNativeClose(WebSocket, endpoint) {
   return new Promise<void>((resolve) => {
@@ -71,7 +82,7 @@ export function createBrowserLauncher({
             entry.child.signalCode === null
           ) {
             await requestNativeClose(WebSocket, browser.wsEndpoint());
-            await Promise.race([entry.exited.promise, delay(15000)]);
+            await waitForExit(entry.exited.promise, 15000);
           }
         })());
       if (entry.sessionBoundary) {
@@ -208,14 +219,15 @@ export function createBrowserLauncher({
           await entry.starting?.catch(() => null);
           const child = entry.child;
           if (child && child.exitCode === null && child.signalCode === null) {
-            const exited = once(child, "exit");
+            const exited = entry.exited.promise;
             // Browserless owns normal shutdown; retain the existing bounded process-exit fallback.
-            await Promise.race([exited, delay(sessionBoundary ? 15000 : 5000)]);
+            await waitForExit(exited, sessionBoundary ? 15000 : 5000);
             if (child.exitCode === null && child.signalCode === null) {
               entry.forcedStop = true;
               child.kill("SIGKILL");
             }
-            await exited;
+            const confirmed = await waitForExit(exited, 5000);
+            if (!confirmed) throw Error("browser_process_exit_unconfirmed");
           }
           launches.delete(trackingId);
           try {
@@ -250,6 +262,8 @@ export function createBrowserLauncher({
             throw new BrowserCleanupUnconfirmed(error);
           })
           .finally(async () => {
+            if (entry.child?.exitCode === null && entry.child?.signalCode === null)
+              return;
             await entry.downloadSession?.detach().catch(() => {});
             entry.downloadSession = null;
           }));

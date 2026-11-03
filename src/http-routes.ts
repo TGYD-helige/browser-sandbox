@@ -1,5 +1,6 @@
 import { transferFile } from "./files.js";
 export function createHttpHandler({ executions, resolvePeerUid, healthy }) {
+  let activeFileTransfers = 0;
   async function authorize(capability, socket) {
     const entry = executions.resolve(capability);
     if (
@@ -80,7 +81,16 @@ export function createHttpHandler({ executions, resolvePeerUid, healthy }) {
           res.end();
           return;
         }
-        const cancel = () => req.destroy();
+        if (activeFileTransfers >= 16) {
+          res.writeHead(429);
+          res.end();
+          return;
+        }
+        activeFileTransfers++;
+        const cancel = () => {
+          req.destroy();
+          res.destroy();
+        };
         entry.lifetime.signal.addEventListener("abort", cancel, { once: true });
         const transfer = transferFile(
           entry.filesDir,
@@ -93,6 +103,7 @@ export function createHttpHandler({ executions, resolvePeerUid, healthy }) {
         try {
           await transfer;
         } finally {
+          activeFileTransfers--;
           entry.fileTransfers.delete(transfer);
           entry.lifetime.signal.removeEventListener("abort", cancel);
         }

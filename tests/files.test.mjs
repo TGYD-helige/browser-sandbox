@@ -1,11 +1,61 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtemp, rm, symlink } from "node:fs/promises";
-import { createServer } from "node:http";
+import { mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { createServer, get } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { transferFile } from "../dist/files.js";
+
+test("slow downloads stay bounded and tracked until finish or cancellation", async () => {
+  const root = await mkdtemp(join(tmpdir(), "browser-slow-files-"));
+  const bytes = Buffer.alloc(16 * 1024 * 1024, 0x61);
+  await writeFile(join(root, "large.bin"), bytes);
+  let finished = false,
+    outgoing,
+    transfer;
+  const server = createServer((req, res) => {
+    outgoing = res;
+    transfer = transferFile(root, process.getuid(), "large.bin", req, res).then(() => {
+      finished = true;
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  let request;
+  try {
+    const response = await new Promise((resolve, reject) => {
+      request = get(
+        `http://127.0.0.1:${server.address().port}/large.bin`,
+        { agent: false },
+        resolve,
+      );
+      request.on("error", reject);
+    });
+    response.pause();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(
+      finished,
+      false,
+      "returning before HTTP finish loses cancellation and the deadline",
+    );
+    assert(
+      outgoing.writableLength <= 128 * 1024,
+      "backpressure must bound queued file bytes",
+    );
+    const closed = once(response, "close");
+    response.destroy();
+    await closed;
+    await transfer;
+    assert.equal(finished, true);
+    assert.equal(response.complete, false);
+  } finally {
+    request?.destroy();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("file transfer round-trips bytes and refuses traversal, overwrite, and links", async () => {
   const root = await mkdtemp(join(tmpdir(), "browser-files-"));
@@ -21,6 +71,11 @@ test("file transfer round-trips bytes and refuses traversal, overwrite, and link
       201,
     );
     assert.equal(await (await fetch(base + "/fixture.txt")).text(), "payload");
+    assert.equal(
+      (await fetch(base + "/empty.txt", { method: "PUT", body: "" })).status,
+      201,
+    );
+    assert.equal(await (await fetch(base + "/empty.txt")).text(), "");
     assert.equal(
       (await fetch(base + "/fixture.txt", { method: "PUT", body: "replace" })).status,
       409,

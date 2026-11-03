@@ -240,6 +240,44 @@ test("a failed startup cannot claim retirement when process termination throws",
   }
 });
 
+test("SIGKILL without an exit event has a bounded unconfirmed outcome", {
+  timeout: 2000,
+}, async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const f = fixture();
+  const pending = f.start(new AbortController().signal);
+  const starting = f.browserManager.getBrowserForRequest(f.req(0));
+  const browser = f.browser();
+  const signals = [];
+  browser.process().kill = (signal) => {
+    signals.push(signal);
+    return true;
+  };
+  f.requests[0].resolve(browser);
+  await starting;
+  f.sockets[0].emit("open");
+  const handle = await pending;
+  const closed = handle.close();
+  closed.catch(() => {});
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    t.mock.timers.tick(5000);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(signals, ["SIGKILL"]);
+    t.mock.timers.tick(5000);
+    await assert.rejects(closed, (error) => error instanceof BrowserCleanupUnconfirmed);
+    assert.equal(browser.process().exitCode, null);
+    assert.equal(browser.process().signalCode, null);
+    await assert.rejects(
+      handle.close(),
+      (error) => error instanceof BrowserCleanupUnconfirmed,
+    );
+  } finally {
+    browser.exit();
+    t.mock.timers.reset();
+  }
+});
+
 for (const cause of ["timeout", "crash"])
   test(`launcher reports ${cause} without an attached MCP client`, async () => {
     const f = fixture();

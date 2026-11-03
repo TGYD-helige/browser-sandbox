@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, get } from "node:http";
 import { createRequire } from "node:module";
 import { connect as connectSocket } from "node:net";
 import { tmpdir } from "node:os";
@@ -68,6 +68,58 @@ async function connect(endpoint) {
   assert.equal(String((await reply)[0]), "hi");
   return socket;
 }
+
+test("file transfer admission stays occupied for slow clients and finish cancels them", {
+  timeout: 10000,
+}, async () => {
+  const f = await fixture(async () => {
+    throw Error("must not launch");
+  });
+  const clients = [];
+  try {
+    const { wsEndpoint } = await f.gateway.command({
+      op: "register",
+      executionId: ids[0],
+    });
+    const url = wsEndpoint.replace(/^ws:/, "http:") + "/files/large.bin";
+    assert.equal(
+      (await fetch(url, { method: "PUT", body: Buffer.alloc(16 * 1024 * 1024) }))
+        .status,
+      201,
+    );
+    for (let i = 0; i < 16; i++) {
+      const response = await new Promise((resolve, reject) => {
+        const request = get(url, { agent: false }, resolve);
+        clients.push(request);
+        request.on("error", reject);
+      });
+      response.on("error", () => {});
+      response.pause();
+      assert.equal(response.statusCode, 200);
+      clients.push(response);
+    }
+    const denied = await fetch(url);
+    assert.equal(denied.status, 429);
+    await denied.arrayBuffer();
+    const closed = clients
+      .filter((client) => "statusCode" in client)
+      .map((response) => new Promise((resolve) => response.once("close", resolve)));
+    await f.gateway.command({ op: "finish", executionId: ids[0] }, true);
+    for (const response of clients.filter((client) => "statusCode" in client))
+      response.resume();
+    await Promise.all(closed);
+    for (const response of clients.filter((client) => "statusCode" in client))
+      assert.equal(response.complete, false);
+    const next = await f.gateway.command({ op: "register", executionId: ids[1] });
+    assert.equal(
+      (await fetch(next.wsEndpoint.replace(/^ws:/, "http:") + "/files/missing")).status,
+      404,
+    );
+  } finally {
+    for (const client of clients) client.destroy();
+    await f.stop();
+  }
+});
 
 test("generic finalization commits a remote archive before releasing its Profile", async () => {
   const events = [];

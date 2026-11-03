@@ -2,6 +2,7 @@ import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
+import { finished, pipeline } from "node:stream/promises";
 
 export const MAX_FILE_BYTES = 16 * 1024 * 1024;
 
@@ -23,7 +24,10 @@ export async function transferFile(
     response.end();
     return;
   }
-  const deadline = setTimeout(() => request.destroy(), 30_000);
+  const deadline = setTimeout(() => {
+    request.destroy();
+    response.destroy();
+  }, 30_000);
   let file: Awaited<ReturnType<typeof open>>;
   try {
     file = await open(
@@ -47,30 +51,29 @@ export async function transferFile(
       }
       if (process.getuid?.() === 0) await file.chown(uid, uid);
       response.writeHead(201, { "content-type": "application/json" });
+      const sent = finished(response, { cleanup: true });
       response.end(
         JSON.stringify({ name, path: join(directory, name), byteSize: size }),
       );
+      await sent;
     } else {
-      const chunks: Buffer[] = [];
-      let size = 0;
-      for await (const chunk of file.createReadStream({ autoClose: false })) {
-        size += chunk.length;
-        if (size > MAX_FILE_BYTES) throw Error("browser_file_too_large");
-        chunks.push(chunk);
-      }
-      const body = Buffer.concat(chunks);
+      response.strictContentLength = true;
       response.writeHead(200, {
         "content-type": "application/octet-stream",
-        "content-length": body.length,
+        "content-length": stat.size,
       });
-      response.end(body);
+      await pipeline(
+        file.createReadStream({ autoClose: false, end: Math.max(0, stat.size - 1) }),
+        response,
+      );
     }
   } catch (error) {
-    if (!response.headersSent)
+    if (!response.headersSent && !response.destroyed) {
       response.writeHead(
         error.code === "ENOENT" ? 404 : error.code === "EEXIST" ? 409 : 400,
       );
-    response.end();
+      response.end();
+    } else response.destroy();
   } finally {
     clearTimeout(deadline);
     await file?.close();
