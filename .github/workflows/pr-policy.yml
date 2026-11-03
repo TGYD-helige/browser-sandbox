@@ -1,0 +1,27 @@
+name: PR policy
+
+on:
+  pull_request_target:
+    branches: [master]
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+jobs:
+  title:
+    name: PR title
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      # Read metadata only; never check out or execute code from the pull request.
+      - name: Validate Conventional Commit title
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        shell: bash
+        run: |
+          pattern='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?(!)?: [^[:space:]].*$'
+          if [[ ! "$PR_TITLE" =~ $pattern ]]; then
+            echo '::error::Use a Conventional Commit title, for example: feat(browser): support persistent profiles'
+            exit 1
+          fi

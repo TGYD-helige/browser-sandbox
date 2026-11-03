@@ -84,6 +84,10 @@ When editing agent instructions, skills, tool descriptions, or model-facing prom
 - Keep Markdown prose paragraphs on one source line. Write repository documentation and all authored GitHub content in English, including issue/PR titles, bodies, comments, and reviews; preserve exact source quotations and logs when needed.
 - Follow repository issue/PR templates when present. Describe the concrete behavior change, reason, compatibility impact, and verification without unrelated cleanup.
 
+## Pull requests
+
+Target `master` and use [.github/pull_request_template.md](.github/pull_request_template.md). Titles follow Conventional Commits, for example `fix(gateway): cancel disconnected requests`. Keep the title, description, and review discussion in English. Merge through a PR after the required title check, one independent approval, and resolution of review conversations. New commits invalidate previous approvals. Use squash merge for one coherent commit per PR; branch protection also applies to administrators. Add build/test gates when the corresponding tooling exists.
+
 ## Instruction ownership
 
 This file is the shared source of repository guidance. CLAUDE.md imports it; update these rules here so harness instructions stay consistent.
