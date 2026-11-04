@@ -128,6 +128,8 @@ try {
     "-e",
     `E2E_MODE=${mode}`,
     "-e",
+    "E2E_SCENARIO",
+    "-e",
     `BROWSER_FILES_DIRECTORY=${executionFiles}`,
   ];
   if (mode === "model")
