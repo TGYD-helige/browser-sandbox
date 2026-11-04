@@ -148,10 +148,18 @@ try {
       p95Ms: sorted[Math.ceil(sorted.length * 0.95) - 1],
     };
   };
+  const phases = Object.fromEntries(
+    Object.entries(durations).map(([name, values]) => [name, summary(values)]),
+  );
+  const limitMs = phases.ordinary.p95Ms * 1.25 + 25;
+  const passed = phases.managed.p95Ms <= limitMs;
   console.log(
     JSON.stringify(
       {
         harness: "Pi",
+        budget: "managed P95 <= ordinary P95 * 1.25 + 25 ms",
+        limitMs,
+        passed,
         node: process.version,
         architecture: process.arch,
         samples,
@@ -166,6 +174,7 @@ try {
       2,
     ),
   );
+  if (!passed) process.exitCode = 1;
 } finally {
   server.closeAllConnections();
   await new Promise((resolve) => server.close(resolve));

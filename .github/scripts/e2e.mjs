@@ -145,6 +145,16 @@ try {
   await control({ op: "finalize", executionId });
   console.log(`${harness} ${mode}: host finalization passed`);
 } catch (error) {
+  if (harness === "unused" && process.env.PERFORMANCE_OUTPUT && error.stdout) {
+    try {
+      await writeFile(
+        process.env.PERFORMANCE_OUTPUT,
+        JSON.stringify(JSON.parse(error.stdout), null, 2),
+      );
+    } catch {
+      /* Preserve only valid benchmark JSON. */
+    }
+  }
   const toolFailure = error.stderr
     ?.split("\n")
     .find((line) =>

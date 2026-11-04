@@ -74,7 +74,7 @@ jobs:
         env:
           PERFORMANCE_OUTPUT: unused-harness-performance.json
       - uses: actions/upload-artifact@v4
-        if: matrix.harness == 'unused'
+        if: always() && matrix.harness == 'unused'
         with:
           name: unused-harness-performance
           path: unused-harness-performance.json
