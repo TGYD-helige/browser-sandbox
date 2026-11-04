@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -15,8 +15,8 @@ const run = (args, input) => {
 };
 const harness = process.argv[2];
 assert(
-  ["pi", "dsh", "opencode", "agent-browser"].includes(harness),
-  "Choose pi, dsh, opencode, or agent-browser",
+  ["pi", "dsh", "opencode", "agent-browser", "unused"].includes(harness),
+  "Choose pi, dsh, opencode, agent-browser, or unused",
 );
 const mode = process.env.E2E_MODE ?? "tools";
 assert(["tools", "model"].includes(mode), "Choose tools or model");
@@ -136,7 +136,12 @@ try {
     "browser-sandbox-e2e:local",
     `/project/.github/scripts/e2e/${harness}.mjs`,
   ]);
-  process.stdout.write(result.stdout);
+  if (harness === "unused" && process.env.PERFORMANCE_OUTPUT)
+    await writeFile(
+      process.env.PERFORMANCE_OUTPUT,
+      JSON.stringify(JSON.parse(result.stdout), null, 2),
+    );
+  else process.stdout.write(result.stdout);
   await control({ op: "finalize", executionId });
   console.log(`${harness} ${mode}: host finalization passed`);
 } catch (error) {

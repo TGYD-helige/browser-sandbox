@@ -7,6 +7,10 @@ on:
     branches: [master]
   workflow_dispatch:
     inputs:
+      baseline_ref:
+        description: Baseline commit for paired performance measurement
+        type: string
+        default: master
       run_model:
         description: Run Pi, DSH, and OpenCode model-driven browser tests (requires OPENAI secrets)
         type: boolean
@@ -33,21 +37,25 @@ jobs:
         with:
           persist-credentials: false
       - run: docker build -t browser-sandbox:local .
-      - run: bash .github/scripts/verify-image.sh browser-sandbox:local
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bash .github/scripts/benchmark-pair.sh "$BASE_REF" "performance-${{ matrix.runner }}"
         env:
-          BENCHMARK_OUTPUT: benchmark-${{ matrix.runner }}.json
+          BASE_REF: ${{ inputs.baseline_ref || github.event.pull_request.base.sha || github.event.before }}
       - uses: actions/upload-artifact@v4
         with:
           name: browser-performance-${{ matrix.runner }}
-          path: benchmark-${{ matrix.runner }}.json
+          path: performance-${{ matrix.runner }}/*.json
           if-no-files-found: error
+        if: always()
 
   harness:
     name: ${{ matrix.harness }} browser E2E
     strategy:
       fail-fast: false
       matrix:
-        harness: [pi, dsh, opencode, agent-browser]
+        harness: [pi, dsh, opencode, agent-browser, unused]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -63,9 +71,17 @@ jobs:
       - run: docker build -t browser-sandbox:local .
       - run: docker build -f Dockerfile.e2e -t browser-sandbox-e2e:local .
       - run: node .github/scripts/e2e.mjs ${{ matrix.harness }}
+        env:
+          PERFORMANCE_OUTPUT: unused-harness-performance.json
+      - uses: actions/upload-artifact@v4
+        if: matrix.harness == 'unused'
+        with:
+          name: unused-harness-performance
+          path: unused-harness-performance.json
+          if-no-files-found: error
 
       - name: Model-driven browser handoff
-        if: matrix.harness != 'agent-browser' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_model) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+        if: matrix.harness != 'agent-browser' && matrix.harness != 'unused' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_model) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           E2E_MODE: model
           OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}

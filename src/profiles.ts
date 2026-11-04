@@ -16,9 +16,10 @@ const tar = () => require("tar-stream");
 export const MAX_ARCHIVE_BYTES = 256 * 1024 * 1024;
 const MAX_PROFILE_BYTES = 512 * 1024 * 1024;
 const MAX_FILES = 100000;
-const version = () =>
+const version = (signal?: AbortSignal) =>
   promisify(execFile)("/opt/google/chrome/chrome", ["--version"], {
     timeout: 10_000,
+    signal,
     maxBuffer: 4096,
   }).then((r) => r.stdout.trim());
 function compatibleVersion(saved, current) {
@@ -36,9 +37,9 @@ function compatibleVersion(saved, current) {
   }
   return true;
 }
-const digest = async (file) => {
+const digest = async (file, signal?: AbortSignal) => {
   const hash = createHash("sha256");
-  for await (const chunk of createReadStream(file)) hash.update(chunk);
+  for await (const chunk of createReadStream(file, { signal })) hash.update(chunk);
   return hash.digest("hex");
 };
 const transient = (name) =>
@@ -67,12 +68,14 @@ function safeName(name) {
     (name === "profile" || name.startsWith("profile/") || name === "cookies.json")
   );
 }
-async function extract(plain, root, uid, gid = uid) {
+async function extract(plain, root, uid, gid = uid, signal?: AbortSignal) {
   const unpack = tar().extract();
   let bytes = 0,
     count = 0;
+  let pending: Promise<void>;
   unpack.on("entry", (header, stream, next) => {
-    (async () => {
+    pending = (async () => {
+      signal?.throwIfAborted();
       if (
         !safeName(header.name) ||
         !["file", "directory"].includes(header.type) ||
@@ -93,37 +96,54 @@ async function extract(plain, root, uid, gid = uid) {
         stream.resume();
       } else {
         await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-        await pipeline(stream, createWriteStream(target, { flags: "wx", mode: 0o600 }));
+        await pipeline(
+          stream,
+          createWriteStream(target, { flags: "wx", mode: 0o600 }),
+          { signal },
+        );
       }
+      signal?.throwIfAborted();
       next();
     })().catch((error) => unpack.destroy(error));
   });
-  await pipeline(createReadStream(plain), unpack);
+  try {
+    await pipeline(createReadStream(plain), unpack, { signal });
+  } finally {
+    // Drain an in-flight filesystem operation before releasing Profile ownership.
+    await pending;
+  }
   // Keep the new Profile root private until all descendants have been processed.
   async function own(dir) {
     for (const item of await fs.readdir(dir, { withFileTypes: true })) {
+      signal?.throwIfAborted();
       const file = path.join(dir, item.name);
       if (item.isDirectory()) await own(file);
+      signal?.throwIfAborted();
       await fs.chown(file, uid, gid);
     }
   }
   await own(path.join(root, "profile"));
+  signal?.throwIfAborted();
   await fs.chown(path.join(root, "profile"), uid, gid);
 }
-async function pack(root, output) {
+async function pack(root, output, signal?: AbortSignal) {
   const archive = tar().pack();
   const writing = pipeline(
     archive,
     bounded(MAX_PROFILE_BYTES + 64 * 1024 * 1024),
     createWriteStream(output, { flags: "wx", mode: 0o600 }),
+    { signal },
   );
+  writing.catch(() => {});
   let bytes = 0,
     count = 0;
   async function visit(relative) {
+    signal?.throwIfAborted();
     if (transient(relative)) return;
     if (!safeName(relative)) throw Error("browser_profile_entry_unsafe");
     const absolute = path.join(root, relative),
       stat = await fs.lstat(absolute);
+    signal?.throwIfAborted();
     if (
       ++count > MAX_FILES ||
       (!stat.isFile() && !stat.isDirectory()) ||
@@ -146,7 +166,7 @@ async function pack(root, output) {
         size: stat.size,
         mode: 0o600,
       });
-      await pipeline(createReadStream(absolute), entry);
+      await pipeline(createReadStream(absolute), entry, { signal });
     }
   }
   try {
@@ -167,15 +187,17 @@ export function createProfileArchive({
   browserVersion = version,
   fetchImpl = fetch,
 }: {
-  browserVersion?: () => Promise<string>;
+  browserVersion?: (signal?: AbortSignal) => Promise<string>;
   fetchImpl?: (input: any, init?: any) => Promise<Response>;
 } = {}) {
   return {
     async restore(entry, archive, signal) {
+      signal?.throwIfAborted();
       if (archive?.error) throw Error("browser_profile_source_unavailable");
       const seed = archive.seed,
-        currentVersion = await browserVersion(),
+        currentVersion = await browserVersion(signal),
         root = entry.journalDir;
+      signal?.throwIfAborted();
       entry.previousSha256 = seed?.sha256 ?? null;
       if (
         seed &&
@@ -213,7 +235,7 @@ export function createProfileArchive({
           );
           if (
             (await fs.stat(encrypted)).size !== seed.byteSize ||
-            (await digest(encrypted)) !== seed.sha256
+            (await digest(encrypted, signal)) !== seed.sha256
           )
             throw Error("browser_profile_digest_mismatch");
           const decipher = createDecipheriv(
@@ -234,11 +256,12 @@ export function createProfileArchive({
         signal?.throwIfAborted();
         await fs.rm(entry.profileDir, { recursive: true, force: true });
         await fs.rm(path.join(root, "cookies.json"), { force: true });
-        if (seed) await extract(plain, root, entry.uid, entry.gid);
+        if (seed) await extract(plain, root, entry.uid, entry.gid, signal);
         else {
           await fs.mkdir(entry.profileDir, { mode: 0o700 });
           await fs.chown(entry.profileDir, entry.uid, entry.gid ?? entry.uid);
         }
+        signal?.throwIfAborted();
         entry.profileVersion = currentVersion;
       } catch {
         throw Error("browser_profile_restore_failed");
@@ -258,8 +281,8 @@ export function createProfileArchive({
         signal?.throwIfAborted();
         await fs.rm(plain, { force: true });
         await fs.rm(encrypted, { force: true });
-        await clearWindowState(entry.profileDir);
-        await pack(root, plain);
+        await clearWindowState(entry.profileDir, signal);
+        await pack(root, plain, signal);
         const iv = randomBytes(12),
           cipher = createCipheriv("aes-256-gcm", Buffer.from(target.key, "hex"), iv);
         cipher.setAAD(Buffer.from(entry.profileId + "\n" + entry.profileVersion));
@@ -270,7 +293,7 @@ export function createProfileArchive({
           createWriteStream(encrypted, { flags: "wx", mode: 0o600 }),
           ...(signal ? [{ signal }] : []),
         );
-        const sha256 = await digest(encrypted),
+        const sha256 = await digest(encrypted, signal),
           byteSize = (await fs.stat(encrypted)).size;
         signal?.throwIfAborted();
         const uploadSignal = AbortSignal.any([

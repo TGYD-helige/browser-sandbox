@@ -1,0 +1,126 @@
+name: Release browser image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Immutable version tag matching package.json (for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-image-release
+  cancel-in-progress: false
+
+jobs:
+  eligibility:
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-24.04
+    outputs:
+      image: ${{ steps.validate.outputs.image }}
+      tag: ${{ steps.validate.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: validate
+        env:
+          TAG: ${{ inputs.tag }}
+          BROWSERLESS_APPROVAL: ${{ vars.BROWSERLESS_IMAGE_DISTRIBUTION }}
+          CLOAK_APPROVAL: ${{ vars.CLOAKBROWSER_IMAGE_DISTRIBUTION }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/master ]]
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$TAG" == "v$(node -p "require('./package.json').version")" ]]
+          if [[ "$BROWSERLESS_APPROVAL" != approved || "$CLOAK_APPROVAL" != approved ]]; then
+            echo 'Record upstream image-distribution authorization before enabling release; see docs/release.md.' >&2
+            exit 1
+          fi
+          gh run list --commit "$GITHUB_SHA" --json workflowName,conclusion,status --limit 100 > /tmp/checks.json
+          node --input-type=module -e '
+            import fs from "node:fs";
+            const runs = JSON.parse(fs.readFileSync("/tmp/checks.json"));
+            for (const name of ["Runtime CI", "Browser integration"]) {
+              const latest = runs.find(run => run.workflowName === name);
+              if (latest?.status !== "completed" || latest.conclusion !== "success") throw Error(`${name} must pass at this commit`);
+            }
+          '
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: eligibility
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: docker build -t browser-sandbox:local .
+      - run: bash .github/scripts/verify-image.sh browser-sandbox:local
+      - name: Push verified architecture image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.eligibility.outputs.image }}
+          ARCH: ${{ matrix.architecture }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          tag="$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ARCH"
+          docker tag browser-sandbox:local "$tag"
+          docker push "$tag"
+          docker image inspect "$tag" --format '{{index .RepoDigests 0}}' > "$ARCH.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.architecture }}
+          path: ${{ matrix.architecture }}.txt
+          if-no-files-found: error
+
+  manifest:
+    needs: [eligibility, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          merge-multiple: true
+      - name: Publish immutable multi-architecture tag and draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: ${{ needs.eligibility.outputs.image }}
+          TAG: ${{ needs.eligibility.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          if docker manifest inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+            echo 'Version already exists; choose a new package version.' >&2
+            exit 1
+          fi
+          docker buildx imagetools create --tag "$IMAGE:$TAG" "$(cat amd64.txt)" "$(cat arm64.txt)"
+          docker buildx imagetools inspect "$IMAGE:$TAG" > image-manifest.txt
+          printf 'Verified Linux AMD64/ARM64 image: `%s:%s`.\n\nSee docs/usage.md and docs/release.md for deployment and licensing conditions.\n' "$IMAGE" "$TAG" > /tmp/release-notes.md
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --draft --notes-file /tmp/release-notes.md image-manifest.txt

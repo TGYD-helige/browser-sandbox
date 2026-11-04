@@ -7,7 +7,8 @@ import path from "node:path";
 
 export const validProfileId = (value) =>
   typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(value);
-export async function clearWindowState(profileDir) {
+export async function clearWindowState(profileDir, signal?: AbortSignal) {
+  signal?.throwIfAborted();
   const flags =
     constants.O_RDONLY |
     constants.O_NOFOLLOW |
@@ -23,6 +24,7 @@ export async function clearWindowState(profileDir) {
   const pinned = (fd, name) =>
     process.platform === "linux" ? "/proc/self/fd/" + fd.fd : name;
   const remove = async (name, depth = 0) => {
+    signal?.throwIfAborted();
     if (++count > 100_000 || depth > 128)
       throw Error("browser_profile_capacity_exceeded");
     const directory = await fs.open(name, flags).catch(async (error) => {
@@ -38,6 +40,7 @@ export async function clearWindowState(profileDir) {
     } finally {
       await directory.close();
     }
+    signal?.throwIfAborted();
     await fs.rmdir(name);
   };
   try {

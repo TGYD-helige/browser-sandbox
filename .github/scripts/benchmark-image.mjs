@@ -3,7 +3,7 @@ import { fork } from "node:child_process";
 import { randomBytes, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createReadStream, createWriteStream } from "node:fs";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { arch, cpus, release, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,7 +18,9 @@ if (process.argv[2] === "worker") {
   process.on("message", async ({ action, url, bytes }) => {
     try {
       let result;
-      if (action === "ready") {
+      if (action === "unused") {
+        result = true;
+      } else if (action === "ready") {
         cdp = await connectCdp(process.env.BROWSER_WS_ENDPOINT);
         const { targetId } = await cdp.call("Target.createTarget", { url });
         ({ sessionId } = await cdp.call("Target.attachToTarget", {
@@ -124,6 +126,7 @@ if (process.argv[2] === "worker") {
   let browserVersion;
   try {
     for (const [name, bytes] of [
+      ["unused", -1],
       ["temporary", null],
       ["remote-small", 1024],
       ["remote-large", 8 * 1024 * 1024],
@@ -131,8 +134,12 @@ if (process.argv[2] === "worker") {
       const profileId = bytes === null ? undefined : `benchmark/${randomUUID()}`;
       const key = randomBytes(32).toString("hex");
       let latest;
+      let storageCalls = 0;
       const results = {
         register: [],
+        profileAcquire: [],
+        profileRestore: [],
+        browserLaunch: [],
         firstBrowserReady: [],
         finalize: [],
         archiveDownload: [],
@@ -157,16 +164,19 @@ if (process.argv[2] === "worker") {
           if (profileId)
             storage = await attachStorage(socket, registration, {
               async load() {
+                storageCalls++;
                 return {
                   seed: latest ? { ...latest, key, url: origin + "/archive" } : null,
                 };
               },
               async save() {
+                storageCalls++;
                 return {
                   target: { key, url: origin + "/archive", objectKey: "benchmark" },
                 };
               },
               async commit(result) {
+                storageCalls++;
                 assert.equal(result.previousSha256, latest?.sha256 ?? null);
                 latest = result.archive;
                 return { confirmedSha: latest.sha256 };
@@ -189,14 +199,45 @@ if (process.argv[2] === "worker") {
             assert(!response.error, "Browser benchmark worker failed");
             return response.result;
           };
-          browserVersion = await call("ready", { url: origin + "/page" });
+          const unused = name === "unused";
+          const version = await call(unused ? "unused" : "ready", {
+            url: origin + "/page",
+          });
+          if (!unused) browserVersion = version;
           const ready = performance.now() - start;
-          if (profileId)
+          if (unused)
+            assert.equal(
+              (
+                await hostRequest(socket, {
+                  op: "session",
+                  executionId,
+                  action: "status",
+                })
+              ).state,
+              "unused",
+            );
+          let preparation;
+          if (!unused && process.env.REQUIRE_PREPARATION_TIMINGS !== "0") {
+            const timingPath = `/run/browser-sandbox/benchmark/${executionId}.json`;
+            for (let attempt = 0; attempt < 100; attempt++) {
+              try {
+                preparation = JSON.parse(await readFile(timingPath, "utf8"));
+                break;
+              } catch (error) {
+                if (error.code !== "ENOENT" && !(error instanceof SyntaxError))
+                  throw error;
+                await delay(10);
+              }
+            }
+            assert(preparation, "Missing preparation timing record");
+            await rm(timingPath);
+          }
+          if (profileId && !unused)
             assert.equal(
               await call(sample === -3 ? "seed" : "verify", { bytes }),
               bytes,
             );
-          await call("close");
+          if (!unused) await call("close");
           const exited = once(child, "exit");
           child.disconnect();
           await exited;
@@ -205,7 +246,14 @@ if (process.argv[2] === "worker") {
           finalized = true;
           if (sample >= 0) {
             results.register.push(registered);
-            results.firstBrowserReady.push(ready);
+            if (!unused) {
+              results.firstBrowserReady.push(ready);
+              if (preparation) {
+                results.profileAcquire.push(preparation.profileAcquireMs);
+                results.profileRestore.push(preparation.profileRestoreMs);
+                results.browserLaunch.push(preparation.browserLaunchMs);
+              }
+            }
             results.finalize.push(performance.now() - start);
             results.archiveDownload.push(...transfers.download);
             results.archiveUpload.push(...transfers.upload);
@@ -216,9 +264,13 @@ if (process.argv[2] === "worker") {
           storage?.close();
         }
       }
+      if (name === "unused")
+        assert.equal(storageCalls, 0, "Unused execution contacted storage");
       cases.push({
+        storageCalls,
+        measurements: results,
         name,
-        payloadBytes: bytes ?? 0,
+        payloadBytes: Math.max(0, bytes ?? 0),
         phases: Object.fromEntries(
           Object.entries(results)
             .filter(([, values]) => values.length)
@@ -239,7 +291,7 @@ if (process.argv[2] === "worker") {
           warmups: 3,
           environment:
             "Sandboxed image; 2 CPUs, 2 GiB RAM; real CDP renderer and local streaming HTTP archive store",
-          note: "First readiness includes client startup, Profile restore, browser startup, navigation, and screenshot. Finalization includes checkpoint, browser exit, encryption/archive, upload, and commit. HTTP transfer timings are measured at the local storage server. These measurements do not establish production/cloud latency or a comparative performance claim.",
+          note: "First readiness includes client startup, Profile restore, browser startup, navigation, and screenshot. Finalization includes checkpoint, browser exit, encryption/archive, upload, and commit. HTTP transfer timings are measured at the local storage server. Profile acquisition and source lookup/restore are measured inside the runtime. Browser launch includes Browserless queue wait. Unused executions use a generic Node client without connecting CDP; real harness startup is measured separately. These measurements do not establish production/cloud latency or a comparative performance claim.",
           cases,
         },
         null,

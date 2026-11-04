@@ -2267,3 +2267,42 @@ test("application credential binding is unsupported and CDP commands pass throug
     await f.stop();
   }
 });
+
+test("revocation capacity fences new identities while existing executions can finish", async () => {
+  const f = await fixture(async () => {
+    throw Error("must not launch");
+  });
+  try {
+    const live = await f.gateway.command({ op: "register", executionId: ids[0] });
+    for (let index = 0; index < 65536; index++)
+      await f.gateway.command(
+        {
+          op: "finish",
+          executionId: `aaaaaaaa-aaaa-4aaa-8aaa-${index.toString(16).padStart(12, "0")}`,
+        },
+        true,
+      );
+    await assert.rejects(
+      f.gateway.command({ op: "register", executionId: ids[1] }),
+      /browser_execution_capacity_exceeded/,
+    );
+    assert.equal(
+      (await f.gateway.command({ op: "register", executionId: ids[0] })).wsEndpoint,
+      live.wsEndpoint,
+    );
+    await f.gateway.command({ op: "finish", executionId: ids[0] }, true);
+    await assert.rejects(
+      f.gateway.command({ op: "register", executionId: ids[0] }),
+      /browser_execution_capacity_exceeded/,
+    );
+    await assert.rejects(
+      f.gateway.command({
+        op: "register",
+        executionId: "aaaaaaaa-aaaa-4aaa-8aaa-000000000000",
+      }),
+      /browser_execution_revoked/,
+    );
+  } finally {
+    await f.stop();
+  }
+});
