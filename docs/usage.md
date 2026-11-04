@@ -105,6 +105,10 @@ Some CDP clients, including Chrome DevTools MCP, treat loopback endpoints as loc
 | TIMEOUT | 1800000 ms total Browserless timeout |
 | HOST / PORT | Fixed internal Browserless binding 127.0.0.1:3001 |
 
+Profile preparation (including acquisition and restore), archive saves, and ownership release share a separate work limit of CONCURRENT active operations. Preparation and saves admit twice CONCURRENT waiting operations; ownership cleanup has a reserved queue bounded by the 1,000 live execution slots and runs before waiting preparation. This keeps failure recovery and shutdown available when the ordinary queue is full. QUEUED still controls Browserless browser admission. A full Profile work queue returns browser_profile_work_queue_full; it does not call storage or start a browser for the rejected attempt. Cancellation removes queued work, and failed saves retain the Profile for an explicit lifecycle retry. Registration and unused finalization do not enter this queue.
+
+The gateway accepts the execution WebSocket before cold startup completes. The bundled CDP client allows 60 seconds for commands sent before the first reply, covering the default 45-second startup budget plus the ordinary 15-second command budget. Commands sent after that reply keep the 15-second timeout. Other CDP clients must allow for preparation in their initial command deadline; a successful WebSocket handshake alone does not mean Chrome is ready.
+
 The first release intentionally targets the verified Linux topology. Remote TCP control, arbitrary UID allocation policies, Windows/macOS service mode, and a generic browser management UI are outside this implementation.
 
 ## Manage a live browser session

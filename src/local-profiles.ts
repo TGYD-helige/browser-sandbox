@@ -62,7 +62,7 @@ export async function clearWindowState(profileDir, signal?: AbortSignal) {
 // browser-controlled symlinks or transfer a hardlinked file outside this tree.
 async function ownTree(directory, uid, signal?: AbortSignal) {
   let count = 0;
-  const visit = async (name, depth = 0) => {
+  const visit = async (name, depth = 0, parallel = true) => {
     signal?.throwIfAborted();
     if (++count > 100_000 || depth > 128)
       throw Error("browser_profile_capacity_exceeded");
@@ -77,14 +77,31 @@ async function ownTree(directory, uid, signal?: AbortSignal) {
         (stat.isFile() && stat.nlink !== 1)
       )
         throw Error("browser_profile_entry_unsafe");
-      if (stat.isDirectory())
-        for (const item of await fs.readdir("/proc/self/fd/" + fd.fd))
-          await visit("/proc/self/fd/" + fd.fd + "/" + item, depth + 1);
+      if (stat.isDirectory()) {
+        const pinned = "/proc/self/fd/" + fd.fd;
+        const entries = await fs.readdir(pinned, { withFileTypes: true });
+        const files = entries.filter((item) => !item.isDirectory());
+        const batchSize = parallel ? 4 : 1;
+        for (let offset = 0; offset < files.length; offset += batchSize) {
+          const results = await Promise.allSettled(
+            files.slice(offset, offset + batchSize).map((item) =>
+              // A renamed file may now be a directory; keep that subtree serial.
+              visit(path.join(pinned, item.name), depth + 1, false),
+            ),
+          );
+          const failure = results.find((result) => result.status === "rejected");
+          if (failure?.status === "rejected") throw failure.reason;
+        }
+        for (const item of entries)
+          if (item.isDirectory())
+            await visit(path.join(pinned, item.name), depth + 1, parallel);
+      }
       // The browser container has CHOWN, but deliberately no FOWNER capability.
       signal?.throwIfAborted();
-      await fd.chown(0, 0);
-      await fd.chmod(stat.isDirectory() ? 0o700 : 0o600);
-      await fd.chown(uid, uid);
+      if (stat.uid !== 0 || stat.gid !== 0) await fd.chown(0, 0);
+      const mode = stat.isDirectory() ? 0o700 : 0o600;
+      await fd.chmod(mode);
+      if (uid !== 0) await fd.chown(uid, uid);
     } finally {
       await fd.close();
     }

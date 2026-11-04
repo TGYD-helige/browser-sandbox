@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, get } from "node:http";
@@ -9,6 +10,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import WebSocket, { WebSocketServer } from "ws";
+import { connectCdp } from "../dist/cdp.js";
 import { createGateway } from "../dist/gateway.js";
 import { attachStorage, hostRequest } from "../dist/host-client.js";
 import {
@@ -2469,6 +2471,384 @@ test("a quiesce already closing cannot reopen access after a concurrent finish f
     await f.gateway.command({ op: "finish", executionId: ids[0] }, true);
   } finally {
     proceed.resolve();
+    await f.stop();
+  }
+});
+
+test("Profile preparation is bounded before browser admission and queued work is cancellable", async () => {
+  const gate = Promise.withResolvers();
+  let acquisitions = 0;
+  const f = await fixture(
+    async ({ endpoint }) => ({ endpoint, close: async () => {} }),
+    undefined,
+    {
+      maxBrowsers: 1,
+      resolvePeerUid: () => 100001,
+      profileStore: {
+        async acquire(_profile, executionId) {
+          acquisitions++;
+          await gate.promise;
+          const profileDir = join(f.root, "data", executionId, "profile");
+          await mkdir(profileDir);
+          return {
+            profileDir,
+            journalDir: join(profileDir, ".."),
+            release: async () => {},
+            abandon: async () => {},
+          };
+        },
+      },
+    },
+  );
+  const entries = [],
+    clients = [];
+  try {
+    for (let i = 0; i < 4; i++) {
+      const executionId = randomUUID();
+      entries.push(executionId);
+      const { wsEndpoint } = await f.gateway.command(
+        { op: "register", executionId, executorUid: 100001, profileId: "bounded/" + i },
+        true,
+      );
+      const client = new WebSocket(wsEndpoint);
+      client.on("error", () => {});
+      clients.push(client);
+      const closed = once(client, "close");
+      await once(client, "open");
+      if (i === 3) {
+        const [code, reason] = await closed;
+        assert.equal(code, 1011);
+        assert.equal(String(reason), "browser_profile_work_queue_full");
+      }
+    }
+    await waitFor(() => acquisitions > 0);
+    await delay(30);
+    assert.equal(acquisitions, 1);
+    await f.gateway.command({ op: "finish", executionId: entries[1] }, true);
+    assert.equal(acquisitions, 1);
+    gate.resolve();
+    await waitFor(() => acquisitions === 2);
+    assert.equal(acquisitions, 2);
+    for (const executionId of [entries[0], entries[2]])
+      await f.gateway.command({ op: "finish", executionId }, true);
+  } finally {
+    gate.resolve();
+    for (const client of clients) client.terminate();
+    for (const executionId of entries)
+      await f.gateway.command({ op: "quiesce", executionId }, true).catch(() => {});
+    await f.stop();
+  }
+});
+
+test("the first CDP reply can wait for cold startup while later calls retain their normal timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const launch = Promise.withResolvers();
+  const f = await fixture(
+    async ({ endpoint }) => {
+      await launch.promise;
+      return { endpoint, close: async () => {} };
+    },
+    (socket, data) => {
+      const { id, method } = JSON.parse(String(data));
+      if (method === "Browser.getVersion")
+        socket.send(JSON.stringify({ id, result: { product: "fixture" } }));
+    },
+  );
+  let cdp;
+  try {
+    const { wsEndpoint } = await f.gateway.command({
+      op: "register",
+      executionId: ids[0],
+    });
+    cdp = await connectCdp(wsEndpoint);
+    let outcome;
+    const first = cdp.call("Browser.getVersion").then(
+      (value) => {
+        outcome = value;
+        return value;
+      },
+      (error) => {
+        outcome = error;
+        throw error;
+      },
+    );
+    first.catch(() => {});
+    t.mock.timers.tick(15001);
+    await new Promise(setImmediate);
+    assert.equal(outcome, undefined);
+    launch.resolve();
+    assert.equal((await first).product, "fixture");
+    const later = assert.rejects(cdp.call("Runtime.evaluate"), /browser_cdp_timeout/);
+    t.mock.timers.tick(15001);
+    await later;
+  } finally {
+    launch.resolve();
+    cdp?.close();
+    await f.stop();
+    t.mock.timers.reset();
+  }
+});
+
+test("Profile saves share bounded admission, cancel queued work and keep ordinary control responsive", async () => {
+  const gate = Promise.withResolvers();
+  let saves = 0;
+  const sha = "a".repeat(64);
+  const f = await fixture(
+    async ({ endpoint }) => ({ endpoint, close: async () => {} }),
+    undefined,
+    {
+      maxBrowsers: 1,
+      resolvePeerUid: () => 100001,
+      profileStore: {
+        async acquire(_profile, executionId) {
+          const profileDir = join(f.root, "data", executionId, "profile");
+          await mkdir(profileDir);
+          return {
+            profileDir,
+            journalDir: join(profileDir, ".."),
+            release: async () => {},
+            abandon: async () => {},
+          };
+        },
+      },
+      profileArchive: {
+        async restore() {},
+        async save() {
+          saves++;
+          await gate.promise;
+          return { used: true, archive: { sha256: sha } };
+        },
+      },
+    },
+  );
+  const entries = [],
+    clients = [],
+    saving = [];
+  const abort = new AbortController();
+  try {
+    for (let i = 0; i < 3; i++) {
+      const executionId = randomUUID();
+      entries.push(executionId);
+      const { wsEndpoint } = await f.gateway.command(
+        {
+          op: "register",
+          executionId,
+          executorUid: 100001,
+          profileId: `save/${i}`,
+          archive: {},
+        },
+        true,
+      );
+      clients.push(await connect(wsEndpoint));
+    }
+    saving.push(
+      f.gateway.command({ op: "profile_finalize", executionId: entries[0] }, true),
+    );
+    await waitFor(() => saves === 1);
+    const cancelled = assert.rejects(
+      f.gateway.command(
+        { op: "profile_finalize", executionId: entries[1] },
+        true,
+        false,
+        abort.signal,
+      ),
+      /browser_profile_work_cancelled/,
+    );
+    saving.push(
+      f.gateway.command({ op: "profile_finalize", executionId: entries[2] }, true),
+    );
+    await delay(30);
+    assert.equal(saves, 1);
+    const ordinary = randomUUID();
+    await hostRequest(join(f.root, "control.sock"), {
+      op: "register",
+      executionId: ordinary,
+    });
+    await hostRequest(join(f.root, "control.sock"), {
+      op: "finish",
+      executionId: ordinary,
+    });
+    abort.abort();
+    await cancelled;
+    gate.resolve();
+    await Promise.all(saving);
+    assert.equal(saves, 2);
+    await f.gateway.command({ op: "profile_finalize", executionId: entries[1] }, true);
+    for (const executionId of entries)
+      await f.gateway.command({ op: "finish", executionId, confirmedSha: sha }, true);
+  } finally {
+    gate.resolve();
+    abort.abort();
+    await Promise.allSettled(saving);
+    for (const client of clients) client.terminate();
+    await f.stop();
+  }
+});
+
+test("Profile releases share admission with preparation even when its ordinary queue is full", async () => {
+  const gate = Promise.withResolvers();
+  let releases = 0,
+    active = 0,
+    peak = 0;
+  const f = await fixture(
+    async ({ endpoint }) => ({ endpoint, close: async () => {} }),
+    undefined,
+    {
+      maxBrowsers: 1,
+      resolvePeerUid: () => 100001,
+      profileStore: {
+        async acquire(_profile, executionId) {
+          active++;
+          peak = Math.max(peak, active);
+          try {
+            const profileDir = join(f.root, "data", executionId, "profile");
+            await mkdir(profileDir);
+            return {
+              profileDir,
+              journalDir: join(profileDir, ".."),
+              async release() {
+                active++;
+                peak = Math.max(peak, active);
+                releases++;
+                try {
+                  await gate.promise;
+                } finally {
+                  active--;
+                }
+              },
+              async abandon() {},
+            };
+          } finally {
+            active--;
+          }
+        },
+      },
+    },
+  );
+  const entries = [],
+    clients = [],
+    finishing = [];
+  try {
+    for (let i = 0; i < 3; i++) {
+      const executionId = randomUUID();
+      entries.push(executionId);
+      const { wsEndpoint } = await f.gateway.command(
+        { op: "register", executionId, executorUid: 100001, profileId: `release/${i}` },
+        true,
+      );
+      clients.push(await connect(wsEndpoint));
+    }
+    finishing.push(f.gateway.command({ op: "finish", executionId: entries[0] }, true));
+    await waitFor(() => releases === 1);
+    for (let i = 3; i < 5; i++) {
+      const executionId = randomUUID();
+      entries.push(executionId);
+      const { wsEndpoint } = await f.gateway.command(
+        { op: "register", executionId, executorUid: 100001, profileId: `release/${i}` },
+        true,
+      );
+      const client = new WebSocket(wsEndpoint);
+      client.on("error", () => {});
+      clients.push(client);
+      await once(client, "open");
+    }
+    finishing.push(f.gateway.command({ op: "finish", executionId: entries[1] }, true));
+    finishing.push(f.gateway.command({ op: "finish", executionId: entries[2] }, true));
+    await delay(30);
+    assert.equal(peak, 1);
+    assert.equal(releases, 1);
+    gate.resolve();
+    await Promise.all(finishing);
+    assert.equal(releases, 3);
+  } finally {
+    gate.resolve();
+    await Promise.allSettled(finishing);
+    for (const client of clients) client.terminate();
+    await f.stop();
+  }
+});
+
+test("failed Profile restores retain admission for ownership recovery before later preparation", async () => {
+  const gate = Promise.withResolvers();
+  let active = 0,
+    peak = 0,
+    restores = 0,
+    releases = 0;
+  const track = async (work) => {
+    active++;
+    peak = Math.max(peak, active);
+    try {
+      return await work();
+    } finally {
+      active--;
+    }
+  };
+  const f = await fixture(
+    async () => {
+      throw Error("must not launch");
+    },
+    undefined,
+    {
+      maxBrowsers: 1,
+      resolvePeerUid: () => 100001,
+      profileStore: {
+        acquire(_profile, executionId) {
+          return track(async () => {
+            const profileDir = join(f.root, "data", executionId, "profile");
+            await mkdir(profileDir);
+            return {
+              profileDir,
+              journalDir: join(profileDir, ".."),
+              release: () =>
+                track(async () => {
+                  releases++;
+                  await gate.promise;
+                }),
+              async abandon() {},
+            };
+          });
+        },
+      },
+      profileArchive: {
+        restore: () =>
+          track(async () => {
+            restores++;
+            throw Error("browser_profile_restore_failed");
+          }),
+      },
+    },
+  );
+  const clients = [],
+    closed = [];
+  try {
+    for (let i = 0; i < 3; i++) {
+      const { wsEndpoint } = await f.gateway.command(
+        {
+          op: "register",
+          executionId: randomUUID(),
+          executorUid: 100001,
+          profileId: `failed/${i}`,
+          archive: {},
+        },
+        true,
+      );
+      const client = new WebSocket(wsEndpoint);
+      client.on("error", () => {});
+      clients.push(client);
+      closed.push(once(client, "close"));
+      await once(client, "open");
+      if (i === 0) await waitFor(() => releases === 1);
+    }
+    await delay(30);
+    assert.equal(restores, 1);
+    assert.equal(peak, 1);
+    gate.resolve();
+    await Promise.all(closed);
+    assert.equal(releases, 3);
+    assert.equal(peak, 1);
+  } finally {
+    gate.resolve();
+    for (const client of clients) client.terminate();
     await f.stop();
   }
 });
