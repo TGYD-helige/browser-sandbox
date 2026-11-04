@@ -37,6 +37,7 @@ const config = {
   session: { enabled: true, key: home, retentionMs: HANDOFF_MS },
 };
 const modelMode = process.env.E2E_MODE === "model";
+const sessionOnly = process.env.E2E_SCENARIO === "session";
 let scripted;
 let plan = [];
 let step = 0;
@@ -325,7 +326,7 @@ try {
   }
   await site.verify();
   await files.verify();
-  if (!modelMode) {
+  if (!modelMode && !sessionOnly) {
     let client = new DevToolsClient(config);
     try {
       const opened = await client.callTool("new_page", { url: site.url });
@@ -380,7 +381,7 @@ try {
   await site.verify();
   await files.verify();
   console.log(
-    `Pi ${process.env.E2E_MODE ?? "tools"}: real browser tools, session handoff, upload/download, and form submission passed`,
+    `Pi ${process.env.E2E_MODE ?? "tools"}${sessionOnly ? " session" : " full"}: real browser tools, session handoff, upload/download, and form submission passed`,
   );
 } catch (error) {
   failure = error;

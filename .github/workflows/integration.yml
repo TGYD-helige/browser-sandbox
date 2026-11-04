@@ -52,6 +52,8 @@ jobs:
 
   browser-session:
     name: Pi browser-session E2E
+    env:
+      E2E_SCENARIO: session
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -81,7 +83,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        harness: [dsh, opencode, agent-browser, unused]
+        harness: [pi, dsh, opencode, agent-browser, unused]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
