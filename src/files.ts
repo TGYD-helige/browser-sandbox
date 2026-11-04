@@ -57,15 +57,19 @@ export async function transferFile(
       );
       await sent;
     } else {
-      response.strictContentLength = true;
       response.writeHead(200, {
         "content-type": "application/octet-stream",
         "content-length": stat.size,
       });
-      await pipeline(
-        file.createReadStream({ autoClose: false, end: Math.max(0, stat.size - 1) }),
-        response,
-      );
+      if (stat.size > 0) {
+        const source = file.createReadStream({ autoClose: false, end: stat.size - 1 });
+        // Validate before ending: strictContentLength throws outside pipeline's promise.
+        await pipeline(source, response, { end: false });
+        if (source.bytesRead !== stat.size) throw Error("browser_file_changed");
+      }
+      const sent = finished(response, { cleanup: true });
+      response.end();
+      await sent;
     }
   } catch (error) {
     if (!response.headersSent && !response.destroyed) {
