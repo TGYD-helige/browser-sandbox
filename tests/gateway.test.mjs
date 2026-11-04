@@ -22,6 +22,56 @@ const ids = [
   "11111111-1111-4111-8111-111111111111",
   "22222222-2222-4222-8222-222222222222",
 ];
+
+test("startup cancellation reaches Profile acquisition and prevents a late launch", async () => {
+  let signal,
+    launches = 0;
+  const f = await fixture(
+    () => {
+      launches++;
+      throw Error("unexpected launch");
+    },
+    undefined,
+    {
+      startupTimeoutMs: 30,
+      resolvePeerUid: async () => 100001,
+      profileStore: {
+        async acquire(_profile, _execution, _uid, acquisitionSignal) {
+          assert(acquisitionSignal instanceof AbortSignal);
+          signal = acquisitionSignal;
+          await new Promise((_, reject) => {
+            acquisitionSignal.addEventListener(
+              "abort",
+              () => reject(Error("acquisition_cancelled")),
+              { once: true },
+            );
+          });
+        },
+      },
+    },
+  );
+  let client;
+  try {
+    const { wsEndpoint } = await f.gateway.command(
+      {
+        op: "register",
+        executionId: ids[0],
+        executorUid: 100001,
+        profileId: "cancel/acquire",
+      },
+      true,
+    );
+    client = new WebSocket(wsEndpoint);
+    client.on("error", () => {});
+    await once(client, "close");
+    assert.equal(signal?.aborted, true);
+    await f.gateway.command({ op: "finish", executionId: ids[0] }, true);
+    assert.equal(launches, 0);
+  } finally {
+    client?.terminate();
+    await f.stop();
+  }
+});
 async function fixture(
   launch,
   onMessage = (socket, data) => socket.send(data),

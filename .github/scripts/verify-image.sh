@@ -18,6 +18,7 @@ if [[ -n "${BENCHMARK_OUTPUT:-}" ]]; then
   command_args=(--import /opt/browser-sandbox/.github/scripts/benchmark-observer.mjs /opt/browser-sandbox/dist/main.js)
 fi
 container_id="$(docker run -d --init --cap-drop ALL \
+  --sysctl net.ipv4.ip_local_reserved_ports=3001,42000-42999 \
   --cap-add SETUID --cap-add SETGID --cap-add CHOWN --cap-add KILL \
   --cap-add DAC_OVERRIDE --cap-add SYS_CHROOT --cap-add NET_ADMIN \
   --security-opt no-new-privileges --security-opt "seccomp=$profile_dir/seccomp.json" \

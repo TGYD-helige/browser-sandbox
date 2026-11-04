@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { once } from "node:events";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -61,9 +60,10 @@ export async function clearWindowState(profileDir, signal?: AbortSignal) {
 }
 // Every ancestor is runtime-owned. Pin each node before changing UID; never follow
 // browser-controlled symlinks or transfer a hardlinked file outside this tree.
-async function ownTree(directory, uid) {
+async function ownTree(directory, uid, signal?: AbortSignal) {
   let count = 0;
   const visit = async (name, depth = 0) => {
+    signal?.throwIfAborted();
     if (++count > 100_000 || depth > 128)
       throw Error("browser_profile_capacity_exceeded");
     const fd = await fs.open(
@@ -81,6 +81,7 @@ async function ownTree(directory, uid) {
         for (const item of await fs.readdir("/proc/self/fd/" + fd.fd))
           await visit("/proc/self/fd/" + fd.fd + "/" + item, depth + 1);
       // The browser container has CHOWN, but deliberately no FOWNER capability.
+      signal?.throwIfAborted();
       await fd.chown(0, 0);
       await fd.chmod(stat.isDirectory() ? 0o700 : 0o600);
       await fd.chown(uid, uid);
@@ -90,7 +91,8 @@ async function ownTree(directory, uid) {
   };
   await visit(directory);
 }
-async function fileLock(filename) {
+async function fileLock(filename, signal?: AbortSignal) {
+  signal?.throwIfAborted();
   const fd = await fs.open(
     filename,
     constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW,
@@ -109,6 +111,7 @@ async function fileLock(filename) {
     "flock",
     [
       "-n",
+      "-F",
       "-E",
       "73",
       filename,
@@ -119,29 +122,59 @@ async function fileLock(filename) {
     { stdio: ["pipe", "pipe", "ignore"] },
   );
   child.stdin.on("error", () => {});
-  const exited = once(child, "exit");
-  exited.catch(() => {});
-  await new Promise<void>((resolve, reject) => {
-    child.once("error", () => reject(Error("browser_profile_lock_unavailable")));
-    child.stdout.once("data", () => resolve());
-    child.once("exit", (code) =>
-      reject(
-        Error(
-          code === 73 ? "browser_profile_busy" : "browser_profile_lock_unavailable",
-        ),
-      ),
-    );
-  });
+  const exited = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  const deadline = AbortSignal.any([
+    ...(signal ? [signal] : []),
+    AbortSignal.timeout(30_000),
+  ]);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        child.removeListener("error", failed);
+        child.removeListener("exit", stopped);
+        child.stdout.removeListener("data", ready);
+        deadline.removeEventListener("abort", cancelled);
+      };
+      const done = (error?) => {
+        cleanup();
+        error ? reject(error) : resolve();
+      };
+      const failed = () => done(Error("browser_profile_lock_unavailable"));
+      const stopped = (code) =>
+        done(
+          Error(
+            code === 73 ? "browser_profile_busy" : "browser_profile_lock_unavailable",
+          ),
+        );
+      const ready = () => done();
+      const cancelled = () => done(deadline.reason);
+      child.once("error", failed);
+      child.once("exit", stopped);
+      child.stdout.once("data", ready);
+      deadline.addEventListener("abort", cancelled, { once: true });
+      if (deadline.aborted) cancelled();
+    });
+  } catch (error) {
+    child.kill("SIGKILL");
+    await exited;
+    throw error;
+  }
   return async () => {
     child.stdin.end();
-    if (child.exitCode === null && child.signalCode === null) await exited;
+    const timer = setTimeout(() => child.kill("SIGKILL"), 1000);
+    try {
+      await exited;
+    } finally {
+      clearTimeout(timer);
+    }
   };
 }
 /** Local private data only. No archive, database, credentials or remote transport. */
 export function createLocalProfiles({ root }) {
   if (!path.isAbsolute(root ?? "")) throw Error("browser_profile_root_invalid");
   return {
-    async acquire(profileId, executionId, uid) {
+    async acquire(profileId, executionId, uid, signal?: AbortSignal) {
+      signal?.throwIfAborted();
       if (
         process.getuid?.() !== 0 ||
         !validProfileId(profileId) ||
@@ -163,11 +196,12 @@ export function createLocalProfiles({ root }) {
       const stat = await fs.lstat(directory);
       if (!stat.isDirectory() || stat.uid !== 0 || stat.mode & 0o022)
         throw Error("browser_profile_root_unsafe");
-      const unlock = await fileLock(path.join(directory, "lock"));
+      const unlock = await fileLock(path.join(directory, "lock"), signal);
       const active = path.join(directory, "active.json"),
         profileDir = path.join(directory, "profile");
       let created = false;
       try {
+        signal?.throwIfAborted();
         // A free OS lock alone cannot prove an orphan Chrome has exited. Fail
         // closed after an unclean owner loss, without stealing permissions.
         const marker = await fs.open(active, "wx", 0o600).catch((error) => {
@@ -183,7 +217,7 @@ export function createLocalProfiles({ root }) {
         await fs.mkdir(profileDir, { mode: 0o700 }).catch((error) => {
           if (error.code !== "EEXIST") throw error;
         });
-        await ownTree(profileDir, uid);
+        await ownTree(profileDir, uid, signal);
       } catch (error) {
         // No lease was handed out, so this attempt cannot have started Chrome.
         try {
@@ -197,13 +231,14 @@ export function createLocalProfiles({ root }) {
       return {
         profileDir,
         journalDir: directory,
-        async release() {
+        async release(signal?: AbortSignal) {
           if (released) return;
+          signal?.throwIfAborted();
           const exists = await fs.lstat(profileDir).catch((error) => {
             if (error.code === "ENOENT") return null;
             throw error;
           });
-          if (exists) await ownTree(profileDir, 0);
+          if (exists) await ownTree(profileDir, 0, signal);
           await fs.rm(active);
           released = true;
           await unlock();

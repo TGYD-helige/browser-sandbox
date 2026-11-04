@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -14,6 +15,101 @@ const readAs = (uid, file) =>
     ["--reuid=" + uid, "--regid=" + uid, "--clear-groups", "cat", file],
     { stdio: ["ignore", "pipe", "pipe"] },
   ).toString();
+
+test("cancelled Profile handoff stops traversal, rolls back acquisition and permits retry", {
+  skip: !linux,
+}, async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "profile-cancel-"));
+  const store = createLocalProfiles({ root });
+  let lease;
+  try {
+    lease = await store.acquire("cancel", "seed", 100001);
+    await fs.writeFile(path.join(lease.profileDir, "saved"), "keep");
+    const profileDir = lease.profileDir;
+    await lease.release();
+    lease = null;
+    const abort = new AbortController();
+    const readdir = fs.readdir.bind(fs);
+    let cancelled = false;
+    t.mock.method(fs, "readdir", async (...args) => {
+      const entries = await readdir(...args);
+      if (!cancelled) {
+        cancelled = true;
+        abort.abort(Error("handoff_cancelled"));
+      }
+      return entries;
+    });
+    await assert.rejects(
+      store.acquire("cancel", "cancelled", 100002, abort.signal).then((value) => {
+        lease = value;
+        return value;
+      }),
+      /handoff_cancelled/,
+    );
+    assert(cancelled);
+    assert.equal((await fs.stat(path.join(profileDir, "saved"))).uid, 0);
+    lease = await store.acquire("cancel", "retry", 100003);
+    assert.equal(await fs.readFile(path.join(profileDir, "saved"), "utf8"), "keep");
+    const releaseAbort = new AbortController();
+    releaseAbort.abort(Error("release_cancelled"));
+    await assert.rejects(lease.release(releaseAbort.signal), /release_cancelled/);
+    await assert.rejects(store.acquire("cancel", "competitor", 100004), /profile_busy/);
+    await lease.release();
+    lease = null;
+  } finally {
+    await lease?.abandon();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cancelling lock-helper startup waits for helper exit before retry", {
+  skip: !linux,
+}, async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "profile-lock-cancel-"));
+  const store = createLocalProfiles({ root });
+  const abort = new AbortController();
+  const spawn = childProcess.spawn;
+  let lease, helper;
+  let started;
+  const spawned = new Promise((resolve) => {
+    started = resolve;
+  });
+  t.mock.method(childProcess, "spawn", () => {
+    helper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: ["pipe", "pipe", "ignore"],
+    });
+    helper.once("spawn", started);
+    return helper;
+  });
+  syncBuiltinESMExports();
+  const acquisition = store
+    .acquire("cancel-lock", "cancelled", 100001, abort.signal)
+    .then((value) => {
+      lease = value;
+      return value;
+    });
+  const rejected = assert.rejects(acquisition, /lock_cancelled/);
+  rejected.catch(() => {});
+  try {
+    await spawned;
+    abort.abort(Error("lock_cancelled"));
+    await rejected;
+    assert.equal(helper.signalCode, "SIGKILL");
+    assert.throws(() => process.kill(helper.pid, 0), { code: "ESRCH" });
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    lease = await store.acquire("cancel-lock", "retry", 100002);
+    await lease.release();
+    lease = null;
+  } finally {
+    abort.abort(Error("lock_cancelled"));
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    await acquisition.catch(() => {});
+    await lease?.abandon();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 test("window cleanup cannot traverse an execution-owned Default symlink", {
   skip: !linux,

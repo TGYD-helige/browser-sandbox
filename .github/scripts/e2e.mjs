@@ -58,6 +58,8 @@ try {
       "run",
       "-d",
       "--init",
+      "--sysctl",
+      "net.ipv4.ip_local_reserved_ports=3001,42000-42999",
       "--cap-drop",
       "ALL",
       ...[

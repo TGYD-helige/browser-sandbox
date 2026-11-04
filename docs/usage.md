@@ -6,6 +6,8 @@ The current deployment is a private Linux container/Pod network namespace with a
 
 Use a compatible Linux host with user namespaces enabled. Chrome keeps its renderer sandbox; startup fails if a real page and screenshot cannot run safely. The runtime must not be exposed as a public unauthenticated browser port.
 
+Reserve the internal ports from automatic allocation in the shared network namespace: pass `--sysctl net.ipv4.ip_local_reserved_ports=3001,42000-42999` to the runtime container, or configure the equivalent Pod sysctl while preserving any other host-reserved ranges. The firewall blocks execution UIDs from these ports; without this reservation, a client-side MCP or Session worker using a random listener can intermittently select a blocked port. The reservation preserves the firewall and does not authorize direct internal CDP access.
+
 ```sh
 pnpm docker:build
 bash .github/scripts/verify-image.sh browser-sandbox:local

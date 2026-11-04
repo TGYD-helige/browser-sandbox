@@ -16,6 +16,7 @@ test("a lease is granted only after automation has stopped and requires the same
         if (method === "Target.getTargets")
           return {
             targetInfos: [
+              { type: "page", targetId: "blank", url: "about:blank" },
               { type: "page", targetId: "page", url: "https://example.com/login" },
             ],
           };
@@ -37,6 +38,7 @@ test("a lease is granted only after automation has stopped and requires the same
   finish();
   const lease = await acquiring;
   assert.equal(lease.state, "human");
+  assert.equal(lease.targetId, "page");
   await assert.rejects(
     control.command({
       op: "release",
@@ -160,6 +162,48 @@ test("takeover queries and renews its holder, rejects changed origins on release
   });
   assert.notEqual(replacement.epoch, lease.epoch);
   await assert.rejects(control.command({ ...identity, op: "renew" }), /stale/);
+});
+
+test("lease expiry fences input and replacement requires another confirmed automation stop", async (t) => {
+  const b = browser();
+  let now = Date.now(),
+    stops = 0;
+  t.mock.method(Date, "now", () => now);
+  const control = new Takeover(
+    "ws://unused",
+    async () => {
+      stops++;
+    },
+    b.connect,
+  );
+  const grant = {
+    op: "acquire",
+    actorId: "human",
+    leaseId: "lease",
+    automationStopped: true,
+  };
+  const lease = await control.command(grant);
+  const identity = { actorId: "human", leaseId: "lease", epoch: lease.epoch };
+  const frame = await control.command({ ...identity, op: "frame" });
+  now = lease.expiresAt;
+  await assert.rejects(
+    control.command({ ...identity, ...frame, op: "text", text: "expired" }),
+    /control_expired/,
+  );
+  assert.equal(
+    (await control.command({ op: "status", actorId: "human" })).state,
+    "uncertain",
+  );
+  await assert.rejects(
+    control.command({ ...grant, automationStopped: false }),
+    /takeover_request_invalid/,
+  );
+  assert.equal(stops, 1);
+  const replacement = await control.command({ ...grant, leaseId: "replacement" });
+  assert.equal(stops, 2);
+  assert.equal(replacement.state, "human");
+  assert.notEqual(replacement.epoch, lease.epoch);
+  await assert.rejects(control.command({ ...identity, op: "renew" }), /control_stale/);
 });
 
 test("human input consumes one fresh frame and rejects navigation and out-of-bounds pointers", async () => {
