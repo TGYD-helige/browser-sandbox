@@ -13,28 +13,35 @@ export function comparePerformance(baseline, current) {
   for (const before of baseline.cases) {
     const after = current.cases.find((entry) => entry.name === before.name);
     assert(after, `Missing workload ${before.name}`);
-    for (const [phase, reference] of Object.entries(before.phases)) {
+    for (const phase of Object.keys(before.phases)) {
       const measured = after.phases[phase];
       assert(measured, `Missing phase ${before.name}/${phase}`);
       const oldSamples = before.measurements[phase],
         newSamples = after.measurements[phase];
-      assert(oldSamples.length >= 20 && oldSamples.length === newSamples.length);
+      assert(
+        oldSamples.length === baseline.samples && newSamples.length === current.samples,
+        "Missing or extra phase samples",
+      );
       for (const value of [...oldSamples, ...newSamples])
         assert(Number.isFinite(value) && value >= 0);
       const deltas = newSamples
         .map((value, index) => value - oldSamples[index])
         .sort((a, b) => a - b);
       // Initial CI regression guard, relative to the same runner's baseline; not a production SLA.
-      const limitMs = reference.p95Ms * 1.25 + 25;
+      const p95 = (values) =>
+        [...values].sort((a, b) => a - b)[Math.ceil(values.length * 0.95) - 1];
+      const baselineP95Ms = p95(oldSamples),
+        currentP95Ms = p95(newSamples);
+      const limitMs = baselineP95Ms * 1.25 + 25;
       comparisons.push({
         workload: before.name,
         phase,
-        baselineP95Ms: reference.p95Ms,
-        currentP95Ms: measured.p95Ms,
+        baselineP95Ms,
+        currentP95Ms,
         limitMs,
         pairedMedianDeltaMs: deltas[Math.floor(deltas.length / 2)],
         pairedP95DeltaMs: deltas[Math.ceil(deltas.length * 0.95) - 1],
-        passed: measured.p95Ms <= limitMs,
+        passed: currentP95Ms <= limitMs,
       });
     }
   }

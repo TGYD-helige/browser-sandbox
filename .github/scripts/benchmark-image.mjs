@@ -9,9 +9,43 @@ import { arch, cpus, release, tmpdir } from "node:os";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { connectCdp } from "../../dist/cdp.js";
 import { attachStorage, hostRequest } from "../../dist/host-client.js";
+
+export function createBenchmarkSite(root) {
+  const transfers = { download: [], upload: [] };
+  const site = createServer(async (req, res) => {
+    if (req.url === "/page" && req.method === "GET") {
+      res
+        .writeHead(200, { "content-type": "text/html" })
+        .end("<h1>Browser benchmark</h1>");
+      return;
+    }
+    if (req.url !== "/archive") {
+      res.writeHead(404).end();
+      return;
+    }
+    if (req.method !== "GET" && req.method !== "PUT") {
+      res.writeHead(405).end();
+      return;
+    }
+    const start = performance.now();
+    try {
+      if (req.method === "PUT") {
+        await pipeline(req, createWriteStream(join(root, "archive")));
+        res.writeHead(200).end();
+        transfers.upload.push(performance.now() - start);
+      } else {
+        await pipeline(createReadStream(join(root, "archive")), res);
+        transfers.download.push(performance.now() - start);
+      }
+    } catch {
+      res.destroy();
+    }
+  });
+  return { site, transfers };
+}
 
 if (process.argv[2] === "worker") {
   let cdp, sessionId;
@@ -84,33 +118,12 @@ if (process.argv[2] === "worker") {
     cdp?.close();
     process.exit(0);
   });
-} else {
+} else if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const samples = Number(process.env.SAMPLES ?? 20);
   assert(Number.isInteger(samples) && samples >= 10 && samples <= 100);
   const root = await mkdtemp(join(tmpdir(), "browser-benchmark-"));
   const socket = process.env.BROWSER_CONTROL_SOCKET;
-  const transfers = { download: [], upload: [] };
-  const site = createServer(async (req, res) => {
-    if (req.url === "/page") {
-      res
-        .writeHead(200, { "content-type": "text/html" })
-        .end("<h1>Browser benchmark</h1>");
-      return;
-    }
-    const start = performance.now();
-    try {
-      if (req.method === "PUT") {
-        await pipeline(req, createWriteStream(join(root, "archive")));
-        res.writeHead(200).end();
-        transfers.upload.push(performance.now() - start);
-      } else {
-        await pipeline(createReadStream(join(root, "archive")), res);
-        transfers.download.push(performance.now() - start);
-      }
-    } catch {
-      res.destroy();
-    }
-  });
+  const { site, transfers } = createBenchmarkSite(root);
   site.listen(18081, "127.0.0.1");
   await once(site, "listening");
   const origin = "http://127.0.0.1:18081";
@@ -245,6 +258,9 @@ if (process.argv[2] === "worker") {
           await hostRequest(socket, { op: "finalize", executionId });
           finalized = true;
           if (sample >= 0) {
+            const expectedTransfers = profileId && !unused ? 1 : 0;
+            assert.equal(transfers.download.length, expectedTransfers);
+            assert.equal(transfers.upload.length, expectedTransfers);
             results.register.push(registered);
             if (!unused) {
               results.firstBrowserReady.push(ready);

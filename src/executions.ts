@@ -47,6 +47,7 @@ export interface Execution {
   lifetime: AbortController;
   fileTransfers: Set<Promise<void>>;
   revoked: boolean;
+  finishRequested?: boolean;
   browserRequested?: boolean;
   starting?: Promise<BrowserHandle>;
   closing?: Promise<void>;
@@ -122,6 +123,7 @@ export async function createExecutions({
       fail("browser_profile_binding_invalid");
     if (revoked.has(executionId)) fail("browser_execution_revoked");
     let entry = executions.get(executionId);
+    if (entry?.finishRequested) fail("browser_execution_revoked");
     if (!entry && revoked.size >= MAX_REVOKED_EXECUTIONS)
       fail("browser_execution_capacity_exceeded");
     if (entry && entry.profileId !== profileId) fail("browser_profile_binding_changed");
@@ -137,7 +139,12 @@ export async function createExecutions({
       // Explicit registration can resume a failed quiesce only after retirement.
       // A finish or shutdown arriving during this wait remains authoritative.
       await entry.reusable;
-      if (closing || revoked.has(executionId) || executions.get(executionId) !== entry)
+      if (
+        closing ||
+        entry.finishRequested ||
+        revoked.has(executionId) ||
+        executions.get(executionId) !== entry
+      )
         fail("browser_execution_revoked");
       entry.revoked = false;
       entry.lifetime = new AbortController();
@@ -422,14 +429,18 @@ export async function createExecutions({
         request.confirmedSha !== entry.finalized.archive.sha256)
     )
       fail("browser_profile_save_unconfirmed");
-    // Fence a late register even if an execution never started a browser.
-    // Keep old identities fenced; at capacity, drain instead of evicting tombstones.
-    if (request.op === "finish" && revoked.size < MAX_REVOKED_EXECUTIONS)
-      revoked.add(request.executionId);
+    if (request.op === "quiesce" && entry?.finishRequested)
+      fail("browser_execution_revoked");
+    if (request.op === "finish") {
+      if (revoked.size < MAX_REVOKED_EXECUTIONS) revoked.add(request.executionId);
+      // At capacity, a failed cleanup still needs a permanent fence on its live entry.
+      if (entry) entry.finishRequested = true;
+    }
     if (entry) {
       await close(entry, request.op === "finish");
       if (request.op === "finish") executions.delete(request.executionId);
       else {
+        if (entry.finishRequested) fail("browser_execution_revoked");
         entry.starting = null;
         entry.revoked = false;
         entry.lifetime = new AbortController();

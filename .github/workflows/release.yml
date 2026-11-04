@@ -43,7 +43,8 @@ jobs:
             echo 'Record upstream image-distribution authorization before enabling release.' >&2
             exit 1
           fi
-          gh run list --commit "$GITHUB_SHA" --json workflowName,conclusion,status --limit 100 > /tmp/checks.json
+          bash .github/scripts/check-release-tag.sh "$TAG"
+          gh run list --branch master --event push --commit "$GITHUB_SHA" --json workflowName,conclusion,status --limit 100 > /tmp/checks.json
           node --input-type=module -e '
             import fs from "node:fs";
             const runs = JSON.parse(fs.readFileSync("/tmp/checks.json"));
@@ -116,8 +117,4 @@ jobs:
         run: |
           set -euo pipefail
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          bash .github/scripts/check-image-tag.sh "$IMAGE:$TAG"
-          docker buildx imagetools create --tag "$IMAGE:$TAG" "$(cat amd64.txt)" "$(cat arm64.txt)"
-          docker buildx imagetools inspect "$IMAGE:$TAG" > image-manifest.txt
-          printf 'Verified Linux AMD64/ARM64 image: %s:%s.\n\nSee docs/usage.md for deployment conditions. Upstream licenses apply separately.\n' "$IMAGE" "$TAG" > /tmp/release-notes.md
-          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --draft --notes-file /tmp/release-notes.md image-manifest.txt
+          bash .github/scripts/publish-release.sh "$IMAGE" "$TAG"

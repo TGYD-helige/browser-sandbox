@@ -166,7 +166,7 @@ try {
   const diagnostic = error.stderr
     ?.split("\n")
     .find((line) =>
-      /^E2E_FAILURE [A-Za-z]+ at (\.github\/scripts\/e2e\/(pi|dsh|opencode|agent-browser|session-mcp|fixture)\.mjs:\d+:\d+|unknown)$/.test(
+      /^E2E_FAILURE [A-Za-z]+ at (\.github\/scripts\/e2e\/(pi|dsh|opencode|agent-browser|unused|session-mcp|fixture)\.mjs:\d+:\d+|unknown)$/.test(
         line,
       ),
     );
