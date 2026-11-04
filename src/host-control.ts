@@ -1,6 +1,7 @@
 import { chmod, rm } from "node:fs/promises";
 import type { Socket } from "node:net";
 import { createServer as socketServer } from "node:net";
+import { StringDecoder } from "node:string_decoder";
 import { attachArchiveChannel } from "./archive-channel.js";
 
 export async function createHostControl({
@@ -23,18 +24,27 @@ export async function createHostControl({
       socket.on("error", () => {});
       let input = "",
         handled = false;
+      const decoder = new StringDecoder("utf8");
       let storageHandler: ReturnType<typeof attachArchiveChannel>;
       socket.once("end", () => requestLife.abort());
       socket.on("data", (chunk) => {
-        if (storageHandler) return storageHandler(chunk);
+        const decoded = decoder.write(chunk);
+        if (storageHandler) return storageHandler(decoded);
         if (handled) return;
-        input += chunk;
+        input += decoded;
         if (input.length > (host ? 262144 : 4096)) return socket.destroy();
         if (!input.includes("\n")) return;
         handled = true;
         let request: any;
         try {
           request = JSON.parse(input.slice(0, input.indexOf("\n")));
+          if (
+            !request ||
+            typeof request !== "object" ||
+            Array.isArray(request) ||
+            typeof request.op !== "string"
+          )
+            throw Error("browser_request_invalid");
         } catch {
           socket.end(JSON.stringify({ error: "browser_request_invalid" }) + "\n");
           return;
@@ -49,9 +59,10 @@ export async function createHostControl({
           socket.destroy();
         }, budget);
         socket.once("close", () => clearTimeout(deadline));
-        const work = host
-          ? executions.dispatch(request, requestLife.signal)
-          : Promise.reject(Error("browser_host_authority_required"));
+        const work = Promise.resolve().then(() => {
+          if (!host) throw Error("browser_host_authority_required");
+          return executions.dispatch(request, requestLife.signal);
+        });
         work.then(
           (result) => {
             if (

@@ -5,7 +5,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createLocalProfiles } from "../dist/local-profiles.js";
+import { clearWindowState, createLocalProfiles } from "../dist/local-profiles.js";
 
 const linux = process.platform === "linux" && process.getuid?.() === 0;
 const readAs = (uid, file) =>
@@ -14,6 +14,83 @@ const readAs = (uid, file) =>
     ["--reuid=" + uid, "--regid=" + uid, "--clear-groups", "cat", file],
     { stdio: ["ignore", "pipe", "pipe"] },
   ).toString();
+
+test("window cleanup cannot traverse an execution-owned Default symlink", {
+  skip: !linux,
+}, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "profile-window-links-"));
+  await fs.chmod(root, 0o711);
+  const profile = path.join(root, "profile"),
+    outside = path.join(root, "outside");
+  await fs.mkdir(profile, { mode: 0o700 });
+  await fs.chown(profile, 100001, 100001);
+  await fs.mkdir(path.join(outside, "Sessions"), { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(outside, "Sessions", "sentinel"), "keep");
+  execFileSync(
+    process.execPath,
+    [
+      "-e",
+      "require('node:fs').symlinkSync(process.argv[1], process.argv[2])",
+      outside,
+      path.join(profile, "Default"),
+    ],
+    { uid: 100001, gid: 100001 },
+  );
+  try {
+    await assert.rejects(clearWindowState(profile));
+    assert.equal(
+      await fs.readFile(path.join(outside, "Sessions", "sentinel"), "utf8"),
+      "keep",
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("window cleanup pins nested directories against execution rename races", {
+  skip: !linux,
+}, async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "profile-window-race-"));
+  await fs.chmod(root, 0o711);
+  const profile = path.join(root, "profile"),
+    defaults = path.join(profile, "Default"),
+    state = path.join(defaults, "Sessions"),
+    outside = path.join(root, "outside");
+  await fs.mkdir(state, { recursive: true, mode: 0o700 });
+  for (const name of [profile, defaults, state]) await fs.chown(name, 100001, 100001);
+  await fs.mkdir(outside, { mode: 0o700 });
+  await fs.writeFile(path.join(state, "sentinel"), "old");
+  await fs.writeFile(path.join(outside, "sentinel"), "keep");
+  const readdir = fs.readdir.bind(fs);
+  let replaced = false;
+  t.mock.method(fs, "readdir", async (name, ...args) => {
+    const entries = await readdir(name, ...args);
+    if (!replaced && (await fs.realpath(name)) === state) {
+      replaced = true;
+      execFileSync(
+        process.execPath,
+        [
+          "-e",
+          `
+        const fs = require('node:fs'); fs.renameSync(process.argv[1], process.argv[1] + '-old');
+        fs.symlinkSync(process.argv[2], process.argv[1]);
+      `,
+          state,
+          outside,
+        ],
+        { uid: 100001, gid: 100001 },
+      );
+    }
+    return entries;
+  });
+  try {
+    await assert.rejects(clearWindowState(profile));
+    assert(replaced);
+    assert.equal(await fs.readFile(path.join(outside, "sentinel"), "utf8"), "keep");
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 test("a private Profile survives execution cleanup and securely transfers across UIDs and processes", {
   skip: !linux,
 }, async () => {

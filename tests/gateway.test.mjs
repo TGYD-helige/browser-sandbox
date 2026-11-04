@@ -2067,6 +2067,123 @@ test("session controls require the execution kernel UID and cannot address anoth
   }
 });
 
+test("human takeover cancels a pending idle retirement until control is released", async () => {
+  let closed = 0;
+  const f = await fixture(
+    async ({ endpoint }) => ({
+      endpoint,
+      close: async () => {
+        closed++;
+      },
+    }),
+    (socket, data) => {
+      let message;
+      try {
+        message = JSON.parse(String(data));
+      } catch {
+        socket.send(data);
+        return;
+      }
+      const result =
+        message.method === "Target.getTargets"
+          ? {
+              targetInfos: [
+                { type: "page", targetId: "page", url: "https://example.com/login" },
+              ],
+            }
+          : message.method === "Target.attachToTarget"
+            ? { sessionId: "session" }
+            : {};
+      socket.send(JSON.stringify({ id: message.id, result }));
+    },
+  );
+  try {
+    const { wsEndpoint } = await f.gateway.command({
+      op: "register",
+      executionId: ids[0],
+    });
+    const peer = await connect(wsEndpoint);
+    const disconnected = once(peer, "close");
+    peer.close();
+    await disconnected;
+    await delay(50);
+    const lease = await f.gateway.command(
+      {
+        op: "takeover",
+        executionId: ids[0],
+        action: {
+          op: "acquire",
+          actorId: "operator",
+          leaseId: "lease",
+          automationStopped: true,
+        },
+      },
+      true,
+    );
+    assert.equal(lease.state, "human");
+    await delay(1150);
+    assert.equal(closed, 0);
+    assert.equal(
+      (
+        await f.gateway.command(
+          { op: "session", executionId: ids[0], action: "status" },
+          true,
+        )
+      ).state,
+      "live",
+    );
+    await f.gateway.command(
+      {
+        op: "takeover",
+        executionId: ids[0],
+        action: {
+          op: "release",
+          actorId: "operator",
+          leaseId: "lease",
+          epoch: lease.epoch,
+          origin: lease.origin,
+        },
+      },
+      true,
+    );
+    await delay(1150);
+    assert.equal(closed, 1);
+  } finally {
+    await f.stop();
+  }
+});
+
+test("invalid host JSON values do not crash the gateway subprocess", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const root = await mkdtemp(join(tmpdir(), "browser-invalid-control-"));
+  const source = `
+    import assert from 'node:assert/strict';
+    import { createRequire } from 'node:module';
+    import { createGateway } from ${JSON.stringify(new URL("../dist/gateway.js", import.meta.url).href)};
+    import { hostRequest } from ${JSON.stringify(new URL("../dist/host-client.js", import.meta.url).href)};
+    const WebSocket = createRequire(${JSON.stringify(import.meta.url)})('ws');
+    const socketPath = ${JSON.stringify(join(root, "control.sock"))};
+    const gateway = await createGateway({
+      WebSocket, WebSocketServer: WebSocket.WebSocketServer, port: 0,
+      dataRoot: ${JSON.stringify(join(root, "data"))}, socketPath,
+      healthy: async () => true, launch: async () => { throw Error('unused'); },
+    });
+    try {
+      for (const request of [null, [], '中文', 42, true, {}])
+        await assert.rejects(hostRequest(socketPath, request), /browser_request_invalid/);
+      assert.equal((await fetch('http://127.0.0.1:' + gateway.port + '/health')).status, 204);
+    } finally { await gateway.stop(); }
+  `;
+  try {
+    execFileSync(process.execPath, ["--input-type=module", "-e", source], {
+      timeout: 10_000,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("failed readback restores idle retirement after disconnecting automation", async () => {
   let closed = 0;
   const f = await fixture(

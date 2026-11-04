@@ -95,13 +95,11 @@ async function extract(plain, root, uid, gid = uid) {
         await fs.mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
         await pipeline(stream, createWriteStream(target, { flags: "wx", mode: 0o600 }));
       }
-      // Extraction only touches a new root-owned tree, before any execution UID can traverse it.
-      if (header.name !== "cookies.json") await fs.chown(target, uid, gid);
       next();
     })().catch((error) => unpack.destroy(error));
   });
   await pipeline(createReadStream(plain), unpack);
-  // Implicit directories may not have appeared as tar headers.
+  // Keep the new Profile root private until all descendants have been processed.
   async function own(dir) {
     for (const item of await fs.readdir(dir, { withFileTypes: true })) {
       const file = path.join(dir, item.name);

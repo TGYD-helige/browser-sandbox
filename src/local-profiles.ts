@@ -8,11 +8,53 @@ import path from "node:path";
 export const validProfileId = (value) =>
   typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(value);
 export async function clearWindowState(profileDir) {
-  for (const name of ["Sessions", "Session Storage"])
-    await fs.rm(path.join(profileDir, "Default", name), {
-      recursive: true,
-      force: true,
+  const flags =
+    constants.O_RDONLY |
+    constants.O_NOFOLLOW |
+    constants.O_NONBLOCK |
+    constants.O_DIRECTORY;
+  const profile = await fs.open(profileDir, flags).catch((error) => {
+    if (error.code !== "ENOENT") throw error;
+    return null;
+  });
+  if (!profile) return;
+  let defaults: Awaited<ReturnType<typeof fs.open>>;
+  let count = 0;
+  const pinned = (fd, name) =>
+    process.platform === "linux" ? "/proc/self/fd/" + fd.fd : name;
+  const remove = async (name, depth = 0) => {
+    if (++count > 100_000 || depth > 128)
+      throw Error("browser_profile_capacity_exceeded");
+    const directory = await fs.open(name, flags).catch(async (error) => {
+      if (error.code === "ENOENT") return null;
+      if (error.code !== "ENOTDIR" && error.code !== "ELOOP") throw error;
+      await fs.unlink(name);
+      return null;
     });
+    if (!directory) return;
+    try {
+      for (const item of await fs.readdir(pinned(directory, name)))
+        await remove(path.join(pinned(directory, name), item), depth + 1);
+    } finally {
+      await directory.close();
+    }
+    await fs.rmdir(name);
+  };
+  try {
+    // Linux isolation pins both ancestors across concurrent execution renames.
+    const root = pinned(profile, profileDir);
+    defaults = await fs.open(path.join(root, "Default"), flags).catch((error) => {
+      if (error.code !== "ENOENT") throw error;
+      return null;
+    });
+    if (!defaults) return;
+    const directory = pinned(defaults, path.join(root, "Default"));
+    for (const name of ["Sessions", "Session Storage"])
+      await remove(path.join(directory, name));
+  } finally {
+    await defaults?.close();
+    await profile.close();
+  }
 }
 // Every ancestor is runtime-owned. Pin each node before changing UID; never follow
 // browser-controlled symlinks or transfer a hardlinked file outside this tree.

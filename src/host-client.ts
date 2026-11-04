@@ -1,4 +1,5 @@
 import { connect } from "node:net";
+import { StringDecoder } from "node:string_decoder";
 
 export interface Registration {
   executionId: string;
@@ -24,6 +25,7 @@ export function hostRequest<T = Record<string, unknown>>(
   return new Promise((resolve, reject) => {
     const socket = connect(socketPath + ".auth");
     let input = "";
+    const decoder = new StringDecoder("utf8");
     const finish = (error?: Error, result?: T) => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", abort);
@@ -42,7 +44,7 @@ export function hostRequest<T = Record<string, unknown>>(
       socket.write(JSON.stringify(request) + "\n");
     });
     socket.on("data", (chunk) => {
-      input += chunk;
+      input += decoder.write(chunk);
       if (input.length > 32 * 1024 * 1024)
         return finish(Error("browser_control_response_too_large"));
       if (!input.includes("\n")) return;
@@ -75,6 +77,7 @@ export async function attachStorage(
   const socket = connect(socketPath + ".auth");
   const life = new AbortController();
   let input = "";
+  const decoder = new StringDecoder("utf8");
   let ready = false;
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -99,7 +102,7 @@ export async function attachStorage(
       ),
     );
     socket.on("data", (chunk) => {
-      input += chunk;
+      input += decoder.write(chunk);
       if (input.length > 262_144) return socket.destroy();
       while (input.includes("\n")) {
         const end = input.indexOf("\n");

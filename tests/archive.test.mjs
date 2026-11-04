@@ -1,10 +1,100 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createCipheriv, createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import tar from "tar-stream";
 import { createProfileArchive } from "../dist/profiles.js";
+
+test("restore keeps the new tree private until extraction and ownership transfer complete", {
+  skip: process.platform !== "linux" || process.getuid?.() !== 0,
+}, async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "archive-ownership-"));
+  await fs.chmod(root, 0o711);
+  const outside = path.join(root, "outside");
+  const journalDir = path.join(root, "journal");
+  await fs.mkdir(outside, { mode: 0o700 });
+  await fs.mkdir(journalDir, { mode: 0o711 });
+  const entry = {
+    profileId: "race",
+    uid: 100001,
+    journalDir,
+    profileDir: path.join(journalDir, "profile"),
+  };
+  const pack = tar.pack();
+  const chunks = [];
+  const collected = (async () => {
+    for await (const chunk of pack) chunks.push(chunk);
+  })();
+  pack.entry({ name: "profile", type: "directory" });
+  pack.entry({ name: "profile/redirect", type: "directory" });
+  pack.entry({ name: "profile/redirect/payload" }, "restored");
+  pack.finalize();
+  await collected;
+  const key = Buffer.alloc(32, 1),
+    iv = Buffer.alloc(12, 2);
+  const browserVersion = "Google Chrome 146.0.7680.177";
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(entry.profileId + "\n" + browserVersion));
+  const encrypted = Buffer.concat([
+    cipher.update(Buffer.concat(chunks)),
+    cipher.final(),
+  ]);
+  const archive = createProfileArchive({
+    browserVersion: async () => browserVersion,
+    fetchImpl: async () => new Response(encrypted),
+  });
+  let attempted = false;
+  const chown = fs.chown.bind(fs);
+  t.mock.method(fs, "chown", async (name, uid, gid) => {
+    await chown(name, uid, gid);
+    if (name !== entry.profileDir || uid !== entry.uid || attempted) return;
+    attempted = true;
+    // Schedule the execution UID exactly when root first grants traversal.
+    execFileSync(
+      process.execPath,
+      [
+        "-e",
+        `
+      try { require('node:fs').symlinkSync(process.argv[1], process.argv[2]); }
+      catch (error) { if (!['EEXIST', 'EACCES'].includes(error.code)) throw error; }
+    `,
+        outside,
+        path.join(entry.profileDir, "redirect"),
+      ],
+      { uid: entry.uid, gid: entry.uid },
+    );
+  });
+  try {
+    await archive.restore(entry, {
+      seed: {
+        schema: "browser-sandbox.profile/v1",
+        browserVersion,
+        key: key.toString("hex"),
+        iv: iv.toString("hex"),
+        tag: cipher.getAuthTag().toString("hex"),
+        sha256: createHash("sha256").update(encrypted).digest("hex"),
+        byteSize: encrypted.length,
+        url: "archive",
+      },
+    });
+    assert(attempted);
+    assert.equal((await fs.stat(outside)).uid, 0);
+    assert.deepEqual(await fs.readdir(outside), []);
+    assert.equal(
+      await fs.readFile(path.join(entry.profileDir, "redirect", "payload"), "utf8"),
+      "restored",
+    );
+    assert.equal(
+      (await fs.stat(path.join(entry.profileDir, "redirect", "payload"))).uid,
+      entry.uid,
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 test("runtime saves encrypted immutable data and cold restores only the same Profile", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "profile-archive-")),

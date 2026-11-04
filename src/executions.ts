@@ -311,6 +311,8 @@ export async function createExecutions({
           for (const peer of entry.peers) peer.cleanup();
         });
       }
+      clearTimeout(entry.idle);
+      entry.idle = null;
       try {
         return await entry.takeover.command(request.action, signal);
       } finally {
@@ -554,7 +556,16 @@ export async function createExecutions({
     )
       return;
     entry.idleAt = Date.now();
-    entry.idle ??= setTimeout(() => retire(entry), 1000);
+    entry.idle ??= setTimeout(() => {
+      entry.idle = null;
+      if (
+        !entry.peers.size &&
+        !entry.revoked &&
+        !entry.session.retained &&
+        (!entry.takeover || entry.takeover.state === "automation")
+      )
+        retire(entry);
+    }, 1000);
     reclaimIdle().catch(() => {});
   }
   return {
