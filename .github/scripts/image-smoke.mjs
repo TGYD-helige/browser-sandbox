@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
@@ -11,10 +12,12 @@ import { sessionRequest } from "../../dist/session.js";
 
 if (process.argv[2] === "worker") {
   const endpoint = process.env.BROWSER_WS_ENDPOINT;
-  const connection = connectCdp(endpoint);
+  let connection = connectCdp(endpoint);
+  let extra;
   connection.catch(() => {});
-  process.on("message", async ({ id, method, params = {} }) => {
+  process.on("message", async ({ id, method, params = {}, sessionId }) => {
     try {
+      if (method === "reconnect") connection = connectCdp(endpoint);
       const upstream = await connection;
       const cdp = {
         async call(method, ...args) {
@@ -26,7 +29,13 @@ if (process.argv[2] === "worker") {
         },
       };
       let result;
-      if (method === "session")
+      if (method === "reconnect") result = await cdp.call("Browser.getVersion");
+      else if (method === "extra") {
+        extra = await connectCdp(endpoint);
+        result = await extra.call("Browser.getVersion");
+      } else if (method === "extraVersion")
+        result = await extra.call("Browser.getVersion");
+      else if (method === "session")
         result = await sessionRequest(endpoint, params.action, params.durationMs);
       else if (method === "deny") {
         await assert.rejects(connectCdp(params.endpoint), /connect_failed|closed/);
@@ -99,7 +108,7 @@ if (process.argv[2] === "worker") {
         }
         assert.equal(downloaded, "browser download", "browser_smoke_download_missing");
         result = true;
-      } else result = await cdp.call(method, params);
+      } else result = await cdp.call(method, params, sessionId);
       process.send({ id, result });
     } catch (error) {
       process.send({
@@ -120,6 +129,20 @@ if (process.argv[2] === "worker") {
     process.exit(0);
   });
 } else {
+  const reserved = (
+    await readFile("/proc/sys/net/ipv4/ip_local_reserved_ports", "utf8")
+  )
+    .trim()
+    .split(",")
+    .map((range) => range.split("-").map(Number));
+  for (const port of [
+    3001,
+    ...Array.from({ length: 1000 }, (_, index) => 42000 + index),
+  ])
+    assert(
+      reserved.some(([start, end = start]) => port >= start && port <= end),
+      "Internal ports must be reserved from random client listeners",
+    );
   const socket = process.env.BROWSER_CONTROL_SOCKET;
   const workers = new Set(),
     executions = new Set();
@@ -134,7 +157,9 @@ if (process.argv[2] === "worker") {
     else
       res
         .writeHead(200, { "content-type": "text/html" })
-        .end('<input type="file"><a href="/download">Download</a>');
+        .end(
+          '<input type="file"><a href="/download">Download</a><input id="human" style="position:fixed;left:20px;top:100px"><button style="position:fixed;left:20px;top:150px" onclick="document.body.dataset.human=document.querySelector(\'#human\').value">Submit</button>',
+        );
   });
   // This fixture owns the container network namespace; avoid protected CDP ports.
   site.listen(18080, "127.0.0.1");
@@ -173,7 +198,7 @@ if (process.argv[2] === "worker") {
       }
       pending.clear();
     });
-    const call = (method, params) =>
+    const call = (method, params, sessionId = undefined) =>
       new Promise((resolve, reject) => {
         const id = ++sequence;
         const timer = setTimeout(() => {
@@ -181,7 +206,7 @@ if (process.argv[2] === "worker") {
           reject(Error("browser_smoke_timeout"));
         }, 55000);
         pending.set(id, { resolve, reject, timer });
-        child.send({ id, method, params });
+        child.send({ id, method, params, sessionId });
       });
     const ready = call("Browser.getVersion");
     const finish = async () => {
@@ -194,7 +219,7 @@ if (process.argv[2] === "worker") {
       executions.delete(executionId);
       return result;
     };
-    return { wsEndpoint, ready, call, finish };
+    return { executionId, wsEndpoint, ready, call, finish };
   };
   try {
     const a = await create(100011),
@@ -251,8 +276,97 @@ if (process.argv[2] === "worker") {
     cookies = (await third.call("Storage.getCookies")).cookies;
     assert(!cookies.some((cookie) => cookie.name === "persistent"));
     await third.finish();
+    const human = await create(100017);
+    await human.ready;
+    await human.call("Target.createTarget", { url: "about:blank" });
+    const { targetId } = await human.call("Target.createTarget", {
+      url: "http://127.0.0.1:18080/human",
+    });
+    const { sessionId } = await human.call("Target.attachToTarget", {
+      targetId,
+      flatten: true,
+    });
+    for (let i = 0; i < 100; i++) {
+      const result = await human.call(
+        "Runtime.evaluate",
+        { expression: "!!document.querySelector('#human')", returnByValue: true },
+        sessionId,
+      );
+      if (result.result.value) break;
+      await delay(25);
+    }
+    await human.call("extra");
+    const takeover = (action) =>
+      hostRequest(socket, { op: "takeover", executionId: human.executionId, action });
+    const holder = { actorId: "human", leaseId: randomUUID() };
+    await assert.rejects(
+      takeover({ op: "acquire", ...holder, automationStopped: false }),
+      /takeover_request_invalid/,
+    );
+    const lease = await takeover({ op: "acquire", ...holder, automationStopped: true });
+    assert.equal(lease.state, "human");
+    assert.equal(lease.targetId, targetId);
+    await assert.rejects(
+      takeover({
+        op: "acquire",
+        actorId: "other-human",
+        leaseId: randomUUID(),
+        automationStopped: true,
+      }),
+      /control_busy/,
+    );
+    const control = (op, args = {}) =>
+      takeover({ ...holder, epoch: lease.epoch, op, ...args });
+    await assert.rejects(
+      human.call("Browser.getVersion"),
+      /browser_smoke_cdp_Browser_getVersion/,
+    );
+    await assert.rejects(human.call("extraVersion"));
+    await human.call("deny", { endpoint: human.wsEndpoint });
+    await delay(1150);
+    assert.equal((await control("status")).state, "human");
+    assert.equal((await control("renew")).epoch, lease.epoch);
+    const oldFrame = await control("frame");
+    const frame = await control("frame");
+    const bytes = Buffer.from(frame.data, "base64");
+    assert(bytes.length > 100 && bytes.subarray(0, 2).toString("hex") === "ffd8");
+    const input = (op, image, args = {}) =>
+      control(op, {
+        targetId: image.targetId,
+        origin: image.origin,
+        frameRevision: image.frameRevision,
+        ...args,
+      });
+    await assert.rejects(input("pointer", oldFrame, { x: 30, y: 110 }), /frame_stale/);
+    await input("pointer", frame, { x: 30, y: 110 });
+    await assert.rejects(input("text", frame, { text: "stale" }), /frame_stale/);
+    await input("text", await control("frame"), { text: "human typed" });
+    await input("key", await control("frame"), { key: "Tab" });
+    await input("pointer", await control("frame"), { x: 30, y: 160 });
+    await assert.rejects(
+      control("release", { origin: "https://wrong.example" }),
+      /origin_mismatch/,
+    );
+    await human.call("deny", { endpoint: human.wsEndpoint });
+    assert.equal(
+      (await control("release", { origin: lease.origin })).state,
+      "automation",
+    );
+    await human.call("reconnect");
+    const attached = await human.call("Target.attachToTarget", {
+      targetId,
+      flatten: true,
+    });
+    const result = await human.call(
+      "Runtime.evaluate",
+      { expression: "document.body.dataset.human", returnByValue: true },
+      attached.sessionId,
+    );
+    assert.equal(result.result.value, "human typed");
+    await assert.rejects(control("frame"), /control_stale/);
+    await human.finish();
     console.log(
-      "Image lifecycle: UID/Cookie isolation, concurrency queue, upload/download, persistent Cookie restore/deletion, and Session Cookie exclusion passed",
+      "Image lifecycle: UID/Cookie isolation, concurrency queue, files, Cookie restore/deletion, and real human takeover (fencing, screenshots, input, stale frames, renewal and return) passed",
     );
   } finally {
     for (const child of workers) child.kill("SIGTERM");

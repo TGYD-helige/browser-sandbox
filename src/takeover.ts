@@ -320,7 +320,9 @@ export class Takeover {
       const { targetInfos } = await cdp.call("Target.getTargets");
       const target = targetInfos.find(
         (item: any) =>
-          item.type === "page" && (!this.targetId || item.targetId === this.targetId),
+          item.type === "page" &&
+          (!this.targetId || item.targetId === this.targetId) &&
+          /^https?:/.test(item.url),
       );
       if (!target || !/^https?:/.test(target.url))
         throw Error("browser_page_unavailable");

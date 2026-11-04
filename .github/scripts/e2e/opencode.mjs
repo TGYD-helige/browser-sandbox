@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { sessionRequest } from "../../../dist/session.js";
 import {
+  assertPng,
   complete,
   fixture,
   HANDOFF_MS,
@@ -60,6 +61,7 @@ try {
             "browser_select_page",
             "browser_upload_file",
             "browser_take_snapshot",
+            "browser_take_screenshot",
           ].includes(next[0])
         ) {
           const pages = request.messages
@@ -179,6 +181,10 @@ try {
             ["browser_new_page", { url: site.url }],
             ["browser_evaluate_script", { function: inspect }],
             ["browser_take_snapshot", {}],
+            [
+              "browser_take_screenshot",
+              { format: "png", filePath: join(home, "screenshot.png") },
+            ],
             ["browser_upload_file", { filePaths: [files.path] }],
             [
               "browser_evaluate_script",
@@ -250,6 +256,7 @@ try {
       "OpenCode did not control its browser session",
     );
     if (phase === "retain") {
+      if (!modelMode) assertPng(await readFile(join(home, "screenshot.png")));
       const retained = await sessionRequest(endpoint);
       assert.equal(retained.state, "retained");
       generation = retained.generation;

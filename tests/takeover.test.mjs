@@ -16,6 +16,7 @@ test("a lease is granted only after automation has stopped and requires the same
         if (method === "Target.getTargets")
           return {
             targetInfos: [
+              { type: "page", targetId: "blank", url: "about:blank" },
               { type: "page", targetId: "page", url: "https://example.com/login" },
             ],
           };
@@ -37,6 +38,7 @@ test("a lease is granted only after automation has stopped and requires the same
   finish();
   const lease = await acquiring;
   assert.equal(lease.state, "human");
+  assert.equal(lease.targetId, "page");
   await assert.rejects(
     control.command({
       op: "release",

@@ -272,7 +272,7 @@ export async function createExecutions({
     }
     return Promise.all(released);
   }
-  async function close(entry: Execution, removeProfile: boolean) {
+  async function close(entry: Execution, removeProfile: boolean, signal?: AbortSignal) {
     entry.revoked = true;
     entry.lifetime?.abort();
     clearTimeout(entry.idle);
@@ -282,7 +282,7 @@ export async function createExecutions({
     await Promise.allSettled(entry.fileTransfers);
     entry.lifetime?.abort();
     if (removeProfile) {
-      await entry.profileLease?.release();
+      await entry.profileLease?.release(signal);
       entry.profileLease = null;
       await rm(entry.root, { recursive: true, force: true });
     }
@@ -437,7 +437,7 @@ export async function createExecutions({
       if (entry) entry.finishRequested = true;
     }
     if (entry) {
-      await close(entry, request.op === "finish");
+      await close(entry, request.op === "finish", signal);
       if (request.op === "finish") executions.delete(request.executionId);
       else {
         if (entry.finishRequested) fail("browser_execution_revoked");
@@ -469,6 +469,7 @@ export async function createExecutions({
                 entry.profileId,
                 entry.executionId,
                 entry.uid,
+                abort.signal,
               );
               phases.profileAcquireMs = performance.now() - start;
               acquiredLease = entry.profileLease;

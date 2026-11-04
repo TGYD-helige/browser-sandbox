@@ -32,6 +32,7 @@ const config = {
   wsEndpoint: endpoint,
   session: { enabled: true, key: home, retentionMs: HANDOFF_MS },
 };
+let failure;
 try {
   if (process.env.E2E_MODE === "model") {
     for (const key of ["OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL_NAME"])
@@ -255,14 +256,27 @@ try {
   console.log(
     `Pi ${process.env.E2E_MODE ?? "tools"}: real browser tools, session handoff, upload/download, and form submission passed`,
   );
+} catch (error) {
+  failure = error;
 } finally {
-  const client = new DevToolsClient(config);
-  try {
-    await client.sessionControl("release");
-  } finally {
-    await client.close();
+  for (const cleanup of [
+    async () => {
+      const client = new DevToolsClient(config);
+      try {
+        await client.sessionControl("release");
+      } finally {
+        await client.close();
+      }
+    },
+    () => sessionRequest(endpoint, "stop"),
+    () => site.close(),
+    () => rm(home, { recursive: true, force: true }),
+  ]) {
+    try {
+      await cleanup();
+    } catch (error) {
+      failure ??= error;
+    }
   }
-  await sessionRequest(endpoint, "stop");
-  await site.close();
-  await rm(home, { recursive: true, force: true });
 }
+if (failure) throw failure;

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
+import { readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 export async function fixture() {
@@ -143,6 +145,18 @@ export async function prepareFiles(site, endpoint) {
 }
 
 export async function transferFiles(call, page, files) {
+  const filePath = join(tmpdir(), `browser-screenshot-${randomUUID()}.png`);
+  try {
+    const screenshot = await call("take_screenshot", {
+      pageId: page,
+      format: "png",
+      filePath,
+    });
+    assert(!screenshot.isError, "Browser screenshot tool failed");
+    assertPng(await readFile(filePath));
+  } finally {
+    await rm(filePath, { force: true });
+  }
   const snapshot = await call("take_snapshot", { pageId: page });
   const uploaded = await call("upload_file", {
     pageId: page,
@@ -157,4 +171,10 @@ export async function transferFiles(call, page, files) {
   });
   assert(!downloaded.isError, "Browser download interaction failed");
   await files.verify();
+}
+
+export function assertPng(bytes) {
+  assert(bytes.length > 100, "Screenshot is empty");
+  assert.equal(bytes.subarray(0, 8).toString("hex"), "89504e470d0a1a0a");
+  assert(bytes.readUInt32BE(16) > 0 && bytes.readUInt32BE(20) > 0);
 }
