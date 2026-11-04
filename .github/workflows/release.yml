@@ -49,7 +49,7 @@ jobs:
             const runs = JSON.parse(fs.readFileSync("/tmp/checks.json"));
             for (const name of ["Runtime CI", "Browser integration"]) {
               const latest = runs.find(run => run.workflowName === name);
-              if (latest?.status !== "completed" || latest.conclusion !== "success") throw Error(`${name} must pass at this commit`);
+              if (latest?.status !== "completed" || latest.conclusion !== "success") throw Error(name + " must pass at this commit");
             }
           '
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
@@ -119,5 +119,5 @@ jobs:
           bash .github/scripts/check-image-tag.sh "$IMAGE:$TAG"
           docker buildx imagetools create --tag "$IMAGE:$TAG" "$(cat amd64.txt)" "$(cat arm64.txt)"
           docker buildx imagetools inspect "$IMAGE:$TAG" > image-manifest.txt
-          printf 'Verified Linux AMD64/ARM64 image: `%s:%s`.\n\nSee docs/usage.md for deployment conditions. Upstream licenses apply separately.\n' "$IMAGE" "$TAG" > /tmp/release-notes.md
+          printf 'Verified Linux AMD64/ARM64 image: %s:%s.\n\nSee docs/usage.md for deployment conditions. Upstream licenses apply separately.\n' "$IMAGE" "$TAG" > /tmp/release-notes.md
           gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --draft --notes-file /tmp/release-notes.md image-manifest.txt
