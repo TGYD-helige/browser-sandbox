@@ -63,16 +63,18 @@ try {
             },
           }),
         );
-        if (mode === "managed")
-          await writeFile(
-            join(home, "settings.json"),
-            JSON.stringify({
-              "pi-browser-use": {
-                sessionMode: "existing",
-                wsEndpoint: process.env.BROWSER_WS_ENDPOINT,
-              },
-            }),
-          );
+        await writeFile(
+          join(home, "settings.json"),
+          JSON.stringify({
+            "pi-browser-use":
+              mode === "managed"
+                ? {
+                    sessionMode: "existing",
+                    wsEndpoint: process.env.BROWSER_WS_ENDPOINT,
+                  }
+                : { sessionMode: "persistent", userDataDir: join(home, "profile") },
+          }),
+        );
         const start = performance.now();
         const task = run(
           process.execPath,
@@ -89,7 +91,8 @@ try {
             "json",
             "--no-approve",
             "--no-extensions",
-            ...(mode === "managed" ? ["--extension", extension] : []),
+            "--extension",
+            extension,
             "--no-context-files",
             "--no-skills",
             "--no-prompt-templates",
@@ -166,7 +169,7 @@ try {
         warmups: 3,
         measurements: durations,
         phases,
-        note: "Matched ordinary/managed Pi CLI tasks with a local scripted provider, no browser tools invoked. Startup includes task completion and process exit, excludes host registration/finalization (measured by the image benchmark). Not a model/network or production SLA measurement.",
+        note: "Matched local-persistent/managed-endpoint Pi CLI tasks with the same browser extension and local scripted provider, no browser tools invoked. Startup includes task completion and process exit, excludes host registration/finalization (measured by the image benchmark). Not a model/network or production SLA measurement.",
       },
       null,
       2,
