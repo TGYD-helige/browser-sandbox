@@ -1,4 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
+import { channel } from "node:diagnostics_channel";
 import { chmod, lstat, mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -46,6 +47,7 @@ export interface Execution {
   lifetime: AbortController;
   fileTransfers: Set<Promise<void>>;
   revoked: boolean;
+  finishRequested?: boolean;
   browserRequested?: boolean;
   starting?: Promise<BrowserHandle>;
   closing?: Promise<void>;
@@ -63,6 +65,9 @@ export interface Execution {
   takeover?: Takeover;
 }
 
+const preparationTiming = channel("browser-sandbox.preparation");
+
+const MAX_REVOKED_EXECUTIONS = 65536;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const fail = (code) => {
   throw Error(code);
@@ -118,6 +123,9 @@ export async function createExecutions({
       fail("browser_profile_binding_invalid");
     if (revoked.has(executionId)) fail("browser_execution_revoked");
     let entry = executions.get(executionId);
+    if (entry?.finishRequested) fail("browser_execution_revoked");
+    if (!entry && revoked.size >= MAX_REVOKED_EXECUTIONS)
+      fail("browser_execution_capacity_exceeded");
     if (entry && entry.profileId !== profileId) fail("browser_profile_binding_changed");
     if (entry && storage !== undefined && !entry.storageRequired)
       fail("browser_profile_binding_changed");
@@ -131,7 +139,12 @@ export async function createExecutions({
       // Explicit registration can resume a failed quiesce only after retirement.
       // A finish or shutdown arriving during this wait remains authoritative.
       await entry.reusable;
-      if (closing || revoked.has(executionId) || executions.get(executionId) !== entry)
+      if (
+        closing ||
+        entry.finishRequested ||
+        revoked.has(executionId) ||
+        executions.get(executionId) !== entry
+      )
         fail("browser_execution_revoked");
       entry.revoked = false;
       entry.lifetime = new AbortController();
@@ -416,12 +429,18 @@ export async function createExecutions({
         request.confirmedSha !== entry.finalized.archive.sha256)
     )
       fail("browser_profile_save_unconfirmed");
-    // Fence a late register even if an execution never started a browser.
-    if (request.op === "finish") revoked.add(request.executionId);
+    if (request.op === "quiesce" && entry?.finishRequested)
+      fail("browser_execution_revoked");
+    if (request.op === "finish") {
+      if (revoked.size < MAX_REVOKED_EXECUTIONS) revoked.add(request.executionId);
+      // At capacity, a failed cleanup still needs a permanent fence on its live entry.
+      if (entry) entry.finishRequested = true;
+    }
     if (entry) {
       await close(entry, request.op === "finish");
       if (request.op === "finish") executions.delete(request.executionId);
       else {
+        if (entry.finishRequested) fail("browser_execution_revoked");
         entry.starting = null;
         entry.revoked = false;
         entry.lifetime = new AbortController();
@@ -436,6 +455,7 @@ export async function createExecutions({
     if (!entry.starting) {
       entry.session.starting();
       let hardExpiresAt: number;
+      const phases = { profileAcquireMs: 0, profileRestoreMs: 0, browserLaunchMs: 0 };
       const abort = (entry.abort = new AbortController());
       let acquiredLease: Awaited<ReturnType<typeof profileStore.acquire>>;
       const starting = Promise.resolve(entry.reusable)
@@ -444,25 +464,29 @@ export async function createExecutions({
           if (abort.signal.aborted) fail("browser_launch_cancelled");
           if (entry.profileId) {
             if (!entry.profileLease) {
+              const start = performance.now();
               entry.profileLease = await profileStore.acquire(
                 entry.profileId,
                 entry.executionId,
                 entry.uid,
               );
+              phases.profileAcquireMs = performance.now() - start;
               acquiredLease = entry.profileLease;
             }
             entry.profileDir = entry.profileLease.profileDir;
             entry.journalDir = entry.profileLease.journalDir;
             if ((entry.archive || entry.storageRequired) && !entry.profileRestored) {
+              const start = performance.now();
               const archive = entry.storageRequired
                 ? await requestArchive(entry, "load", abort.signal)
                 : entry.archive;
               await profileArchive.restore(entry, archive, abort.signal);
+              phases.profileRestoreMs = performance.now() - start;
               entry.profileRestored = true;
             }
             entry.profileUsed = true;
             if (abort.signal.aborted || entry.revoked) fail("browser_launch_cancelled");
-            await clearWindowState(entry.profileDir);
+            await clearWindowState(entry.profileDir, abort.signal);
             await writeFile(
               join(entry.root, "owner.json"),
               JSON.stringify({
@@ -473,8 +497,10 @@ export async function createExecutions({
               { mode: 0o600 },
             );
           }
+          if (abort.signal.aborted || entry.revoked) fail("browser_launch_cancelled");
           hardExpiresAt = Date.now() + maxSessionMs;
-          return launch({
+          const start = performance.now();
+          const browser = await launch({
             ...entry,
             signal: abort.signal,
             sessionBoundary: !!entry.profileId,
@@ -488,10 +514,15 @@ export async function createExecutions({
               ),
             ),
           });
+          phases.browserLaunchMs = performance.now() - start;
+          return browser;
         })
         .then((browser) => {
-          if (entry.starting === starting && !entry.revoked && !abort.signal.aborted)
+          if (entry.starting === starting && !entry.revoked && !abort.signal.aborted) {
             entry.session.ready(hardExpiresAt);
+            if (preparationTiming.hasSubscribers)
+              preparationTiming.publish({ executionId: entry.executionId, ...phases });
+          }
           // Watch Browserless/Chrome even while no MCP client is attached.
           browser.closed?.then(() => retire(entry, starting)).catch(() => {});
           return browser;

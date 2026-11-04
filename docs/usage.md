@@ -171,3 +171,9 @@ Image CI publishes `browser-performance-<runner>` JSON artifacts for AMD64 and A
 First readiness includes the CDP client, archive restoration, Chrome startup, navigation, and screenshot. Finalization includes checkpoint, browser exit, archive/encryption, upload, and reference commit. Storage runs over local HTTP in the test namespace; these measurements do not establish production storage latency, an optimization speedup, or an agreed production performance threshold. `scripts/benchmark.mjs` remains a separate synthetic gateway diagnostic.
 
 To collect the image benchmark locally, build the image and run `BENCHMARK_OUTPUT=/tmp/browser-performance.json bash .github/scripts/verify-image.sh browser-sandbox:local`. Set `BENCHMARK_SAMPLES` between 10 and 100 to change the measured sample count.
+
+## Runtime admission and cancellation limits
+
+A runtime retains up to 65,536 finished execution identities to fence delayed registrations. After reaching that budget it rejects new identities with `browser_execution_capacity_exceeded`, while existing registrations and their cleanup remain available. It never evicts a tombstone to admit a new execution. Hosts should drain a runtime before that budget is exhausted, confirm browser shutdown, and replace it through their normal deployment lifecycle. Continue to use fresh execution UUIDs and fence old host requests across replacement; tombstones are process-local, not a durable authorization database.
+
+Archive hashing, streams, directory traversal, window cleanup, and the default browser-version subprocess observe lifecycle cancellation. An already-issued filesystem operation must finish before ownership is released, so a stalled kernel or filesystem can still delay cleanup. Cancelled saves retain the recoverable Profile, remove intermediate archive files, and can be retried without replaying website operations. Cancelled restoration never reports successful preparation or starts Chrome afterward.
