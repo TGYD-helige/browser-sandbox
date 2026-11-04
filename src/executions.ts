@@ -15,6 +15,7 @@ import {
   validProfileId,
 } from "./local-profiles.js";
 import { normalizeAllowedDomains } from "./network-policy.js";
+import { createProfileWork } from "./profile-work.js";
 import { createProfileArchive } from "./profiles.js";
 import { BrowserSession } from "./session.js";
 import { Takeover } from "./takeover.js";
@@ -85,6 +86,8 @@ export async function createExecutions({
 }) {
   if (!Number.isSafeInteger(maxBrowsers) || maxBrowsers < 1)
     fail("browser_capacity_invalid");
+  // The fixed debug-port pool bounds live executions and their cleanup waiters.
+  const profileWork = createProfileWork(maxBrowsers, 43000 - 42000);
   await mkdir(dataRoot, { recursive: true, mode: 0o755 });
   await chmod(dataRoot, 0o755);
   const executions = new Map<string, Execution>(),
@@ -282,7 +285,8 @@ export async function createExecutions({
     await Promise.allSettled(entry.fileTransfers);
     entry.lifetime?.abort();
     if (removeProfile) {
-      await entry.profileLease?.release(signal);
+      if (entry.profileLease)
+        await profileWork.cleanup(() => entry.profileLease.release(signal), signal);
       entry.profileLease = null;
       await rm(entry.root, { recursive: true, force: true });
     }
@@ -376,10 +380,12 @@ export async function createExecutions({
       await close(entry, false);
       if (signal?.aborted) fail("browser_request_cancelled");
       if (!entry.finalized) {
-        const archive = entry.storageRequired
-          ? await requestArchive(entry, "save", signal)
-          : (request.archive ?? entry.archive);
-        entry.finalized = await profileArchive.save(entry, archive, signal);
+        entry.finalized = await profileWork.run(async () => {
+          const archive = entry.storageRequired
+            ? await requestArchive(entry, "save", signal)
+            : (request.archive ?? entry.archive);
+          return profileArchive.save(entry, archive, signal);
+        }, signal);
       }
       return entry.finalized;
     }
@@ -463,40 +469,43 @@ export async function createExecutions({
         .then(async () => {
           if (abort.signal.aborted) fail("browser_launch_cancelled");
           if (entry.profileId) {
-            if (!entry.profileLease) {
-              const start = performance.now();
-              entry.profileLease = await profileStore.acquire(
-                entry.profileId,
-                entry.executionId,
-                entry.uid,
-                abort.signal,
+            await profileWork.run(async () => {
+              if (!entry.profileLease) {
+                const start = performance.now();
+                entry.profileLease = await profileStore.acquire(
+                  entry.profileId,
+                  entry.executionId,
+                  entry.uid,
+                  abort.signal,
+                );
+                phases.profileAcquireMs = performance.now() - start;
+                acquiredLease = entry.profileLease;
+              }
+              entry.profileDir = entry.profileLease.profileDir;
+              entry.journalDir = entry.profileLease.journalDir;
+              if ((entry.archive || entry.storageRequired) && !entry.profileRestored) {
+                const start = performance.now();
+                const archive = entry.storageRequired
+                  ? await requestArchive(entry, "load", abort.signal)
+                  : entry.archive;
+                await profileArchive.restore(entry, archive, abort.signal);
+                phases.profileRestoreMs = performance.now() - start;
+                entry.profileRestored = true;
+              }
+              entry.profileUsed = true;
+              if (abort.signal.aborted || entry.revoked)
+                fail("browser_launch_cancelled");
+              await clearWindowState(entry.profileDir, abort.signal);
+              await writeFile(
+                join(entry.root, "owner.json"),
+                JSON.stringify({
+                  uid: entry.uid,
+                  profileDir: entry.profileDir,
+                  debugPort: entry.debugPort,
+                }),
+                { mode: 0o600 },
               );
-              phases.profileAcquireMs = performance.now() - start;
-              acquiredLease = entry.profileLease;
-            }
-            entry.profileDir = entry.profileLease.profileDir;
-            entry.journalDir = entry.profileLease.journalDir;
-            if ((entry.archive || entry.storageRequired) && !entry.profileRestored) {
-              const start = performance.now();
-              const archive = entry.storageRequired
-                ? await requestArchive(entry, "load", abort.signal)
-                : entry.archive;
-              await profileArchive.restore(entry, archive, abort.signal);
-              phases.profileRestoreMs = performance.now() - start;
-              entry.profileRestored = true;
-            }
-            entry.profileUsed = true;
-            if (abort.signal.aborted || entry.revoked) fail("browser_launch_cancelled");
-            await clearWindowState(entry.profileDir, abort.signal);
-            await writeFile(
-              join(entry.root, "owner.json"),
-              JSON.stringify({
-                uid: entry.uid,
-                profileDir: entry.profileDir,
-                debugPort: entry.debugPort,
-              }),
-              { mode: 0o600 },
-            );
+            }, abort.signal);
           }
           if (abort.signal.aborted || entry.revoked) fail("browser_launch_cancelled");
           hardExpiresAt = Date.now() + maxSessionMs;
@@ -535,7 +544,7 @@ export async function createExecutions({
             !(error instanceof VerifiedBrowserCheckpointFailure)
           ) {
             try {
-              await acquiredLease.release();
+              await profileWork.cleanup(() => acquiredLease.release());
               if (entry.profileLease === acquiredLease) {
                 entry.profileLease = null;
                 entry.profileUsed = false;

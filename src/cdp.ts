@@ -7,6 +7,7 @@ export async function connectCdp(endpoint: string, signal?: AbortSignal) {
     handshakeTimeout: 30_000,
   });
   let sequence = 0;
+  let ready = false;
   const pending = new Map<
     number,
     {
@@ -35,6 +36,7 @@ export async function connectCdp(endpoint: string, signal?: AbortSignal) {
     }
     const call = pending.get(response.id);
     if (!call) return;
+    ready = true;
     pending.delete(response.id);
     clearTimeout(call.timer);
     response.error
@@ -58,10 +60,14 @@ export async function connectCdp(endpoint: string, signal?: AbortSignal) {
         return Promise.reject(Error("browser_cdp_closed"));
       return new Promise((resolve, reject) => {
         const id = ++sequence;
-        const timer = setTimeout(() => {
-          pending.delete(id);
-          reject(Error("browser_cdp_timeout"));
-        }, 15_000);
+        // Allow the gateway's 45s cold startup before the ordinary 15s command budget.
+        const timer = setTimeout(
+          () => {
+            pending.delete(id);
+            reject(Error("browser_cdp_timeout"));
+          },
+          ready ? 15_000 : 60_000,
+        );
         pending.set(id, { resolve, reject, timer });
         socket.send(
           JSON.stringify({

@@ -319,3 +319,165 @@ for (const fault of ["mkdir", "ownership", "marker-write"])
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
+test("Profile handoff bounds concurrent file work and drains failures before unlocking", {
+  skip: !linux,
+}, async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "profile-workers-"));
+  const store = createLocalProfiles({ root });
+  let lease = await store.acquire("workers", "seed", 100001);
+  const directory = lease.profileDir;
+  for (let i = 0; i < 12; i++)
+    await fs.writeFile(path.join(directory, `file-${i}`), "keep");
+  await lease.release();
+  lease = null;
+  const open = fs.open.bind(fs);
+  let active = 0,
+    peak = 0,
+    fail = false;
+  t.mock.method(fs, "open", async (...args) => {
+    const fd = await open(...args);
+    const stat = await fd.stat();
+    if (stat.isFile() && stat.size === 4) {
+      const original = fd.stat.bind(fd);
+      t.mock.method(fd, "stat", async () => {
+        active++;
+        peak = Math.max(peak, active);
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          if (fail) throw Error("handoff_injected_failure");
+          return await original();
+        } finally {
+          active--;
+        }
+      });
+    }
+    return fd;
+  });
+  try {
+    lease = await store.acquire("workers", "parallel", 100002);
+    assert(peak > 1 && peak <= 4);
+    await lease.release();
+    lease = null;
+    fail = true;
+    await assert.rejects(
+      store.acquire("workers", "failed", 100003),
+      /handoff_injected_failure/,
+    );
+    assert.equal(active, 0);
+    fail = false;
+    lease = await store.acquire("workers", "retry", 100004);
+    assert.equal(await fs.readFile(path.join(directory, "file-0"), "utf8"), "keep");
+    await lease.release();
+    lease = null;
+  } finally {
+    t.mock.restoreAll();
+    await lease?.abandon();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("parallel Profile handoff rejects links without changing outside ownership or permissions", {
+  skip: !linux,
+}, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "profile-links-"));
+  const store = createLocalProfiles({ root });
+  const outside = path.join(root, "outside");
+  await fs.writeFile(outside, "private", { mode: 0o600 });
+  try {
+    for (const kind of ["symlink", "hardlink"]) {
+      const lease = await store.acquire(kind, "seed", 100001);
+      const profileDir = lease.profileDir;
+      await lease.release();
+      const link = path.join(profileDir, "unsafe");
+      if (kind === "symlink") await fs.symlink(outside, link);
+      else await fs.link(outside, link);
+      await assert.rejects(store.acquire(kind, "blocked", 100002));
+      const stat = await fs.stat(outside);
+      assert.equal(stat.uid, 0);
+      assert.equal(stat.mode & 0o7777, 0o600);
+      await fs.unlink(link);
+      const retry = await store.acquire(kind, "retry", 100002);
+      await retry.release();
+    }
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Profile handoff normalizes permissive and special modes across ownership changes", {
+  skip: !linux,
+}, async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "profile-modes-"));
+  const store = createLocalProfiles({ root });
+  let lease;
+  try {
+    lease = await store.acquire("modes", "seed", 100001);
+    const directory = path.join(lease.profileDir, "nested");
+    const file = path.join(directory, "saved");
+    await fs.mkdir(directory);
+    await fs.writeFile(file, "keep");
+    await fs.chmod(directory, 0o2777);
+    await fs.chmod(file, 0o4666);
+    await lease.release();
+    lease = await store.acquire("modes", "next", 100002);
+    for (const [name, mode] of [
+      [lease.profileDir, 0o700],
+      [directory, 0o700],
+      [file, 0o600],
+    ]) {
+      const stat = await fs.stat(name);
+      assert.equal(stat.uid, 100002);
+      assert.equal(stat.gid, 100002);
+      assert.equal(stat.mode & 0o7777, mode);
+    }
+    await lease.release();
+    lease = null;
+    assert.equal((await fs.stat(file)).uid, 0);
+    assert.equal((await fs.stat(file)).mode & 0o7777, 0o600);
+  } finally {
+    await lease?.abandon();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Profile release seals permissions changed by its old UID after the stat snapshot", {
+  skip: !linux,
+}, async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "profile-mode-race-"));
+  await fs.chmod(root, 0o711);
+  const store = createLocalProfiles({ root });
+  let lease;
+  let raced = false;
+  try {
+    lease = await store.acquire("mode-race", "seed", 100001);
+    const profileDir = lease.profileDir;
+    const open = fs.open.bind(fs);
+    t.mock.method(fs, "open", async (name, ...args) => {
+      const fd = await open(name, ...args);
+      if (name === profileDir && !raced) {
+        const stat = fd.stat.bind(fd);
+        t.mock.method(fd, "stat", async () => {
+          const snapshot = await stat();
+          execFileSync(
+            process.execPath,
+            ["-e", "require('node:fs').chmodSync(process.argv[1], 0o777)", profileDir],
+            { uid: 100001, gid: 100001 },
+          );
+          raced = true;
+          return snapshot;
+        });
+      }
+      return fd;
+    });
+    await lease.release();
+    lease = null;
+    assert(raced);
+    assert.equal((await fs.stat(profileDir)).uid, 0);
+    assert.equal((await fs.stat(profileDir)).mode & 0o7777, 0o700);
+  } finally {
+    t.mock.restoreAll();
+    await lease?.abandon();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
