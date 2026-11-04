@@ -50,12 +50,38 @@ jobs:
           if-no-files-found: error
         if: always()
 
+  browser-session:
+    name: Pi browser-session E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build browser runtime and harness images
+        run: |
+          docker build -t browser-sandbox:local .
+          docker build -f Dockerfile.e2e -t browser-sandbox-e2e:local .
+      - name: Pi scripted agent session handoff
+        run: node .github/scripts/e2e.mjs pi
+      - name: Pi model-driven agent session handoff
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_model) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          E2E_MODE: model
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL_NAME: ${{ vars.OPENAI_MODEL_NAME || secrets.OPENAI_MODEL_NAME }}
+        run: node .github/scripts/e2e.mjs pi
+
   harness:
     name: ${{ matrix.harness }} browser E2E
     strategy:
       fail-fast: false
       matrix:
-        harness: [pi, dsh, opencode, agent-browser, unused]
+        harness: [dsh, opencode, agent-browser, unused]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
