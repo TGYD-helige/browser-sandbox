@@ -82,6 +82,7 @@ When editing agent instructions, skills, tool descriptions, or model-facing prom
 - Test external behavior through lifecycle interfaces and standard CDP clients. Reuse migrated regression coverage; add focused tests for changed branches, cancellation, limits, permissions, and failure recovery.
 - Run affected tests, typechecks, and formatting checks. For browser launch, Docker, sandbox, or upstream changes, run real-renderer and image integration checks on supported architectures when available.
 - Verify harness integrations for changes to connection or lifecycle contracts. Distinguish local tests, real-browser checks, CI, and deployed behavior; state skipped checks and remaining risks.
+- Commit only documentation for users, covering installation, configuration, public contracts, and operation. Keep performance reports, implementation notes, review findings, and internal process records in CI artifacts or task discussion.
 - Keep Markdown prose paragraphs on one source line. Write repository documentation and all authored GitHub content in English, including issue/PR titles, bodies, comments, and reviews; preserve exact source quotations and logs when needed.
 - Follow repository issue/PR templates when present. Describe the concrete behavior change, reason, compatibility impact, and verification without unrelated cleanup.
 

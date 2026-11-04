@@ -165,9 +165,7 @@ try {
         samples,
         warmups: 3,
         measurements: durations,
-        phases: Object.fromEntries(
-          Object.entries(durations).map(([name, values]) => [name, summary(values)]),
-        ),
+        phases,
         note: "Matched ordinary/managed Pi CLI tasks with a local scripted provider, no browser tools invoked. Startup includes task completion and process exit, excludes host registration/finalization (measured by the image benchmark). Not a model/network or production SLA measurement.",
       },
       null,

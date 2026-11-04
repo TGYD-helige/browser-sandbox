@@ -40,7 +40,7 @@ jobs:
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
           [[ "$TAG" == "v$(node -p "require('./package.json').version")" ]]
           if [[ "$BROWSERLESS_APPROVAL" != approved || "$CLOAK_APPROVAL" != approved ]]; then
-            echo 'Record upstream image-distribution authorization before enabling release; see docs/release.md.' >&2
+            echo 'Record upstream image-distribution authorization before enabling release.' >&2
             exit 1
           fi
           gh run list --commit "$GITHUB_SHA" --json workflowName,conclusion,status --limit 100 > /tmp/checks.json
@@ -119,5 +119,5 @@ jobs:
           bash .github/scripts/check-image-tag.sh "$IMAGE:$TAG"
           docker buildx imagetools create --tag "$IMAGE:$TAG" "$(cat amd64.txt)" "$(cat arm64.txt)"
           docker buildx imagetools inspect "$IMAGE:$TAG" > image-manifest.txt
-          printf 'Verified Linux AMD64/ARM64 image: `%s:%s`.\n\nSee docs/usage.md and docs/release.md for deployment and licensing conditions.\n' "$IMAGE" "$TAG" > /tmp/release-notes.md
+          printf 'Verified Linux AMD64/ARM64 image: `%s:%s`.\n\nSee docs/usage.md for deployment conditions. Upstream licenses apply separately.\n' "$IMAGE" "$TAG" > /tmp/release-notes.md
           gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --draft --notes-file /tmp/release-notes.md image-manifest.txt
