@@ -71,12 +71,13 @@ When editing agent instructions, skills, tool descriptions, or model-facing prom
 - Keep temporary and persistent cleanup semantics explicit. Finish removes temporary execution data, retains authorized persistent Profiles, and never deletes the only recoverable copy before remote save confirmation.
 - Retain Cookie deletion/expiry semantics and exclude Session Cookies from cold restore. Keep live page retention distinct from persistent Profile restoration.
 - Preserve Chrome sandboxing, privilege separation, private directory permissions, internal CDP port protection, and trust-boundary validation. Document deployment assumptions; separate directories and capability URLs alone do not establish multi-tenant isolation.
-- Keep real credentials out of execution environments, pages, CDP results, logs, fixtures, and source. Return sanitized actionable errors; never silently fall back to another browser or identity.
+- Keep infrastructure secrets, including Browserless tokens, host-control credentials, and archive encryption keys, out of execution environments, pages, CDP results, logs, fixtures, and source. Return sanitized actionable errors; never silently fall back to another browser or identity.
 - Propagate connection failures without automatically replaying CDP commands or website writes. Human takeover must confirm automation has stopped before granting control.
 
 ## Verification and delivery
 
 - Keep public files and GitHub metadata free of private repository names, URLs, source paths, and commit identifiers. Describe public interfaces and dependencies instead.
+- Store GitHub Actions-specific test runners, integration fixtures, and test-only dependency manifests under `.github/scripts/`. Keep reusable unit tests in `tests/` and general build/developer utilities in `scripts/`. Keep workflow YAML focused on orchestration, and update workflows, Dockerfiles, package commands, relative imports, and usage instructions together when relocating scripts.
 - Use the repository's actual manifests and CI configuration as the source of truth for commands. Until tooling exists, report missing checks rather than inventing successful results.
 - Test external behavior through lifecycle interfaces and standard CDP clients. Reuse migrated regression coverage; add focused tests for changed branches, cancellation, limits, permissions, and failure recovery.
 - Run affected tests, typechecks, and formatting checks. For browser launch, Docker, sandbox, or upstream changes, run real-renderer and image integration checks on supported architectures when available.
