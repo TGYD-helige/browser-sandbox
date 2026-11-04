@@ -1,0 +1,124 @@
+name: Build browser images
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Tag to publish alongside sha-<commit> for every configured image name
+        type: string
+        default: latest
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-image-build
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ${{ vars.BAIDU_CCR_REGISTRY }}
+  NAMESPACE: ${{ vars.BAIDU_CCR_NAMESPACE }}
+  IMAGE_NAMES: ${{ vars.BROWSER_IMAGE_NAMES }}
+  IMAGE_TAG: ${{ inputs.image_tag }}
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      image: ${{ steps.validate.outputs.image }}
+    steps:
+      - name: Validate publication configuration
+        id: validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == refs/heads/master ]] || exit 1
+          [[ "$REGISTRY" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]+)?$ ]] || exit 1
+          [[ "$NAMESPACE" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || exit 1
+          [[ "$IMAGE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] || exit 1
+          read -ra names <<< "$IMAGE_NAMES"
+          ((${#names[@]} > 0))
+          for name in "${names[@]}"; do
+            [[ "$name" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || exit 1
+          done
+          echo "image=$REGISTRY/$NAMESPACE/${names[0]}" >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: amd64
+          - runner: ubuntu-24.04-arm
+            architecture: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and verify native image
+        run: |
+          docker build -t browser-sandbox:local .
+          bash .github/scripts/verify-image.sh browser-sandbox:local
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Verify Pi agent browser-session tools
+        run: |
+          docker build -f Dockerfile.e2e -t browser-sandbox-e2e:local .
+          node .github/scripts/e2e.mjs pi
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.BAIDU_CCR_USERNAME }}
+          password: ${{ secrets.BAIDU_CCR_PASSWORD }}
+      - name: Push verified architecture image
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          ARCH: ${{ matrix.architecture }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ARCH"
+          docker tag browser-sandbox:local "$tag"
+          docker push "$tag"
+          docker image inspect "$tag" --format '{{index .RepoDigests 0}}' > "$ARCH.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-build-digest-${{ matrix.architecture }}
+          path: ${{ matrix.architecture }}.txt
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, image]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: browser-build-digest-*
+          merge-multiple: true
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.BAIDU_CCR_USERNAME }}
+          password: ${{ secrets.BAIDU_CCR_PASSWORD }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Publish verified multi-architecture images
+        shell: bash
+        run: |
+          set -euo pipefail
+          read -ra names <<< "$IMAGE_NAMES"
+          for name in "${names[@]}"; do
+            image="$REGISTRY/$NAMESPACE/$name"
+            docker buildx imagetools create \
+              --tag "$image:sha-$GITHUB_SHA" --tag "$image:$IMAGE_TAG" \
+              "$(cat amd64.txt)" "$(cat arm64.txt)"
+            printf 'Published %s:sha-%s and %s:%s (Linux AMD64/ARM64).\n' \
+              "$image" "$GITHUB_SHA" "$image" "$IMAGE_TAG" >> "$GITHUB_STEP_SUMMARY"
+          done
