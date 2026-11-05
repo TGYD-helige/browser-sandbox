@@ -307,6 +307,11 @@ export async function createExecutions({
       if (!host) fail("browser_host_authority_required");
       const entry = executions.get(request.executionId);
       if (!entry || entry.revoked) fail("browser_execution_revoked");
+      if (
+        Object.hasOwn(request, "expectedStarting") &&
+        entry.starting !== request.expectedStarting
+      )
+        fail("browser_session_lost");
       if (request.action === "stop") {
         if (entry.takeover && entry.takeover.state !== "automation")
           fail("browser_control_busy");

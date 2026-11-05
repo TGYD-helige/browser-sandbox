@@ -2,13 +2,15 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
-import { request } from "node:http";
+import { createServer, request } from "node:http";
+import { connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import WebSocket, { WebSocketServer } from "ws";
 import { browserAuthRequest } from "../dist/browser-auth.js";
+import { attachCdpProxy } from "../dist/cdp-proxy.js";
 import { createGateway } from "../dist/gateway.js";
 import { hostRequest } from "../dist/host-client.js";
 import { sessionRequest } from "../dist/session.js";
@@ -21,6 +23,8 @@ async function fixture(t, access = {}, gatewayOptions = {}) {
   const extraTargets = [];
   let targetsGate, notifyTargets;
   let captureFailures = 0;
+  let launchError;
+  let closeBrowser = async () => {};
   let launches = 0,
     url = "https://example.com/form",
     generation = "document-1";
@@ -107,9 +111,14 @@ async function fixture(t, access = {}, gatewayOptions = {}) {
     ...gatewayOptions,
     async launch() {
       launches++;
+      if (launchError) {
+        const error = launchError;
+        launchError = undefined;
+        throw error;
+      }
       return {
         endpoint: `ws://127.0.0.1:${upstream.address().port}`,
-        close: async () => {},
+        close: () => closeBrowser(),
       };
     },
   });
@@ -183,6 +192,18 @@ async function fixture(t, access = {}, gatewayOptions = {}) {
     agent,
     viewer,
     calls,
+    failNextLaunch: (error) => {
+      launchError = error;
+    },
+    onBrowserClose: (callback) => {
+      closeBrowser = callback;
+    },
+    rawAgent(url) {
+      const client = new WebSocket(url);
+      clients.push(client);
+      client.on("error", () => {});
+      return client;
+    },
     addTarget: (target) => extraTargets.push(target),
     failNextCapture: () => {
       captureFailures++;
@@ -941,4 +962,150 @@ test("pre-start grants also bind when the private UID transport starts the brows
   await assert.rejects(f.agent(access.cdpUrl), /403/);
   const oldView = await f.viewer(access.viewerUrl);
   assert.equal((await once(oldView.client, "close"))[0], 1008);
+});
+
+test("remote stop returns its terminal response before the revoked connection closes", async (t) => {
+  const f = await fixture(t);
+  const access = await f.issue();
+  await f.agent(access.cdpUrl);
+  const result = await sessionRequest(access.cdpUrl, "stop");
+  assert.equal(result.state, "stopped");
+  await assert.rejects(sessionRequest(access.cdpUrl));
+  await assert.rejects(f.agent(access.cdpUrl), /403/);
+  const fresh = await f.issue();
+  assert.equal((await sessionRequest(fresh.cdpUrl)).state, "stopped");
+});
+
+test("remote startup failure delivers its sanitized WebSocket close frame and revokes the grant", async (t) => {
+  const f = await fixture(t);
+  const access = await f.issue();
+  f.failNextLaunch(Error("browser_profile_storage_unavailable"));
+  const client = f.rawAgent(access.cdpUrl);
+  const closed = once(client, "close");
+  const [code, reason] = await closed;
+  assert.equal(code, 1011);
+  assert.equal(reason.toString(), "browser_profile_storage_unavailable");
+  await assert.rejects(f.agent(access.cdpUrl), /403/);
+  assert.equal(f.launches, 1);
+});
+
+test("an admitted slow stop drains while the same grant already rejects new requests", async (t) => {
+  const f = await fixture(t);
+  const access = await f.issue();
+  await f.agent(access.cdpUrl);
+  let notifyClosing;
+  const closing = new Promise((resolve) => {
+    notifyClosing = resolve;
+  });
+  f.onBrowserClose(async () => {
+    notifyClosing();
+    await delay(1200);
+  });
+  const stopping = sessionRequest(access.cdpUrl, "stop");
+  await closing;
+  await assert.rejects(sessionRequest(access.cdpUrl));
+  await assert.rejects(f.agent(access.cdpUrl), /403/);
+  assert.equal((await stopping).state, "stopped");
+});
+
+test("pipelined requests cannot truncate an admitted stop response", async (t) => {
+  const f = await fixture(t);
+  const access = await f.issue();
+  await f.agent(access.cdpUrl);
+  f.onBrowserClose(() => delay(30));
+  const socket = connect(Number(new URL(f.origin).port), "127.0.0.1");
+  t.after(() => socket.destroy());
+  socket.on("error", () => {});
+  let output = "";
+  socket.on("data", (data) => {
+    output += data;
+  });
+  const closed = once(socket, "close");
+  await once(socket, "connect");
+  const path = `${new URL(access.cdpUrl).pathname}/session`;
+  const body = JSON.stringify({ action: "stop" });
+  socket.write(
+    `POST ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}GET ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n`,
+  );
+  await closed;
+  assert.match(output, /HTTP\/1\.1 200/);
+  assert.match(output, /"state":"stopped"/);
+  await assert.rejects(f.agent(access.cdpUrl), /403/);
+});
+
+test("explicit revocation overrides a generation's terminal-response drain", async (t) => {
+  const f = await fixture(t);
+  const access = await f.issue();
+  await f.agent(access.cdpUrl);
+  let started, release;
+  const entered = new Promise((resolve) => {
+    started = resolve;
+  });
+  const closing = new Promise((resolve) => {
+    release = resolve;
+  });
+  f.onBrowserClose(async () => {
+    started();
+    await closing;
+  });
+  const stopping = sessionRequest(access.cdpUrl, "stop").then(
+    () => "unexpected success",
+    () => "cancelled",
+  );
+  await entered;
+  await f.gateway.command({ op: "access_revoke", executionId: f.executionId }, true);
+  let timer;
+  let outcome;
+  try {
+    outcome = await Promise.race([
+      stopping,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve("not cancelled"), 1000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    release();
+  }
+  assert.equal(outcome, "cancelled");
+});
+
+test("CDP admission rechecks a grant revoked while authorization was awaited", async (t) => {
+  const server = createServer();
+  const life = new AbortController();
+  let launches = 0;
+  const entry = { revoked: false, peers: new Set() };
+  const proxy = attachCdpProxy({
+    server,
+    WebSocket,
+    WebSocketServer,
+    executions: {
+      closing: false,
+      ensureStarted() {
+        launches++;
+      },
+    },
+    authorize: async () => {
+      queueMicrotask(() => life.abort());
+      return { entry, signal: life.signal };
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const client = new WebSocket(
+    `ws://127.0.0.1:${server.address().port}/execution/${"a".repeat(64)}`,
+  );
+  client.on("error", () => {});
+  t.after(async () => {
+    client.terminate();
+    proxy.close();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const status = await new Promise((resolve) =>
+    client.once("unexpected-response", (_req, res) => {
+      res.resume();
+      resolve(res.statusCode);
+    }),
+  );
+  assert.equal(status, 403);
+  assert.equal(launches, 0);
 });

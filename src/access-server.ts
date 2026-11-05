@@ -29,9 +29,10 @@ interface Grant {
   browserSignal?: AbortSignal;
   expiresAt: number;
   life: AbortController;
-  connections: Set<any>;
+  connections: Map<any, (browserEnded: boolean) => boolean | void>;
   timer: ReturnType<typeof setTimeout>;
   cleanup(): void;
+  browserEnded(): void;
 }
 const errorCode = (error: any) =>
   /^browser_[a-z_]+$/.test(error?.message)
@@ -98,8 +99,8 @@ export async function createAccessServer({
     if (grant.browser || !grant.entry.starting) return;
     grant.browser = grant.entry.starting;
     grant.browserSignal = grant.entry.abort.signal;
-    grant.browserSignal.addEventListener("abort", grant.cleanup, { once: true });
-    if (grant.browserSignal.aborted) grant.cleanup();
+    grant.browserSignal.addEventListener("abort", grant.browserEnded, { once: true });
+    if (grant.browserSignal.aborted) grant.browserEnded();
   }
   function resolve(token: string, kind: Grant["kind"]) {
     const grant = grants.get(token);
@@ -122,10 +123,19 @@ export async function createAccessServer({
     }
     return grant;
   }
-  function track(grant: Grant, socket: any) {
-    if (grant.connections.has(socket)) return;
-    grant.connections.add(socket);
-    socket.once("close", () => grant.connections.delete(socket));
+  function track(
+    grant: Grant,
+    connection: any,
+    close = (_browserEnded: boolean) => {
+      connection.destroy ? connection.destroy() : connection.terminate();
+    },
+  ) {
+    if (grant.connections.has(connection)) return;
+    grant.connections.set(connection, close);
+    connection.once("close", () => {
+      grant.connections.delete(connection);
+      if (grant.life.signal.aborted && !grant.connections.size) grant.cleanup();
+    });
   }
   function issue(
     entry: any,
@@ -136,19 +146,21 @@ export async function createAccessServer({
   ) {
     const token = randomBytes(32).toString("hex");
     const life = new AbortController();
-    const revoke = () => {
-      grants.delete(token);
+    const revoke = (browserEnded = false) => {
       if (viewportOwners.get(entry) === grant) {
         viewportOwners.delete(entry);
         executions.releaseViewport(entry, grant.actorId);
       }
       life.abort();
-      clearTimeout(grant.timer);
-      entry.lifetime.signal.removeEventListener("abort", revoke);
-      grant.browserSignal?.removeEventListener("abort", revoke);
-      for (const connection of grant.connections)
-        connection.destroy ? connection.destroy() : connection.terminate();
-      grant.connections.clear();
+      grant.browserSignal?.removeEventListener("abort", grant.browserEnded);
+      for (const [connection, close] of grant.connections) {
+        if (close(browserEnded) !== true) grant.connections.delete(connection);
+      }
+      if (!grant.connections.size) {
+        grants.delete(token);
+        clearTimeout(grant.timer);
+        entry.lifetime.signal.removeEventListener("abort", grant.cleanup);
+      }
     };
     const grant: Grant = {
       token,
@@ -160,22 +172,25 @@ export async function createAccessServer({
       leaseId: randomUUID(),
       expiresAt,
       life,
-      connections: new Set(),
-      timer: setTimeout(revoke, expiresAt - Date.now()),
-      cleanup: revoke,
+      connections: new Map(),
+      timer: setTimeout(() => revoke(), expiresAt - Date.now()),
+      cleanup: () => revoke(),
+      browserEnded: () => revoke(true),
     };
     grant.timer.unref();
-    entry.lifetime.signal.addEventListener("abort", revoke, { once: true });
+    entry.lifetime.signal.addEventListener("abort", grant.cleanup, { once: true });
     grants.set(token, grant);
     bindBrowser(grant);
     return grant;
   }
+  const stopResponses = new WeakSet<object>();
   const files = createHttpHandler({
     executions,
     healthy: async () => true,
     resolvePeerUid: undefined,
     fileTransfers,
     authentication,
+    onSessionStop: (_req, res) => stopResponses.add(res),
     resolveAccess: (token) => resolve(token, "cdp")?.entry,
   });
   const server = createServer(async (req, res) => {
@@ -211,15 +226,20 @@ export async function createAccessServer({
       res.end();
       return;
     }
-    track(grant, req.socket);
-    const abort = () => {
-      req.destroy();
-      res.destroy();
-    };
-    grant.life.signal.addEventListener("abort", abort, { once: true });
-    res.once("close", () => grant.life.signal.removeEventListener("abort", abort));
+    track(grant, res, (browserEnded) => {
+      if (browserEnded && stopResponses.has(res)) {
+        // Only this admitted terminal response may drain, within the handler's deadline.
+        res.shouldKeepAlive = false;
+        return true;
+      } else {
+        req.destroy();
+        res.destroy();
+      }
+    });
     await files(req, res);
   });
+  // Do not admit pipelined work that can tear down a prior terminal response.
+  server.maxRequestsPerSocket = 1;
   const cdp = attachCdpProxy({
     server,
     WebSocket,
@@ -231,8 +251,15 @@ export async function createAccessServer({
       const token = /^\/execution\/([a-f0-9]{64})$/.exec(req.url ?? "")?.[1];
       const grant = resolve(token, "cdp");
       if (!grant) return null;
-      track(grant, req.socket);
-      return grant.entry;
+      track(grant, req.socket, (browserEnded) => {
+        if (!browserEnded) return req.socket.destroy();
+        // The CDP proxy must send its startup-failure close frame before teardown.
+        const timer = setTimeout(() => req.socket.destroy(), 1000);
+        timer.unref();
+        req.socket.once("close", () => clearTimeout(timer));
+        return true;
+      });
+      return { entry: grant.entry, signal: grant.life.signal };
     },
   });
   const viewers = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });

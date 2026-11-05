@@ -6,6 +6,7 @@ export function createHttpHandler({
   resolveAccess = undefined,
   fileTransfers = { active: 0 },
   authentication = undefined,
+  onSessionStop = undefined,
 }) {
   async function authorize(capability, socket) {
     const entry = resolveAccess
@@ -95,6 +96,7 @@ export function createHttpHandler({
           res.end();
           return;
         }
+        const starting = entry.starting;
         const abort = new AbortController();
         const timer = setTimeout(() => {
           abort.abort();
@@ -118,9 +120,11 @@ export function createHttpHandler({
             }
             request = JSON.parse(input);
           }
+          if (request.action === "stop") onSessionStop?.(req, res);
           const result = await executions.dispatch(
             {
               op: "session",
+              ...(request.action === "stop" ? { expectedStarting: starting } : {}),
               executionId: entry.executionId,
               action: request.action,
               durationMs: request.durationMs,
