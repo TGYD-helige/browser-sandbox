@@ -9,8 +9,8 @@ COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY tsconfig.json ./
 COPY src ./src
-COPY skills ./skills
-COPY scripts/copy-viewer.mjs ./scripts/copy-viewer.mjs
+COPY skills/browser-sandbox-auth/scripts/auth.mjs ./skills/browser-sandbox-auth/scripts/auth.mjs
+COPY scripts/copy-assets.mjs ./scripts/copy-assets.mjs
 RUN pnpm build && pnpm prune --prod
 
 FROM ${CLOAK_IMAGE} AS cloak
@@ -23,7 +23,6 @@ WORKDIR /opt/browser-sandbox
 # Ubuntu's existing Chrome AppArmor profile attaches to this root-owned path.
 COPY --from=cloak --chown=0:0 /cloak /opt/google/chrome
 COPY --from=build /build/dist ./dist
-COPY --from=build /build/skills ./skills
 COPY --from=build /build/node_modules ./node_modules
 COPY package.json ./
 COPY examples ./examples

@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { cp, mkdtemp, rm, symlink } from "node:fs/promises";
+import { cp, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 const exec = promisify(execFile);
@@ -150,4 +151,29 @@ test("the script does not follow redirects or retry a request", async (t) => {
     return true;
   });
   assert.equal(f.calls.length, 1);
+});
+
+test("the built SDK loads from dist without an installed skill directory", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "auth-dist-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await cp(new URL("../dist", import.meta.url), join(root, "dist"), {
+    recursive: true,
+  });
+  await writeFile(join(root, "package.json"), '{"type":"module"}');
+  await symlink(
+    fileURLToPath(new URL("../node_modules", import.meta.url)),
+    join(root, "node_modules"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  const { stdout, stderr } = await exec(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      'const sdk=await import("./dist/index.js"); console.log(typeof sdk.browserAuthRequest);',
+    ],
+    { cwd: root },
+  );
+  assert.equal(stdout.trim(), "function");
+  assert.equal(stderr, "");
 });

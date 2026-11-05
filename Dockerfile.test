@@ -6,7 +6,7 @@ RUN pnpm install --frozen-lockfile
 COPY tsconfig.json ./
 COPY src ./src
 COPY skills ./skills
-COPY scripts/copy-viewer.mjs ./scripts/copy-viewer.mjs
+COPY scripts/copy-assets.mjs ./scripts/copy-assets.mjs
 COPY tests ./tests
 COPY adapters/cloudflare-worker/index.js ./adapters/cloudflare-worker/index.js
 COPY config ./config

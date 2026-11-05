@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { requestAuth } from "../skills/browser-sandbox-auth/scripts/auth.mjs";
+import { requestAuth } from "./auth-client.mjs";
 import { connectCdp } from "./cdp.js";
 
 export type BrowserAuthStatus =
