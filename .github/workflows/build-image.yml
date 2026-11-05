@@ -4,10 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: Tag to publish alongside sha-<commit> for every configured image name
+        description: Existing Git version tag at the master commit being built (for example v0.1.0)
         type: string
-        default: latest
         required: true
+      publish_latest:
+        description: Also publish this version as latest
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -21,6 +24,7 @@ env:
   NAMESPACE: ${{ vars.BAIDU_CCR_NAMESPACE }}
   IMAGE_NAMES: ${{ vars.BROWSER_IMAGE_NAMES }}
   IMAGE_TAG: ${{ inputs.image_tag }}
+  PUBLISH_LATEST: ${{ inputs.publish_latest }}
 
 jobs:
   prepare:
@@ -29,6 +33,10 @@ jobs:
     outputs:
       image: ${{ steps.validate.outputs.image }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
       - name: Validate publication configuration
         id: validate
         shell: bash
@@ -38,6 +46,18 @@ jobs:
           [[ "$REGISTRY" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]+)?$ ]] || exit 1
           [[ "$NAMESPACE" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || exit 1
           [[ "$IMAGE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] || exit 1
+          if [[ "$IMAGE_TAG" == latest || "$IMAGE_TAG" == sha-* ]]; then
+            echo "Use a version tag; latest and sha-* are reserved image tags." >&2
+            exit 1
+          fi
+          if ! source_sha="$(git rev-parse --verify "refs/tags/$IMAGE_TAG^{commit}")"; then
+            echo "Create and push the Git version tag before publishing." >&2
+            exit 1
+          fi
+          if [[ "$source_sha" != "$GITHUB_SHA" ]]; then
+            echo "The Git version tag must point to the master commit being built." >&2
+            exit 1
+          fi
           read -ra names <<< "$IMAGE_NAMES"
           ((${#names[@]} > 0))
           for name in "${names[@]}"; do
@@ -116,9 +136,12 @@ jobs:
           read -ra names <<< "$IMAGE_NAMES"
           for name in "${names[@]}"; do
             image="$REGISTRY/$NAMESPACE/$name"
-            docker buildx imagetools create \
-              --tag "$image:sha-$GITHUB_SHA" --tag "$image:$IMAGE_TAG" \
+            tags=(--tag "$image:sha-$GITHUB_SHA" --tag "$image:$IMAGE_TAG")
+            if [[ "$PUBLISH_LATEST" == true ]]; then
+              tags+=(--tag "$image:latest")
+            fi
+            docker buildx imagetools create "${tags[@]}" \
               "$(cat amd64.txt)" "$(cat arm64.txt)"
-            printf 'Published %s:sha-%s and %s:%s (Linux AMD64/ARM64).\n' \
-              "$image" "$GITHUB_SHA" "$image" "$IMAGE_TAG" >> "$GITHUB_STEP_SUMMARY"
+            printf 'Published %s (Linux AMD64/ARM64).\n' \
+              "${tags[*]}" >> "$GITHUB_STEP_SUMMARY"
           done
