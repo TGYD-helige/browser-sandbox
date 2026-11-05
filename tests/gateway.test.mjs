@@ -1554,6 +1554,62 @@ test("a queued disconnected launch preserves an earlier browser close failure", 
   }
 });
 
+for (const code of [
+  "browser_extensions_directory_invalid",
+  "browser_extensions_directory_unreadable_or_invalid",
+  "browser_extensions_scan_busy",
+  "browser_extensions_launch_request_too_large",
+]) {
+  test(`CDP and the startup probe preserve the allowlisted error ${code}`, async () => {
+    const f = await fixture(async () => {
+      throw Error(code);
+    });
+    let peer;
+    try {
+      const { wsEndpoint } = await f.gateway.command({
+        op: "register",
+        executionId: ids[0],
+      });
+      peer = new WebSocket(wsEndpoint);
+      peer.on("error", () => {});
+      const [status, reason] = await once(peer, "close");
+      assert.equal(status, 1011);
+      assert.equal(String(reason), code);
+      await f.gateway.command({ op: "finish", executionId: ids[0] });
+      await assert.rejects(verifyTarget(f.gateway, WebSocket), { message: code });
+    } finally {
+      peer?.terminate();
+      await f.stop();
+    }
+  });
+}
+
+test("unlisted extension startup details remain private in CDP and probe errors", async () => {
+  const f = await fixture(async () => {
+    throw Error("browser_extensions_private_secret");
+  });
+  let peer;
+  try {
+    const { wsEndpoint } = await f.gateway.command({
+      op: "register",
+      executionId: ids[0],
+    });
+    peer = new WebSocket(wsEndpoint);
+    peer.on("error", () => {});
+    const [status, reason] = await once(peer, "close");
+    assert.equal(status, 1006);
+    assert.equal(String(reason), "");
+    await f.gateway.command({ op: "finish", executionId: ids[0] });
+    await assert.rejects(
+      verifyTarget(f.gateway, WebSocket),
+      /browser_probe_disconnected/,
+    );
+  } finally {
+    peer?.terminate();
+    await f.stop();
+  }
+});
+
 test("the renderer probe uses the wrapper-owned default profile and removes it after probing", async () => {
   let profile;
   const f = await fixture(

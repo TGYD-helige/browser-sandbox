@@ -119,7 +119,9 @@ export function attachCdpProxy({
         })
         .catch((error) => {
           const code =
-            error instanceof Error && /^browser_profile_[a-z_]+$/.test(error.message)
+            error instanceof Error &&
+            (/^browser_profile_[a-z_]+$/.test(error.message) ||
+              EXTENSION_STARTUP_ERRORS.has(error.message))
               ? error.message
               : null;
           if (code && client.readyState === WebSocket.OPEN) client.close(1011, code);
@@ -129,3 +131,5 @@ export function attachCdpProxy({
   });
   return ws;
 }
+
+import { EXTENSION_STARTUP_ERRORS } from "./lifecycle-errors.js";

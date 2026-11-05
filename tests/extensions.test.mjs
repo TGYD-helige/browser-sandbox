@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs, { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
@@ -12,6 +13,49 @@ test("extension scanning stops when startup is cancelled", async () => {
   await assert.rejects(readExtensionDirs(undefined, abort.signal), {
     name: "AbortError",
   });
+});
+
+test("cancelled readers do not accumulate on a stalled scan with another active reader", () => {
+  const child = spawnSync(
+    process.execPath,
+    [
+      "--expose-gc",
+      "--input-type=module",
+      "-e",
+      `
+    import fs from 'node:fs/promises';
+    import { syncBuiltinESMExports } from 'node:module';
+    import { setImmediate } from 'node:timers/promises';
+    import { createExtensionReader } from ${JSON.stringify(new URL("../dist/extensions.js", import.meta.url).href)};
+    let scans = 0;
+    fs.opendir = () => { scans++; return new Promise(() => {}); };
+    syncBuiltinESMExports();
+    const read = createExtensionReader('/extensions');
+    const retained = read(new AbortController().signal);
+    async function rotate(count) {
+      for (let i = 0; i < count; i++) {
+        const abort = new AbortController();
+        const pending = read(abort.signal);
+        abort.abort();
+        try { await pending; } catch {}
+      }
+      for (let i = 0; i < 3; i++) { await setImmediate(); global.gc(); }
+    }
+    await rotate(500);
+    const before = process.memoryUsage().heapUsed;
+    await rotate(30000);
+    console.log(JSON.stringify({ scans, growth: process.memoryUsage().heapUsed - before }));
+  `,
+    ],
+    { encoding: "utf8", timeout: 15000 },
+  );
+  assert.equal(child.status, 0, child.stderr);
+  const result = JSON.parse(child.stdout);
+  assert.equal(result.scans, 1);
+  assert(
+    result.growth < 8 * 1024 * 1024,
+    `cancelled readers retained ${result.growth} bytes`,
+  );
 });
 
 test("overlapping scans share work without one cancelled reader cancelling another", async (t) => {

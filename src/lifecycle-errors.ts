@@ -20,3 +20,9 @@ export class BrowserCleanupUnconfirmed extends Error {
     this.name = "BrowserCleanupUnconfirmed";
   }
 }
+export const EXTENSION_STARTUP_ERRORS = new Set([
+  "browser_extensions_directory_invalid",
+  "browser_extensions_directory_unreadable_or_invalid",
+  "browser_extensions_scan_busy",
+  "browser_extensions_launch_request_too_large",
+]);

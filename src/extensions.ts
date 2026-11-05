@@ -45,42 +45,41 @@ export function createExtensionReader(root: string) {
   let pending:
     | {
         abort: AbortController;
-        result: Promise<string[]>;
-        readers: number;
+        waiters: Set<(error: unknown, paths?: string[]) => void>;
       }
     | undefined;
   return async (signal: AbortSignal): Promise<string[]> => {
     signal.throwIfAborted();
     if (pending?.abort.signal.aborted) throw Error("browser_extensions_scan_busy");
     if (!pending) {
-      const abort = new AbortController();
-      const result = readExtensionDirs(root, abort.signal);
-      const scan = { abort, result, readers: 0 };
+      const scan = {
+        abort: new AbortController(),
+        waiters: new Set<(error: unknown, paths?: string[]) => void>(),
+      };
       pending = scan;
-      result
-        .finally(() => {
-          if (pending === scan) pending = undefined;
-        })
-        .catch(() => {});
+      const publish = (error: unknown, paths?: string[]) => {
+        if (pending === scan) pending = undefined;
+        for (const notify of scan.waiters) notify(error, paths);
+      };
+      readExtensionDirs(root, scan.abort.signal).then(
+        (paths) => publish(undefined, paths),
+        (error) => publish(error),
+      );
     }
     const scan = pending;
-    scan.readers++;
-    let cancel: () => void;
-    try {
-      // Only deployment files are read; cancelled executions need not retain their Profiles.
-      const paths = await Promise.race([
-        scan.result,
-        new Promise<never>((_, reject) => {
-          cancel = () => reject(signal.reason);
-          signal.addEventListener("abort", cancel, { once: true });
-          if (signal.aborted) cancel();
-        }),
-      ]);
-      signal.throwIfAborted();
-      return paths;
-    } finally {
-      signal.removeEventListener("abort", cancel);
-      if (--scan.readers === 0) scan.abort.abort();
-    }
+    return new Promise<string[]>((resolve, reject) => {
+      const finish = (error: unknown, paths?: string[]) => {
+        if (!scan.waiters.delete(finish)) return;
+        signal.removeEventListener("abort", cancel);
+        if (error !== undefined) reject(error);
+        else if (signal.aborted) reject(signal.reason);
+        else resolve(paths);
+        if (scan.waiters.size === 0) scan.abort.abort();
+      };
+      const cancel = () => finish(signal.reason);
+      scan.waiters.add(finish);
+      signal.addEventListener("abort", cancel, { once: true });
+      if (signal.aborted) cancel();
+    });
   };
 }
