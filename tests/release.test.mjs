@@ -101,6 +101,11 @@ test("publication reserves the verified Git commit atomically and stops before p
       '#!/bin/sh\nprintf "gh %s\\n" "$*" >> "$TRACE"\nif [ "$1" = api ]; then exit "$RESERVE_STATUS"; fi\n',
       { mode: 0o700 },
     );
+    await writeFile(
+      join(root, "node"),
+      '#!/bin/sh\nprintf "node %s\\n" "$*" >> "$TRACE"\nprintf "Generated release notes\\n" > "$3"\n',
+      { mode: 0o700 },
+    );
     const trace = join(root, "trace");
     const publish = (status) =>
       run(
@@ -136,6 +141,7 @@ test("publication reserves the verified Git commit atomically and stops before p
       requests.indexOf("gh api --method POST") <
         requests.indexOf("docker buildx imagetools create"),
     );
+    assert(requests.includes("generate-release-summary.mjs v1.0.0"));
     assert(requests.includes("gh release create v1.0.0 --verify-tag"));
     assert(!requests.includes("--target"));
   } finally {

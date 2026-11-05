@@ -114,6 +114,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IMAGE: ${{ needs.eligibility.outputs.image }}
           TAG: ${{ needs.eligibility.outputs.tag }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL_NAME: ${{ vars.OPENAI_MODEL_NAME || secrets.OPENAI_MODEL_NAME }}
         run: |
           set -euo pipefail
           echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin

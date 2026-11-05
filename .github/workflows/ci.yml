@@ -26,6 +26,6 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck && pnpm lint && pnpm build
       - name: Image publication workflow tests
-        run: node --test .github/scripts/test-build-image.mjs
+        run: node --test .github/scripts/test-*.mjs
       - name: Linux lifecycle and isolation tests
         run: sudo "$(command -v node)" --test --test-timeout=60000 tests/*.test.mjs
