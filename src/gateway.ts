@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import { join } from "node:path";
 import { type AccessOptions, createAccessServer } from "./access-server.js";
 import { createAuthRequests } from "./auth-requests.js";
+import { createAutomationControl } from "./automation-control.js";
 import { attachCdpProxy } from "./cdp-proxy.js";
 import { createExecutions } from "./executions.js";
 import { createHostControl } from "./host-control.js";
@@ -30,6 +31,7 @@ export async function createGateway({
   access = undefined as AccessOptions | undefined,
 }) {
   const server = createServer();
+  let remote: Awaited<ReturnType<typeof createAccessServer>>;
   const executions = await createExecutions({
     launch,
     dataRoot,
@@ -39,11 +41,13 @@ export async function createGateway({
     profileArchive,
     startupTimeoutMs,
     maxSessionMs,
+    onBrowserStarting: (entry) => remote?.browserStarting(entry),
   });
   const fileTransfers = { active: 0 };
+  const automationControl = createAutomationControl(access?.automation);
   const authentication = createAuthRequests(
     executions,
-    access?.automation,
+    automationControl,
     access?.allowInsecureAuthLoopback,
   );
   server.on(
@@ -70,7 +74,6 @@ export async function createGateway({
   await mkdir(join(socketPath, ".."), { recursive: true, mode: 0o700 });
   await chmod(join(socketPath, ".."), 0o755);
   await rm(socketPath, { force: true });
-  let remote: Awaited<ReturnType<typeof createAccessServer>>;
   try {
     remote = access
       ? await createAccessServer({
@@ -80,6 +83,7 @@ export async function createGateway({
           options: access,
           fileTransfers,
           authentication,
+          automationControl,
         })
       : undefined;
   } catch (error) {

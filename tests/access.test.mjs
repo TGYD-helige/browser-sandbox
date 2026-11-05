@@ -20,6 +20,7 @@ async function fixture(t, access = {}, gatewayOptions = {}) {
   const calls = [];
   const extraTargets = [];
   let targetsGate, notifyTargets;
+  let captureFailures = 0;
   let launches = 0,
     url = "https://example.com/form",
     generation = "document-1";
@@ -36,6 +37,16 @@ async function fixture(t, access = {}, gatewayOptions = {}) {
       if (request.method === "Target.getTargets" && targetsGate) {
         notifyTargets();
         await targetsGate;
+      }
+      if (request.method === "Page.startScreencast" && captureFailures > 0) {
+        captureFailures--;
+        socket.send(
+          JSON.stringify({
+            id: request.id,
+            error: { code: -32000, message: "capture unavailable" },
+          }),
+        );
+        return;
       }
       let result = {};
       if (request.method === "Target.getTargets")
@@ -112,7 +123,11 @@ async function fixture(t, access = {}, gatewayOptions = {}) {
     await rm(root, { recursive: true, force: true });
   });
   const executionId = randomUUID();
-  await gateway.command({ op: "register", executionId, executorUid: 100001 });
+  const registration = await gateway.command({
+    op: "register",
+    executionId,
+    executorUid: 100001,
+  });
   async function issue(options = {}) {
     return hostRequest(socketPath, { op: "access_create", executionId, ...options });
   }
@@ -161,6 +176,7 @@ async function fixture(t, access = {}, gatewayOptions = {}) {
   }
   return {
     gateway,
+    privateEndpoint: registration.wsEndpoint,
     socketPath,
     origin,
     issue,
@@ -168,6 +184,12 @@ async function fixture(t, access = {}, gatewayOptions = {}) {
     viewer,
     calls,
     addTarget: (target) => extraTargets.push(target),
+    failNextCapture: () => {
+      captureFailures++;
+    },
+    disconnectBrowser: () => {
+      for (const socket of upstream.clients) socket.terminate();
+    },
     executionId,
     blockTargetReads() {
       let release, entered;
@@ -351,10 +373,15 @@ test("execution finish revokes links and observing does not keep an idle browser
   const agent = await f.agent(access.cdpUrl);
   const view = await f.viewer(access.viewerUrl);
   await view.wait((message) => message.type === "frame");
+  const idleClosed = once(view.client, "close");
   agent.terminate();
-  await delay(1200);
-  assert.equal((await sessionRequest(access.cdpUrl)).state, "lost");
-  const closed = once(view.client, "close");
+  await idleClosed;
+  await assert.rejects(sessionRequest(access.cdpUrl));
+  const fresh = await f.issue();
+  assert.equal((await sessionRequest(fresh.cdpUrl)).state, "lost");
+  const waiting = await f.viewer(fresh.viewerUrl);
+  await waiting.wait((message) => message.type === "state");
+  const closed = once(waiting.client, "close");
   await f.gateway.command({ op: "finish", executionId: f.executionId }, true);
   await closed;
 });
@@ -768,4 +795,150 @@ test("authentication cleanup preserves a newer host retention deadline", async (
   });
   await waiting;
   assert.equal((await sessionRequest(access.cdpUrl)).expiresAt, extended.expiresAt);
+});
+
+test("browser retirement revokes pre-start grants and requires new access for recovery", async (t) => {
+  const f = await fixture(t);
+  const access = await f.issue();
+  const dormant = await f.issue();
+  const agent = await f.agent(access.cdpUrl);
+  const view = await f.viewer(access.viewerUrl);
+  await view.wait((message) => message.type === "frame");
+  const agentClosed = once(agent, "close");
+  const viewClosed = once(view.client, "close");
+  await f.gateway.command(
+    { op: "session", executionId: f.executionId, action: "stop" },
+    true,
+  );
+  await Promise.all([agentClosed, viewClosed]);
+  await assert.rejects(f.agent(access.cdpUrl), /403/);
+  const oldViewer = await f.viewer(dormant.viewerUrl);
+  assert.equal((await once(oldViewer.client, "close"))[0], 1008);
+  const recovered = await f.issue();
+  await f.agent(recovered.cdpUrl);
+  assert.equal(f.launches, 2);
+});
+
+test("an upstream disconnect cannot use its old CDP grant to start a replacement", async (t) => {
+  const f = await fixture(t);
+  const access = await f.issue();
+  const agent = await f.agent(access.cdpUrl);
+  const closed = once(agent, "close");
+  f.disconnectBrowser();
+  await closed;
+  await assert.rejects(f.agent(access.cdpUrl), /403/);
+  assert.equal(f.launches, 1);
+  await f.agent((await f.issue()).cdpUrl);
+  assert.equal(f.launches, 2);
+});
+
+test("a pending host resume blocks another viewer's acquire transition", async (t) => {
+  let completeResume, resumeStarted;
+  const entered = new Promise((resolve) => {
+    resumeStarted = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    completeResume = resolve;
+  });
+  let pauses = 0;
+  const f = await fixture(t, {
+    automation: {
+      async pause() {
+        pauses++;
+      },
+      async resume() {
+        resumeStarted();
+        await gate;
+      },
+    },
+  });
+  const access = await f.issue({ control: true });
+  const secondAccess = await f.issue({ control: true });
+  await f.agent(access.cdpUrl);
+  const a = await f.viewer(access.viewerUrl);
+  const b = await f.viewer(secondAccess.viewerUrl);
+  await a.wait((message) => message.type === "frame");
+  await b.wait((message) => message.type === "frame");
+  await a.command("acquire");
+  const frame = await a.wait(
+    (message) => message.type === "frame" && message.interactive,
+  );
+  const releasing = a.command("release", {
+    targetId: frame.targetId,
+    frameRevision: frame.frameRevision,
+  });
+  await entered;
+  assert.equal((await b.command("acquire")).error, "browser_control_busy");
+  assert.equal(pauses, 1);
+  completeResume();
+  assert.equal((await releasing).result.resumed, true);
+  assert.equal((await b.command("acquire")).result.state, "human");
+  assert.equal(pauses, 2);
+});
+
+test("authentication cleanup shares the manual takeover transition lock", async (t) => {
+  let completeResume, resumeStarted;
+  const entered = new Promise((resolve) => {
+    resumeStarted = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    completeResume = resolve;
+  });
+  let pauses = 0;
+  const f = await fixture(t, {
+    automation: {
+      async pause() {
+        pauses++;
+      },
+      async resume() {
+        resumeStarted();
+        await gate;
+      },
+    },
+  });
+  const access = await f.issue({ control: true });
+  await f.agent(access.cdpUrl);
+  const view = await f.viewer(access.viewerUrl);
+  const waiting = browserAuthRequest(access.cdpUrl, authSpec);
+  const { authentication } = await view.wait((message) => message.authentication);
+  await view.command("authRespond", {
+    requestId: authentication.requestId,
+    response: { action: "cancel" },
+  });
+  await entered;
+  assert.equal((await view.command("acquire")).error, "browser_control_busy");
+  assert.equal(pauses, 1);
+  completeResume();
+  assert.equal((await waiting).resumed, true);
+  assert.equal((await view.command("acquire")).result.state, "human");
+  assert.equal(pauses, 2);
+});
+
+test("an existing viewer retries after its initial screencast setup fails", async (t) => {
+  const f = await fixture(t);
+  const access = await f.issue();
+  await f.agent(access.cdpUrl);
+  f.failNextCapture();
+  const view = await f.viewer(access.viewerUrl);
+  await view.wait((message) => message.type === "error");
+  await view.wait((message) => message.type === "frame");
+  assert.equal(
+    f.calls.filter((call) => call.method === "Page.startScreencast").length,
+    2,
+  );
+});
+
+test("pre-start grants also bind when the private UID transport starts the browser", async (t) => {
+  const f = await fixture(t, {}, { resolvePeerUid: async () => 100001 });
+  const access = await f.issue();
+  await f.agent(f.privateEndpoint);
+  await f.gateway.command(
+    { op: "session", executionId: f.executionId, action: "stop" },
+    true,
+  );
+  await f.agent(f.privateEndpoint);
+  assert.equal(f.launches, 2);
+  await assert.rejects(f.agent(access.cdpUrl), /403/);
+  const oldView = await f.viewer(access.viewerUrl);
+  assert.equal((await once(oldView.client, "close"))[0], 1008);
 });

@@ -88,6 +88,7 @@ export async function createExecutions({
   profileArchive = createProfileArchive(),
   startupTimeoutMs,
   maxSessionMs,
+  onBrowserStarting = undefined as ((entry: Execution) => void) | undefined,
 }) {
   if (!Number.isSafeInteger(maxBrowsers) || maxBrowsers < 1)
     fail("browser_capacity_invalid");
@@ -595,6 +596,7 @@ export async function createExecutions({
             }
           }
           if (entry.starting === starting) {
+            abort.abort();
             entry.starting = null;
             entry.session.ended();
             if (
@@ -614,6 +616,7 @@ export async function createExecutions({
           throw error;
         });
       entry.starting = starting;
+      onBrowserStarting?.(entry);
       const startupTimer = setTimeout(() => {
         abort.abort();
         for (const peer of entry.peers)

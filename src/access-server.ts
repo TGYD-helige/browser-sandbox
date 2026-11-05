@@ -2,13 +2,11 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
+import { type AutomationCoordinator, waitForControl } from "./automation-control.js";
 import { attachCdpProxy } from "./cdp-proxy.js";
 import { createHttpHandler } from "./http-routes.js";
 
-export interface AutomationCoordinator {
-  pause(executionId: string, signal: AbortSignal): Promise<void>;
-  resume(executionId: string, signal: AbortSignal): Promise<void>;
-}
+export type { AutomationCoordinator } from "./automation-control.js";
 export interface AccessOptions {
   port: number;
   host?: string;
@@ -27,6 +25,8 @@ interface Grant {
   actorId: string;
   leaseId: string;
   epoch?: string;
+  browser?: Promise<unknown>;
+  browserSignal?: AbortSignal;
   expiresAt: number;
   life: AbortController;
   connections: Set<any>;
@@ -37,22 +37,6 @@ const errorCode = (error: any) =>
   /^browser_[a-z_]+$/.test(error?.message)
     ? error.message
     : "browser_view_request_failed";
-async function coordinated(work: Promise<void>, signal: AbortSignal) {
-  let cancel: () => void;
-  try {
-    await Promise.race([
-      work,
-      new Promise<never>((_resolve, reject) => {
-        cancel = () => reject(Error("browser_control_timeout"));
-        signal.addEventListener("abort", cancel, { once: true });
-        if (signal.aborted) cancel();
-      }),
-    ]);
-    signal.throwIfAborted();
-  } finally {
-    signal.removeEventListener("abort", cancel);
-  }
-}
 
 const assets = new Map([
   ["/view", ["index.html", "text/html; charset=utf-8"]],
@@ -68,6 +52,7 @@ export async function createAccessServer({
   options,
   fileTransfers,
   authentication,
+  automationControl,
 }: any) {
   const config = options as AccessOptions;
   const grants = new Map<string, Grant>();
@@ -109,17 +94,33 @@ export async function createAccessServer({
       throw Error("browser_access_origin_invalid");
   }
   const allowedOrigin = (value: string) => value === origin || viewerOrigins.has(value);
+  function bindBrowser(grant: Grant) {
+    if (grant.browser || !grant.entry.starting) return;
+    grant.browser = grant.entry.starting;
+    grant.browserSignal = grant.entry.abort.signal;
+    grant.browserSignal.addEventListener("abort", grant.cleanup, { once: true });
+    if (grant.browserSignal.aborted) grant.cleanup();
+  }
   function resolve(token: string, kind: Grant["kind"]) {
     const grant = grants.get(token);
-    return grant &&
-      grant.kind === kind &&
-      grant.expiresAt > Date.now() &&
-      !grant.entry.revoked &&
-      !grant.life.signal.aborted &&
-      !executions.closing &&
-      executions.get(grant.entry.executionId) === grant.entry
-      ? grant
-      : null;
+    if (
+      !grant ||
+      grant.kind !== kind ||
+      grant.expiresAt <= Date.now() ||
+      grant.entry.revoked ||
+      grant.life.signal.aborted ||
+      executions.closing ||
+      executions.get(grant.entry.executionId) !== grant.entry
+    )
+      return null;
+    if (
+      grant.life.signal.aborted ||
+      (grant.browser && grant.browser !== grant.entry.starting)
+    ) {
+      grant.cleanup();
+      return null;
+    }
+    return grant;
   }
   function track(grant: Grant, socket: any) {
     if (grant.connections.has(socket)) return;
@@ -144,6 +145,7 @@ export async function createAccessServer({
       life.abort();
       clearTimeout(grant.timer);
       entry.lifetime.signal.removeEventListener("abort", revoke);
+      grant.browserSignal?.removeEventListener("abort", revoke);
       for (const connection of grant.connections)
         connection.destroy ? connection.destroy() : connection.terminate();
       grant.connections.clear();
@@ -165,6 +167,7 @@ export async function createAccessServer({
     grant.timer.unref();
     entry.lifetime.signal.addEventListener("abort", revoke, { once: true });
     grants.set(token, grant);
+    bindBrowser(grant);
     return grant;
   }
   const files = createHttpHandler({
@@ -352,9 +355,7 @@ export async function createAccessServer({
           browser: status,
           control: state,
           canResize: grant.resize,
-          canAcquire:
-            grant.control &&
-            (!!config.automation || authentication.isConfirmed(grant.entry)),
+          canAcquire: grant.control && automationControl.canPause(grant.entry),
           authentication: grant.control
             ? authentication.prompt(grant.entry)
             : undefined,
@@ -415,6 +416,7 @@ export async function createAccessServer({
           );
         }
       } catch (error) {
+        activeObservation = undefined;
         if (!signal.aborted) send({ type: "error", error: errorCode(error) });
       } finally {
         polling = false;
@@ -446,7 +448,7 @@ export async function createAccessServer({
       busy = true;
       const opSignal = AbortSignal.any([signal, AbortSignal.timeout(30_000)]);
       try {
-        await coordinated(pollDone, opSignal);
+        await waitForControl(pollDone, opSignal);
         if (!resolve(grant.token, "view")) throw Error("browser_access_denied");
         let result: any = {};
         if (message.type === "authRespond") {
@@ -499,18 +501,13 @@ export async function createAccessServer({
         } else {
           if (!grant.control) throw Error("browser_control_denied");
           if (message.type === "acquire") {
-            if (config.automation)
-              await coordinated(
-                config.automation.pause(grant.entry.executionId, opSignal),
+            result = await automationControl.run(grant.entry, opSignal, async () => {
+              await automationControl.pause(grant.entry, opSignal);
+              return control(
+                { op: "acquire", automationStopped: true, targetId: selected },
                 opSignal,
               );
-            else if (!authentication.consumeConfirmation(grant.entry))
-              throw Error("browser_automation_stop_required");
-            opSignal.throwIfAborted();
-            result = await control(
-              { op: "acquire", automationStopped: true, targetId: selected },
-              opSignal,
-            );
+            });
             selected = result.targetId;
             interaction = undefined;
             await frame(opSignal);
@@ -562,35 +559,31 @@ export async function createAccessServer({
               message.targetId !== selected
             )
               throw Error("browser_frame_stale");
-            await control(
-              {
-                op: "confirmTarget",
-                targetId: interaction.targetId,
-                origin: interaction.origin,
-                frameRevision: interaction.frameRevision,
-              },
-              opSignal,
-            );
-            result = await control(
-              { op: "release", origin: interaction.origin },
-              opSignal,
-            );
-            grant.epoch = undefined;
-            interaction = undefined;
-            activeObservation = undefined;
-            let resumed = false;
-            if (config.automation) {
+            result = await automationControl.run(grant.entry, opSignal, async () => {
+              await control(
+                {
+                  op: "confirmTarget",
+                  targetId: interaction.targetId,
+                  origin: interaction.origin,
+                  frameRevision: interaction.frameRevision,
+                },
+                opSignal,
+              );
+              const released = await control(
+                { op: "release", origin: interaction.origin },
+                opSignal,
+              );
+              grant.epoch = undefined;
+              interaction = undefined;
+              activeObservation = undefined;
+              let resumed = false;
               try {
-                await coordinated(
-                  config.automation.resume(grant.entry.executionId, opSignal),
-                  opSignal,
-                );
-                resumed = true;
+                resumed = await automationControl.resume(grant.entry, opSignal);
               } catch {
-                /* Control release succeeded independently of harness resumption. */
+                /* Control release is separate from host resumption. */
               }
-            }
-            result = { ...result, resumed };
+              return { ...released, resumed };
+            });
           } else throw Error("browser_human_operation_invalid");
         }
         const publicResult = { ...result };
@@ -620,6 +613,10 @@ export async function createAccessServer({
   origin ??= `http://127.0.0.1:${port}`;
   return {
     port,
+    browserStarting(entry: any) {
+      for (const grant of grants.values())
+        if (grant.entry === entry) bindBrowser(grant);
+    },
     command(request: any) {
       const entry = executions.get(request.executionId);
       if (!entry || entry.revoked || executions.closing)
@@ -661,7 +658,7 @@ export async function createAccessServer({
       if (request.op === "access_confirm_stopped") {
         if (request.automationStopped !== true)
           throw Error("browser_automation_stop_required");
-        authentication.confirm(entry);
+        automationControl.confirm(entry);
         return { confirmed: true };
       }
       throw Error("browser_access_request_invalid");

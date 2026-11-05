@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AutomationCoordinator } from "./access-server.js";
+import type { createAutomationControl } from "./automation-control.js";
 import {
   type BrowserAuthPrompt,
   type BrowserAuthResponse,
@@ -12,28 +12,14 @@ import {
 /** Human waits live outside execution mutation queues so finish and cancellation remain available. */
 export function createAuthRequests(
   executions: any,
-  automation?: AutomationCoordinator,
+  automationControl: ReturnType<typeof createAutomationControl>,
   allowHttpLoopback = false,
 ) {
   const pending = new Map<
     any,
     { prompt?: BrowserAuthPrompt; respond(response: BrowserAuthResponse): void }
   >();
-  const confirmed = new Set<any>();
-  const watched = new WeakSet<object>();
-  const consumeConfirmation = (entry: any) => confirmed.delete(entry);
   return {
-    confirm(entry: any) {
-      confirmed.add(entry);
-      if (!watched.has(entry)) {
-        watched.add(entry);
-        entry.lifetime.signal.addEventListener("abort", () => confirmed.delete(entry), {
-          once: true,
-        });
-      }
-    },
-    consumeConfirmation,
-    isConfirmed: (entry: any) => confirmed.has(entry),
     prompt: (entry: any) => pending.get(entry)?.prompt,
     respond(entry: any, requestId: string, response: BrowserAuthResponse) {
       const request = pending.get(entry);
@@ -173,19 +159,12 @@ export function createAuthRequests(
           );
           retainedUntil = retained.expiresAt;
         }
-        if (automation) {
-          await Promise.race([
-            automation.pause(entry.executionId, signal),
-            invalidation.then(() => {
-              throw Error("browser_auth_cancelled");
-            }),
-          ]);
-        } else if (!consumeConfirmation(entry))
-          throw Error("browser_automation_stop_required");
-        signal.throwIfAborted();
-        const lease = await control("acquire", {
-          automationStopped: true,
-          targetId: spec.targetId,
+        const lease = await automationControl.run(entry, signal, async () => {
+          await automationControl.pause(entry, signal);
+          return control("acquire", {
+            automationStopped: true,
+            targetId: spec.targetId,
+          });
         });
         identity.epoch = lease.epoch;
         acquired = true;
@@ -245,33 +224,24 @@ export function createAuthRequests(
         ) {
           const cleanup = AbortSignal.timeout(10_000);
           try {
-            await control("completeRequest", {}, cleanup);
-            controlReleased = true;
-            if (stillOwnsRetention() && entry.session.retained)
-              await executions.dispatch(
-                {
-                  op: "session",
-                  executionId: entry.executionId,
-                  action: "renew",
-                  durationMs: 30_000,
-                },
-                cleanup,
-              );
-            if (automation && !caller.aborted) {
-              await Promise.race([
-                automation.resume(entry.executionId, cleanup),
-                new Promise<never>((_, reject) =>
-                  cleanup.addEventListener(
-                    "abort",
-                    () => reject(Error("browser_control_timeout")),
-                    { once: true },
-                  ),
-                ),
-              ]);
-              resumed = true;
-            }
+            await automationControl.run(entry, cleanup, async () => {
+              await control("completeRequest", {}, cleanup);
+              controlReleased = true;
+              if (stillOwnsRetention() && entry.session.retained)
+                await executions.dispatch(
+                  {
+                    op: "session",
+                    executionId: entry.executionId,
+                    action: "renew",
+                    durationMs: 30_000,
+                  },
+                  cleanup,
+                );
+              if (!caller.aborted)
+                resumed = await automationControl.resume(entry, cleanup);
+            });
           } catch {
-            /* A failed release remains fenced and must be recovered by the host. */
+            /* Release and host resumption have independent outcomes. */
           }
         }
         if (
