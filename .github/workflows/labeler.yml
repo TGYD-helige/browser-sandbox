@@ -1,0 +1,40 @@
+name: PR Labeler
+
+on:
+  pull_request_target:
+    branches: [master]
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to relabel, or all open PRs
+        required: true
+        default: all
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: labeler-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Load only trusted base code, including for fork PRs.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+          sparse-checkout: .github/scripts/label-pr.mjs
+          sparse-checkout-cone-mode: false
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const { default: labelPr } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/label-pr.mjs`);
+            await labelPr({ github, context, core });
