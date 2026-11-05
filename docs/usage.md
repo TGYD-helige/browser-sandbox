@@ -103,6 +103,7 @@ Some CDP clients, including Chrome DevTools MCP, treat loopback endpoints as loc
 | CONCURRENT | 2 Browserless instances |
 | QUEUED | 4 queued requests |
 | TIMEOUT | 1800000 ms total Browserless timeout |
+| BROWSER_EXTENSIONS_DIR | Optional absolute directory containing unpacked extension subdirectories |
 | HOST / PORT | Fixed internal Browserless binding 127.0.0.1:3001 |
 
 Profile preparation (including acquisition and restore), archive saves, and ownership release share a separate work limit of CONCURRENT active operations. Preparation and saves admit twice CONCURRENT waiting operations; ownership cleanup has a reserved queue bounded by the 1,000 live execution slots and runs before waiting preparation. This keeps failure recovery and shutdown available when the ordinary queue is full. QUEUED still controls Browserless browser admission. A full Profile work queue returns browser_profile_work_queue_full; it does not call storage or start a browser for the rejected attempt. Cancellation removes queued work, and failed saves retain the Profile for an explicit lifecycle retry. Registration and unused finalization do not enter this queue.
@@ -110,6 +111,48 @@ Profile preparation (including acquisition and restore), archive saves, and owne
 The gateway accepts the execution WebSocket before cold startup completes. The bundled CDP client allows 60 seconds for commands sent before the first reply, covering the default 45-second startup budget plus the ordinary 15-second command budget. Commands sent after that reply keep the 15-second timeout. Other CDP clients must allow for preparation in their initial command deadline; a successful WebSocket handshake alone does not mean Chrome is ready.
 
 The browser runtime targets the supported Linux topology. Optional authenticated remote access and a lightweight live viewer are described in [live viewing and deployment](./live-view.md). The private host-control socket remains local; native Windows/macOS runtime mode and a general browser-management UI are outside this implementation.
+
+## Load local Chrome extensions
+
+Mount a host directory read-only and set `BROWSER_EXTENSIONS_DIR` to its container path. Each immediate subdirectory must contain an unpacked extension with a readable `manifest.json`; loose files are ignored. An empty directory loads no extensions. For example:
+
+```text
+extensions/
+  my-extension/
+    manifest.json
+    content.js
+  another-extension/
+    manifest.json
+    background.js
+```
+
+Add these options to your existing sandboxed Docker launch, keeping the security options described above:
+
+```sh
+--mount "type=bind,src=$(pwd)/extensions,dst=/browser-extensions,readonly" \
+--env BROWSER_EXTENSIONS_DIR=/browser-extensions
+```
+
+The equivalent additions to a Compose service are:
+
+```yaml
+environment:
+  BROWSER_EXTENSIONS_DIR: /browser-extensions
+volumes:
+  - ./extensions:/browser-extensions:ro
+```
+
+The runtime scans the directory on each browser launch, including cold restarts using a persistent Profile. Add or remove extension directories on the host before starting the next browser; existing browsers keep their loaded extensions. Stage new extensions outside the mounted directory, then move complete directories into it. Do not edit extension files while a browser is using them. Extensions that are disabled or incompatible with the pinned Chromium build require diagnosis in Chrome; manifest presence alone does not guarantee activation.
+
+Only the trusted deployment operator configures this directory. Extensions run in every execution browser, including the startup probe, and their declared permissions may grant access to page content and login data. Mount trusted extension code only, keep it unwritable by executions, and make directories traversable and files readable by all execution UIDs (typically modes 0755 and 0644). Do not place credentials or private configuration in this shared directory. Extension state belongs to each browser's Profile; temporary Profiles discard it and persistent Profiles retain it under the existing persistence rules.
+
+The directory must be absolute and contain at most 32 extension subdirectories. Commas, control characters, and symlink entries are rejected because Chrome receives a comma-separated path list. An unreadable directory or missing manifest fails browser startup. This loads unpacked extensions in headless CloakBrowser Chromium; it does not download CRX files or install from Chrome Web Store.
+
+The encoded Browserless launch request target must fit within 12 KiB, leaving space for HTTP headers under its 16 KiB parser limit. The budget includes all launch options, including both copies of the extension paths. Long paths and non-ASCII names consume more of this budget. An oversized configuration fails before opening a connection with `browser_extensions_launch_request_too_large`; shorten directory names or the mounted container path, or load fewer extensions.
+
+Overlapping launches share one in-progress directory scan. Cancelling one launch does not cancel other readers; when all readers cancel, their startup and Profile cleanup proceed without waiting for a stalled deployment mount. At most one underlying scan remains outstanding. New launches return `browser_extensions_scan_busy` until that abandoned scan finishes closing its directory handle. Late results cannot start a browser, and the next scan reads the directory again.
+
+Run `VERIFY_EXTENSIONS=1 bash .github/scripts/verify-image.sh browser-sandbox:local` to check that a mounted Manifest V3 content script runs in real pages under two execution UIDs. Image CI runs this check on AMD64 and ARM64; the ordinary performance benchmark keeps extensions disabled.
 
 ## Manage a live browser session
 
@@ -182,7 +225,7 @@ To collect the image benchmark locally, build the image and run `BENCHMARK_OUTPU
 
 A runtime retains up to 65,536 finished execution identities to fence delayed registrations. After reaching that budget it rejects new identities with `browser_execution_capacity_exceeded`, while existing registrations and their cleanup remain available. It never evicts a tombstone to admit a new execution. Hosts should drain a runtime before that budget is exhausted, confirm browser shutdown, and replace it through their normal deployment lifecycle. Continue to use fresh execution UUIDs and fence old host requests across replacement; tombstones are process-local, not a durable authorization database.
 
-Archive hashing, streams, directory traversal, window cleanup, and the default browser-version subprocess observe lifecycle cancellation. An already-issued filesystem operation must finish before ownership is released, so a stalled kernel or filesystem can still delay cleanup. Cancelled saves retain the recoverable Profile, remove intermediate archive files, and can be retried without replaying website operations. Cancelled restoration never reports successful preparation or starts Chrome afterward.
+Archive hashing, streams, directory traversal, window cleanup, and the default browser-version subprocess observe lifecycle cancellation. An already-issued Profile filesystem operation must finish before ownership is released, so a stalled kernel or filesystem can still delay cleanup. Cancelled saves retain the recoverable Profile, remove intermediate archive files, and can be retried without replaying website operations. Cancelled restoration never reports successful preparation or starts Chrome afterward.
 
 
 ## PR labels and release notes

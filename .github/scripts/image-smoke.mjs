@@ -225,6 +225,33 @@ if (process.argv[2] === "worker") {
     const a = await create(100011),
       b = await create(100012);
     await Promise.all([a.ready, b.ready]);
+    if (process.env.BROWSER_EXTENSION_SMOKE === "1") {
+      for (const browser of [a, b]) {
+        const { targetId } = await browser.call("Target.createTarget", {
+          url: "http://127.0.0.1:18080/extension",
+        });
+        const { sessionId } = await browser.call("Target.attachToTarget", {
+          targetId,
+          flatten: true,
+        });
+        let enabled = false;
+        for (let attempt = 0; attempt < 100; attempt++) {
+          const result = await browser.call(
+            "Runtime.evaluate",
+            {
+              expression: "document.documentElement?.dataset.browserSandboxExtension",
+              returnByValue: true,
+            },
+            sessionId,
+          );
+          enabled = result.result.value === "enabled";
+          if (enabled) break;
+          await delay(50);
+        }
+        assert(enabled, "browser_smoke_extension_not_enabled");
+        await browser.call("Target.closeTarget", { targetId });
+      }
+    }
     await a.call("Storage.setCookies", {
       cookies: [{ name: "isolation", value: "a", domain: "example.com", path: "/" }],
     });

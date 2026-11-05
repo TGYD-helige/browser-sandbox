@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { EXTENSION_STARTUP_ERRORS } from "./lifecycle-errors.js";
 
 /** Prove the target can run a sandboxed renderer before admitting executions. */
 export async function verifyTarget(gateway, WebSocket) {
@@ -22,9 +23,12 @@ export async function verifyTarget(gateway, WebSocket) {
           : entry.resolve(reply.result);
       }
     });
-    socket.on("close", () => {
-      for (const entry of pending.values())
-        entry.reject(Error("browser_probe_disconnected"));
+    socket.on("close", (code, reason) => {
+      const message =
+        code === 1011 && EXTENSION_STARTUP_ERRORS.has(String(reason))
+          ? String(reason)
+          : "browser_probe_disconnected";
+      for (const entry of pending.values()) entry.reject(Error(message));
       pending.clear();
     });
     await new Promise<void>((resolve, reject) => {

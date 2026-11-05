@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import fs, { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -148,14 +149,17 @@ for (const quiesce of [false, true])
   });
 function fixture(
   cookieStore = () => ({ restore: async () => {}, save: async () => {} }),
+  extensionsDir = undefined,
 ) {
   const sockets = [],
     requests = [];
+  const socketCreated = deferred();
   class Socket extends EventEmitter {
     constructor(url) {
       super();
       this.url = url;
       sockets.push(this);
+      socketCreated.resolve();
     }
     terminate() {
       this.closed = true;
@@ -181,6 +185,7 @@ function fixture(
     base: "http://localhost",
     token: "test",
     privacyArgs: [],
+    extensionsDir,
     cookieStore,
   });
   const req = (index) => ({ parsed: sockets[index].url });
@@ -216,8 +221,149 @@ function fixture(
       fingerprint: "1",
       signal,
     });
-  return { ...runtime, sockets, requests, req, browser, start };
+  return {
+    ...runtime,
+    sockets,
+    requests,
+    req,
+    browser,
+    start,
+    socketCreated: socketCreated.promise,
+  };
 }
+
+test("launcher enables configured extensions without bypassing other Chrome defaults", async () => {
+  const root = await mkdtemp(join(tmpdir(), "browser-launch-extensions-"));
+  try {
+    await mkdir(join(root, "example"));
+    await writeFile(join(root, "example", "manifest.json"), "{}");
+    const f = fixture(undefined, root);
+    const pending = f.start(new AbortController().signal);
+    await f.socketCreated;
+    const options = JSON.parse(f.sockets[0].url.searchParams.get("launch"));
+    assert.deepEqual(options.ignoreDefaultArgs, ["--disable-extensions"]);
+    assert(options.args.includes(`--load-extension=${join(root, "example")}`));
+    assert(
+      options.args.includes(`--disable-extensions-except=${join(root, "example")}`),
+    );
+    assert.equal(options.headless, true);
+    const starting = f.browserManager.getBrowserForRequest(f.req(0));
+    const browser = f.browser();
+    f.requests[0].resolve(browser);
+    await starting;
+    f.sockets[0].emit("open");
+    const handle = await pending;
+    browser.exit();
+    await handle.close();
+    const abort = new AbortController();
+    abort.abort();
+    await assert.rejects(f.start(abort.signal), { name: "AbortError" });
+    assert.equal(f.sockets.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a stalled extension scan does not block gateway finish or publish a late browser", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "browser-stalled-extensions-"));
+  const entered = deferred(),
+    release = deferred();
+  const opendir = fs.opendir;
+  let scans = 0,
+    released = 0;
+  t.mock.method(fs, "opendir", async (...args) => {
+    if (args[0] === join(root, "extensions")) {
+      scans++;
+      entered.resolve();
+      await release.promise;
+    }
+    return opendir(...args);
+  });
+  syncBuiltinESMExports();
+  const f = fixture(undefined, join(root, "extensions"));
+  await mkdir(join(root, "extensions"));
+  const gateway = await createGateway({
+    WebSocket,
+    WebSocketServer,
+    healthy: async () => true,
+    port: 0,
+    dataRoot: join(root, "data"),
+    socketPath: join(root, "control.sock"),
+    startupTimeoutMs: 200,
+    launch: f.launch,
+    resolvePeerUid: async () => 100001,
+    profileStore: {
+      acquire: async () => ({
+        profileDir: join(root, "profile"),
+        journalDir: join(root, "journal"),
+        release: async () => {
+          released++;
+        },
+      }),
+    },
+  });
+  const executionId = "11111111-1111-4111-8111-111111111111";
+  let peer;
+  try {
+    const { wsEndpoint } = await gateway.command(
+      { op: "register", executionId, executorUid: 100001, profileId: "test/profile" },
+      true,
+    );
+    peer = new WebSocket(wsEndpoint);
+    peer.on("error", () => {});
+    const closed = once(peer, "close");
+    await entered.promise;
+    await closed;
+    await Promise.race([
+      gateway.command({ op: "finish", executionId }, true),
+      delay(1000).then(() => {
+        throw Error("finish waited for the extension filesystem");
+      }),
+    ]);
+    assert.equal(released, 1);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      await assert.rejects(
+        f.start(new AbortController().signal),
+        /browser_extensions_scan_busy/,
+      );
+    }
+    assert.equal(scans, 1);
+    release.resolve();
+    await delay(30);
+    assert.equal(f.sockets.length, 0);
+  } finally {
+    release.resolve();
+    peer?.terminate();
+    await gateway.stop();
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("oversized encoded extension launch options fail before opening a WebSocket", async () => {
+  const root = await mkdtemp(join(tmpdir(), "browser-long-extensions-"));
+  try {
+    for (let i = 0; i < 32; i++) {
+      const path = join(root, `${i}-${"扩".repeat(30)}`);
+      await mkdir(path);
+      await writeFile(join(path, "manifest.json"), "{}");
+    }
+    const f = fixture(undefined, root);
+    await assert.rejects(
+      Promise.race([
+        f.start(new AbortController().signal),
+        delay(250).then(() => {
+          throw Error("oversized launch reached the socket");
+        }),
+      ]),
+      /browser_extensions_launch_request_too_large/,
+    );
+    assert.equal(f.sockets.length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("a failed startup cannot claim retirement when process termination throws", async () => {
   const f = fixture(),

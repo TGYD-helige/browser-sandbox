@@ -41,6 +41,7 @@ const { hooks, browserManager, launch } = createBrowserLauncher({
   base,
   token: process.env.TOKEN,
   privacyArgs: BROWSER_PRIVACY_ARGS,
+  extensionsDir: process.env.BROWSER_EXTENSIONS_DIR,
 });
 const metrics = new Metrics(),
   monitoring = new Monitoring(config),

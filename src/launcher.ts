@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import timers from "node:timers/promises";
 import { createCookieStore } from "./cookies.js";
+import { createExtensionReader } from "./extensions.js";
 import {
   BrowserCleanupUnconfirmed,
   VerifiedBrowserCheckpointFailure,
@@ -49,9 +50,12 @@ export function createBrowserLauncher({
   base,
   token,
   privacyArgs,
+  extensionsDir = undefined as string | undefined,
   cookieStore = createCookieStore,
 }) {
   const launches = new Map();
+  const readExtensions =
+    extensionsDir === undefined ? undefined : createExtensionReader(extensionsDir);
   class ExecutionHooks extends Hooks {
     async browser({ browser, req }) {
       const entry = launches.get(req.parsed.searchParams.get("trackingId"));
@@ -159,6 +163,8 @@ export function createBrowserLauncher({
       filesDir = undefined,
       allowedDomains = [],
     }) {
+      const extensions = readExtensions ? await readExtensions(signal) : [];
+      signal.throwIfAborted();
       const trackingId = randomBytes(16).toString("hex");
       const entry: any = {
         sessionBoundary,
@@ -172,7 +178,6 @@ export function createBrowserLauncher({
         }),
         disconnected: Promise.withResolvers(),
       };
-      launches.set(trackingId, entry);
       const url = new URL("/chromium", base);
       url.protocol = "ws:";
       url.searchParams.set("token", token);
@@ -181,6 +186,7 @@ export function createBrowserLauncher({
         "launch",
         JSON.stringify({
           headless: true,
+          ...(extensions.length ? { ignoreDefaultArgs: ["--disable-extensions"] } : {}),
           userDataDir: profileDir,
           // The runtime must checkpoint profiles before Puppeteer's process signal handlers close Chrome.
           handleSIGINT: false,
@@ -190,6 +196,12 @@ export function createBrowserLauncher({
             `--browser-execution-id=${executionId}`,
             `--fingerprint=${fingerprint}`,
             ...privacyArgs,
+            ...(extensions.length
+              ? [
+                  `--disable-extensions-except=${extensions.join(",")}`,
+                  `--load-extension=${extensions.join(",")}`,
+                ]
+              : []),
             ...(allowedDomains.length
               ? [
                   `--host-resolver-rules=MAP * ~NOTFOUND, ${allowedDomains.map((domain) => `EXCLUDE ${domain}`).join(", ")}`,
@@ -198,6 +210,10 @@ export function createBrowserLauncher({
           ],
         }),
       );
+      // Leave 4 KiB for the request line and headers under Browserless's 16 KiB parser limit.
+      if (extensions.length && Buffer.byteLength(url.pathname + url.search) > 12 * 1024)
+        throw Error("browser_extensions_launch_request_too_large");
+      launches.set(trackingId, entry);
       const held = new WebSocket(url, { handshakeTimeout: 1800000 });
       held.on("error", entry.disconnected.resolve);
       held.on("close", entry.disconnected.resolve);
