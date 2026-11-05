@@ -9,6 +9,8 @@ COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY tsconfig.json ./
 COPY src ./src
+COPY skills/browser-sandbox-auth/scripts/auth.mjs ./skills/browser-sandbox-auth/scripts/auth.mjs
+COPY scripts/copy-assets.mjs ./scripts/copy-assets.mjs
 RUN pnpm build && pnpm prune --prod
 
 FROM ${CLOAK_IMAGE} AS cloak

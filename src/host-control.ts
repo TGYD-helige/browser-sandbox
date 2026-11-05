@@ -9,6 +9,7 @@ export async function createHostControl({
   executions,
   controlTimeoutMs,
   profileFinalizeTimeoutMs,
+  dispatch = executions.dispatch,
 }) {
   const connections = new Set<Socket>();
   // Preserve lifecycle order per execution without holding other executions behind storage I/O.
@@ -61,7 +62,7 @@ export async function createHostControl({
         socket.once("close", () => clearTimeout(deadline));
         const work = Promise.resolve().then(() => {
           if (!host) throw Error("browser_host_authority_required");
-          return executions.dispatch(request, requestLife.signal);
+          return dispatch(request, requestLife.signal);
         });
         work.then(
           (result) => {

@@ -1,0 +1,23 @@
+services:
+  browser:
+    image: browser-sandbox:live-viewer
+    init: true
+    environment:
+      BROWSER_ACCESS_PORT: "8080"
+      BROWSER_ACCESS_HOST: "0.0.0.0"
+      BROWSER_ACCESS_ORIGIN: "http://127.0.0.1:8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - browser-data:/browser-data
+    cap_drop: [ALL]
+    cap_add: [SETUID, SETGID, CHOWN, KILL, DAC_OVERRIDE, SYS_CHROOT, NET_ADMIN]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=${BROWSER_SECCOMP_PROFILE:?Set the absolute path to the image seccomp.json}
+    sysctls:
+      net.ipv4.ip_local_reserved_ports: "3001,42000-42999"
+    shm_size: 512mb
+    mem_limit: 2g
+volumes:
+  browser-data:

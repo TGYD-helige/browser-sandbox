@@ -1,0 +1,8 @@
+{
+  "name": "browser-sandbox-access",
+  "main": "index.js",
+  "compatibility_date": "2026-11-05",
+  "vars": {
+    "BROWSER_ORIGIN": "https://browser-origin.example.com"
+  }
+}

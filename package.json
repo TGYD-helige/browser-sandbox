@@ -9,17 +9,23 @@
   },
   "packageManager": "pnpm@10.28.2",
   "exports": {
-    ".": "./dist/index.js"
+    ".": "./dist/index.js",
+    "./viewer": {
+      "types": "./dist/viewer/browser-viewer.d.ts",
+      "import": "./dist/viewer/browser-viewer.js"
+    },
+    "./viewer.css": "./dist/viewer/viewer.css"
   },
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
     "config",
+    "skills",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-assets.mjs",
     "typecheck": "tsc --noEmit",
     "test": "pnpm build && node --test tests/*.test.mjs",
     "format": "biome check --write . && prettier --write .github/workflows",
@@ -29,7 +35,9 @@
     "test:image": "bash .github/scripts/verify-image.sh browser-sandbox:local",
     "test:linux": "docker build -f Dockerfile.test -t browser-sandbox-tests:local . && docker run --rm --cap-drop ALL --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETUID --cap-add SETGID browser-sandbox-tests:local",
     "test:e2e": "node .github/scripts/e2e.mjs",
-    "test:e2e:local": "node .github/scripts/e2e-local.mjs"
+    "test:e2e:local": "node .github/scripts/e2e-local.mjs",
+    "test:viewer": "pnpm build && node .github/scripts/live-view-e2e.mjs",
+    "test:viewer:image": "pnpm build && bash .github/scripts/verify-live-view.sh"
   },
   "dependencies": {
     "tar-stream": "3.2.2",

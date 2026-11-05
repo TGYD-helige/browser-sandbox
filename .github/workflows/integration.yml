@@ -50,6 +50,35 @@ jobs:
           if-no-files-found: error
         if: always()
 
+  viewer:
+    name: Live viewer and authentication E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: docker build -t browser-sandbox:live-viewer .
+      - name: Verify sandboxed viewing and bundled authentication script
+        run: |
+          test -x "$CHROME_EXECUTABLE"
+          bash .github/scripts/verify-live-view.sh
+        env:
+          CHROME_EXECUTABLE: /usr/bin/google-chrome
+          VIEWER_OUTPUT: viewer-artifacts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-viewer
+          path: viewer-artifacts
+          if-no-files-found: warn
+
   browser-session:
     name: Pi browser-session E2E
     env:

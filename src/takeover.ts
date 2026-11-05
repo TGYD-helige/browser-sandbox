@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { connectCdp } from "./cdp.js";
 import { readBrowserJson } from "./readback.js";
 
@@ -25,6 +25,27 @@ export class Takeover {
     private stopAutomation: () => Promise<void>,
     private connect = connectCdp,
   ) {}
+
+  get leaseExpiresAt(): number | undefined {
+    return this.state === "human" || this.state === "uncertain"
+      ? this.expiresAt || undefined
+      : undefined;
+  }
+
+  invalidateFrame() {
+    this.frame = undefined;
+  }
+
+  heldBy(actorId: string, leaseId: string, epoch?: string) {
+    if (this.state === "human" && Date.now() >= this.expiresAt)
+      this.state = "uncertain";
+    return (
+      this.state === "human" &&
+      this.actorId === actorId &&
+      this.leaseId === leaseId &&
+      this.epoch === epoch
+    );
+  }
 
   async command(request: any, signal?: AbortSignal) {
     if (request.op === "readback") {
@@ -110,6 +131,7 @@ export class Takeover {
       this.state = "stopping";
       try {
         await this.stopAutomation();
+        this.targetId = request.targetId ?? this.targetId;
         const page = await this.stopTargets(signal);
         signal?.throwIfAborted();
         this.origin = page.origin;
@@ -139,12 +161,22 @@ export class Takeover {
       return this.lastRelease.result;
     if (
       (this.state !== "human" &&
-        !(request.op === "release" && this.state === "uncertain")) ||
+        !(
+          ["release", "completeRequest"].includes(request.op) &&
+          this.state === "uncertain"
+        )) ||
       request.actorId !== this.actorId ||
       request.leaseId !== this.leaseId ||
       request.epoch !== this.epoch
     )
       throw Error("browser_control_stale");
+    if (request.op === "completeRequest") {
+      // The trusted request owner has closed its private input channel before releasing.
+      this.epoch = randomUUID();
+      this.state = "automation";
+      this.frame = undefined;
+      return { state: this.state };
+    }
     if (request.op === "release") {
       this.state = "stopping";
       try {
@@ -187,6 +219,45 @@ export class Takeover {
         expiresAt: this.expiresAt,
         ...page,
       };
+    }
+    if (request.op === "confirmTarget") {
+      const cdp = await this.connect(this.endpoint, signal);
+      try {
+        const { targetInfos } = await cdp.call("Target.getTargets");
+        const target = targetInfos.find(
+          (item: any) => item.type === "page" && item.targetId === request.targetId,
+        );
+        if (
+          !target ||
+          !/^https?:/.test(target.url) ||
+          new URL(target.url).origin !== request.origin
+        )
+          throw Error("browser_target_changed");
+        const { sessionId } = await cdp.call("Target.attachToTarget", {
+          targetId: target.targetId,
+          flatten: true,
+        });
+        try {
+          const generation = JSON.stringify(
+            (await cdp.call("Page.getFrameTree", {}, sessionId)).frameTree.frame,
+          );
+          if (
+            !this.frame ||
+            request.frameRevision !== this.frame.revision ||
+            this.frame.generation !== generation ||
+            Date.now() - this.frame.capturedAt > 30_000
+          )
+            throw Error("browser_frame_stale");
+          this.targetId = target.targetId;
+          this.origin = request.origin;
+          this.frame = undefined;
+          return { state: this.state, targetId: this.targetId, origin: this.origin };
+        } finally {
+          await cdp.call("Target.detachFromTarget", { sessionId });
+        }
+      } finally {
+        cdp.close();
+      }
     }
     const cdp = await this.connect(this.endpoint, signal);
     try {
@@ -232,6 +303,7 @@ export class Takeover {
         return {
           data,
           frameRevision: this.frame.revision,
+          documentId: createHash("sha256").update(before).digest("hex"),
           targetId: target.targetId,
           origin,
           viewportWidth: cssVisualViewport.clientWidth,
@@ -247,7 +319,7 @@ export class Takeover {
         throw Error("browser_frame_stale");
       this.frame = undefined;
       if (
-        request.op === "pointer" &&
+        ["pointer", "scroll"].includes(request.op) &&
         Number.isFinite(request.x) &&
         Number.isFinite(request.y)
       ) {
@@ -263,12 +335,41 @@ export class Takeover {
           request.y >= viewport.clientHeight
         )
           throw Error("browser_pointer_invalid");
-        for (const type of ["mousePressed", "mouseReleased"])
+        if (request.op === "scroll") {
+          if (
+            !Number.isFinite(request.deltaX) ||
+            !Number.isFinite(request.deltaY) ||
+            Math.abs(request.deltaX) > 2000 ||
+            Math.abs(request.deltaY) > 2000
+          )
+            throw Error("browser_pointer_invalid");
           await cdp.call(
             "Input.dispatchMouseEvent",
-            { type, x: request.x, y: request.y, button: "left", clickCount: 1 },
+            {
+              type: "mouseWheel",
+              x: request.x,
+              y: request.y,
+              deltaX: request.deltaX,
+              deltaY: request.deltaY,
+            },
             sessionId,
           );
+        } else
+          for (const type of ["mousePressed", "mouseReleased"])
+            await cdp.call(
+              "Input.dispatchMouseEvent",
+              { type, x: request.x, y: request.y, button: "left", clickCount: 1 },
+              sessionId,
+            );
+      } else if (request.op === "navigate") {
+        if (typeof request.url !== "string" || request.url.length > 2048)
+          throw Error("browser_navigation_invalid");
+        const url = new URL(request.url);
+        if (!["http:", "https:"].includes(url.protocol) || url.username || url.password)
+          throw Error("browser_navigation_invalid");
+        await cdp.call("Page.navigate", { url: url.href }, sessionId);
+      } else if (request.op === "reload") {
+        await cdp.call("Page.reload", {}, sessionId);
       } else if (
         request.op === "text" &&
         typeof request.text === "string" &&
@@ -277,16 +378,34 @@ export class Takeover {
         await cdp.call("Input.insertText", { text: request.text }, sessionId);
       } else if (
         request.op === "key" &&
-        ["Enter", "Tab", "Backspace", "Escape", "PageUp", "PageDown", "Back"].includes(
-          request.key,
-        )
+        [
+          "Enter",
+          "Tab",
+          "Backspace",
+          "Escape",
+          "PageUp",
+          "PageDown",
+          "Back",
+          "Forward",
+          "Delete",
+          "ArrowLeft",
+          "ArrowRight",
+          "ArrowUp",
+          "ArrowDown",
+          "Home",
+          "End",
+          "SelectAll",
+        ].includes(request.key)
       ) {
-        if (request.key === "Back") {
+        if (request.modifiers !== undefined && ![0, 8].includes(request.modifiers))
+          throw Error("browser_human_operation_invalid");
+        if (["Back", "Forward"].includes(request.key)) {
           const history = await cdp.call("Page.getNavigationHistory", {}, sessionId);
-          if (history.currentIndex > 0)
+          const index = history.currentIndex + (request.key === "Back" ? -1 : 1);
+          if (index >= 0 && index < history.entries.length)
             await cdp.call(
               "Page.navigateToHistoryEntry",
-              { entryId: history.entries[history.currentIndex - 1].id },
+              { entryId: history.entries[index].id },
               sessionId,
             );
           return {};
@@ -296,7 +415,8 @@ export class Takeover {
             "Input.dispatchKeyEvent",
             {
               type,
-              key: request.key,
+              key: request.key === "SelectAll" ? "a" : request.key,
+              modifiers: request.key === "SelectAll" ? 2 : (request.modifiers ?? 0),
               windowsVirtualKeyCode: {
                 Enter: 13,
                 Tab: 9,
@@ -304,6 +424,14 @@ export class Takeover {
                 Escape: 27,
                 PageUp: 33,
                 PageDown: 34,
+                Delete: 46,
+                ArrowLeft: 37,
+                ArrowRight: 39,
+                ArrowUp: 38,
+                ArrowDown: 40,
+                Home: 36,
+                End: 35,
+                SelectAll: 65,
               }[request.key],
             },
             sessionId,

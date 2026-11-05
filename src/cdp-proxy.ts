@@ -4,17 +4,24 @@ export function attachCdpProxy({
   WebSocketServer,
   executions,
   resolvePeerUid,
+  authorize = undefined,
+  canUpgrade = undefined,
 }) {
   const ws = new WebSocketServer({
     noServer: true,
     maxPayload: 32 * 1024 * 1024,
   });
   server.on("upgrade", async (req, socket, head) => {
+    if (canUpgrade && !canUpgrade(req)) return;
     const match = /^\/execution\/([a-f0-9]{64})$/.exec(req.url ?? "");
-    const entry = match && executions.resolve(match[1]);
+    if (authorize && !match) return;
+    const authorization = authorize ? await authorize(req).catch(() => null) : null;
+    const entry = authorize
+      ? authorization?.entry
+      : match && executions.resolve(match[1]);
     let authorized = true;
     try {
-      if (entry?.uid >= 100000)
+      if (!authorize && entry?.uid >= 100000)
         authorized = (await resolvePeerUid(req.socket)) === entry.uid;
     } catch {
       authorized = false;
@@ -22,6 +29,7 @@ export function attachCdpProxy({
     if (
       !entry ||
       !authorized ||
+      (authorize && (!authorization?.signal || authorization.signal.aborted)) ||
       entry.revoked ||
       executions.closing ||
       entry.peers.size >= 16 ||
@@ -34,6 +42,11 @@ export function attachCdpProxy({
       entry.browserRequested = true;
       const pair: any = { client, upstream: null, inflight: new Set() };
       entry.peers.add(pair);
+      const isCurrentConnection = () =>
+        !entry.revoked &&
+        !authorization?.signal.aborted &&
+        !entry.abort?.signal.aborted &&
+        entry.starting === pair.starting;
       let pending = [],
         pendingBytes = 0;
       clearTimeout(entry.idle);
@@ -49,6 +62,7 @@ export function attachCdpProxy({
       client.on("error", cleanup);
       client.on("close", cleanup);
       client.on("message", (data, binary) => {
+        if (!isCurrentConnection()) return;
         if (entry.takeover && entry.takeover.state !== "automation") return;
         try {
           const message = JSON.parse(String(data));
@@ -71,12 +85,11 @@ export function attachCdpProxy({
       starting
         .then((browser) => {
           if (
-            entry.revoked ||
+            !isCurrentConnection() ||
             client.readyState !== WebSocket.OPEN ||
             !entry.peers.has(pair)
           )
             return cleanup();
-          if (entry.starting !== starting) return cleanup();
           const upstream = (pair.upstream = new WebSocket(browser.endpoint, {
             maxPayload: 32 * 1024 * 1024,
           }));
@@ -88,7 +101,8 @@ export function attachCdpProxy({
           upstream.on("error", lost);
           upstream.on("close", lost);
           upstream.on("open", () => {
-            if (entry.revoked || client.readyState !== WebSocket.OPEN) return cleanup();
+            if (!isCurrentConnection() || client.readyState !== WebSocket.OPEN)
+              return cleanup();
             for (const [data, binary] of pending) upstream.send(data, { binary });
             pending = [];
             pendingBytes = 0;
@@ -99,7 +113,7 @@ export function attachCdpProxy({
             } catch {}
             if (client.bufferedAmount + data.length > 32 * 1024 * 1024)
               return cleanup();
-            if (!entry.revoked && client.readyState === WebSocket.OPEN)
+            if (isCurrentConnection() && client.readyState === WebSocket.OPEN)
               client.send(data, { binary });
           });
         })

@@ -111,6 +111,8 @@ function browser() {
         if (method === "Page.getFrameTree")
           return { frameTree: { frame: { id: "frame", loaderId: generation, url } } };
         if (method === "Page.captureScreenshot") return { data: "jpeg" };
+        if (method === "Page.getNavigationHistory")
+          return { currentIndex: 1, entries: [{ id: 10 }, { id: 20 }, { id: 30 }] };
         if (method === "Page.getLayoutMetrics")
           return { cssVisualViewport: { clientWidth: 800, clientHeight: 600 } };
         if (method === "Page.createIsolatedWorld") return { executionContextId: 1 };
@@ -260,4 +262,125 @@ test("same-origin JSON readback fences automation and rejects cross-origin or cr
     await assert.rejects(control.command({ op: "readback", url }), /origin_mismatch/);
     assert.equal(control.state, "automation");
   }
+});
+
+test("scroll uses bounded viewport coordinates and explicit handoff confirms a new origin from a fresh frame", async () => {
+  const b = browser();
+  const control = new Takeover("ws://unused", async () => {}, b.connect);
+  const lease = await control.command({
+    op: "acquire",
+    actorId: "human",
+    leaseId: "lease",
+    automationStopped: true,
+  });
+  const identity = { actorId: "human", leaseId: "lease", epoch: lease.epoch };
+  assert.equal(control.heldBy("human", "lease", lease.epoch), true);
+  assert.equal(control.heldBy("other", "lease", lease.epoch), false);
+  let frame = await control.command({ ...identity, op: "frame" });
+  await assert.rejects(
+    control.command({
+      ...identity,
+      ...frame,
+      op: "scroll",
+      x: 10,
+      y: 20,
+      deltaX: 0,
+      deltaY: 2001,
+    }),
+    /pointer_invalid/,
+  );
+  frame = await control.command({ ...identity, op: "frame" });
+  await control.command({
+    ...identity,
+    ...frame,
+    op: "scroll",
+    x: 10,
+    y: 20,
+    deltaX: 0,
+    deltaY: 200,
+  });
+  assert(
+    b.calls.some(
+      (call) =>
+        call.method === "Input.dispatchMouseEvent" && call.params.type === "mouseWheel",
+    ),
+  );
+  b.navigate("https://other.example/complete");
+  frame = await control.command({ ...identity, op: "frame" });
+  await assert.rejects(
+    control.command({
+      ...identity,
+      ...frame,
+      op: "confirmTarget",
+      frameRevision: "old",
+    }),
+    /frame_stale/,
+  );
+  await control.command({ ...identity, ...frame, op: "confirmTarget" });
+  assert.equal(
+    (
+      await control.command({
+        ...identity,
+        op: "release",
+        origin: "https://other.example",
+      })
+    ).state,
+    "automation",
+  );
+});
+
+test("embedded navigation and editing keys retain lease and frame checks", async () => {
+  const b = browser();
+  const control = new Takeover("ws://unused", async () => {}, b.connect);
+  const lease = await control.command({
+    op: "acquire",
+    actorId: "human",
+    leaseId: "lease",
+    automationStopped: true,
+  });
+  const identity = { actorId: "human", leaseId: "lease", epoch: lease.epoch };
+  const apply = async (action) =>
+    control.command({
+      ...identity,
+      ...(await control.command({ ...identity, op: "frame" })),
+      ...action,
+    });
+  for (const url of [
+    "javascript:alert(1)",
+    "file:///etc/passwd",
+    "https://user:secret@example.com",
+  ])
+    await assert.rejects(apply({ op: "navigate", url }), /navigation_invalid/);
+  await apply({ op: "navigate", url: "https://example.com/next" });
+  await apply({ op: "reload" });
+  await apply({ op: "key", key: "Back" });
+  await apply({ op: "key", key: "Forward" });
+  await apply({ op: "key", key: "SelectAll" });
+  await apply({ op: "key", key: "Tab", modifiers: 8 });
+  await assert.rejects(
+    apply({ op: "key", key: "Tab", modifiers: 2 }),
+    /operation_invalid/,
+  );
+  assert(
+    b.calls.some(
+      (call) =>
+        call.method === "Page.navigate" &&
+        call.params.url === "https://example.com/next",
+    ),
+  );
+  assert(b.calls.some((call) => call.method === "Page.reload"));
+  assert.deepEqual(
+    b.calls
+      .filter((call) => call.method === "Page.navigateToHistoryEntry")
+      .map((call) => call.params.entryId),
+    [10, 30],
+  );
+  assert(
+    b.calls.some(
+      (call) =>
+        call.method === "Input.dispatchKeyEvent" &&
+        call.params.key === "a" &&
+        call.params.modifiers === 2,
+    ),
+  );
 });

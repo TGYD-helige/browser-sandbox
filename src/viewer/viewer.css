@@ -1,0 +1,443 @@
+body.viewer-page {
+  margin: 0;
+  background: #fff;
+}
+browser-viewer {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+browser-viewer[data-standalone] {
+  height: 100dvh;
+}
+.browser-viewer {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  color: #202124;
+  background: #fff;
+  font:
+    13px system-ui,
+    sans-serif;
+}
+.browser-viewer * {
+  box-sizing: border-box;
+}
+.browser-viewer button,
+.browser-viewer input,
+.browser-viewer textarea {
+  font: inherit;
+  color: inherit;
+}
+.browser-viewer button {
+  cursor: pointer;
+}
+.browser-viewer :disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+.browser-viewer :focus-visible {
+  outline: 2px solid #1a73e8;
+  outline-offset: 2px;
+}
+.browser-viewer svg {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: 0 0 auto;
+}
+.browser-viewer .tab-strip {
+  display: flex;
+  flex: 0 0 auto;
+  height: 40px;
+  padding: 6px 8px 0;
+  background: #dee1e6;
+}
+.browser-viewer .tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 3px;
+  min-width: 0;
+  width: 100%;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.browser-viewer .tabs button {
+  position: relative;
+  flex: 0 1 240px;
+  min-width: 92px;
+  max-width: 240px;
+  border: 0;
+  border-radius: 10px 10px 0 0;
+  padding: 8px 16px 8px 34px;
+  background: transparent;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.browser-viewer .tabs button::before {
+  content: "";
+  position: absolute;
+  left: 13px;
+  top: 12px;
+  width: 12px;
+  height: 12px;
+  border: 1.5px solid #69717a;
+  border-radius: 50%;
+}
+.browser-viewer .tabs button:hover {
+  background: #e9ebef;
+}
+.browser-viewer .tabs button[aria-selected="true"] {
+  background: #fff;
+}
+.browser-viewer .tab-placeholder {
+  padding: 9px 16px;
+  color: #606368;
+}
+.browser-viewer .navigation {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 3px;
+  height: 48px;
+  padding: 5px 8px;
+  border-bottom: 1px solid #dadce0;
+  background: #fff;
+  z-index: 2;
+}
+.browser-viewer button[data-navigation] {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+}
+.browser-viewer button[data-navigation]:not(:disabled):hover {
+  background: #f0f1f3;
+}
+.browser-viewer .address-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  height: 34px;
+  margin: 0 6px;
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: 22px;
+  background: #f1f3f4;
+}
+.browser-viewer .address-form:focus-within {
+  border-color: #1a73e8;
+  background: #fff;
+  box-shadow: 0 0 0 1px #1a73e8;
+}
+.browser-viewer .site-icon {
+  width: 16px;
+  height: 16px;
+  color: #5f6368;
+}
+.browser-viewer .url {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  font-size: 13px;
+}
+.browser-viewer .url:focus-visible {
+  outline: none;
+}
+.browser-viewer .alternative > summary {
+  padding: 9px 0;
+  cursor: pointer;
+}
+.browser-viewer .control-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+.browser-viewer .control-menu > summary {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  height: 32px;
+  padding: 0 7px 0 10px;
+  list-style: none;
+  border-radius: 18px;
+  background: #f1f3f4;
+  cursor: pointer;
+}
+.browser-viewer .control-menu > summary::-webkit-details-marker {
+  display: none;
+}
+.browser-viewer .control-menu > summary:hover {
+  background: #e8eaed;
+}
+.browser-viewer .control-menu > summary > svg {
+  width: 14px;
+  height: 14px;
+}
+.browser-viewer .status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.browser-viewer .status::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #80868b;
+}
+.browser-viewer[data-connected="true"] .status::before {
+  background: #188038;
+}
+.browser-viewer[data-control="human"] .control-menu > summary {
+  background: #e8f0fe;
+  color: #174ea6;
+}
+.browser-viewer[data-control="human"] .status::before {
+  background: #1a73e8;
+}
+.browser-viewer .menu-panel {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  width: 284px;
+  max-height: min(480px, 70dvh);
+  overflow: auto;
+  padding: 8px;
+  border: 1px solid #dadce0;
+  border-radius: 10px;
+  background: #fff;
+  box-shadow: 0 8px 24px #20212424;
+}
+.browser-viewer .menu-panel > button {
+  display: block;
+  width: 100%;
+  padding: 9px 12px;
+  text-align: left;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+}
+.browser-viewer .menu-panel > button[hidden] {
+  display: none;
+}
+.browser-viewer .menu-panel button:not(:disabled):hover {
+  background: #f1f3f4;
+}
+.browser-viewer .session-note,
+.browser-viewer .hint {
+  margin: 4px 8px 8px;
+  color: #5f6368;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.browser-viewer .hint {
+  margin-top: 10px;
+}
+.browser-viewer .viewport {
+  position: relative;
+  display: grid;
+  place-items: center;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  background: #f1f3f4;
+}
+.browser-viewer .viewport img {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.browser-viewer .viewport img[hidden] {
+  display: none;
+}
+.browser-viewer .keyboard-capture {
+  position: absolute;
+  left: 1px;
+  top: 1px;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  opacity: 0;
+  pointer-events: none;
+}
+.browser-viewer .visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.browser-viewer .empty {
+  padding: 24px;
+  text-align: center;
+}
+.browser-viewer .empty strong {
+  display: block;
+  font-size: 18px;
+  font-weight: 500;
+}
+.browser-viewer .empty p {
+  max-width: 360px;
+  color: #5f6368;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.browser-viewer .alternative {
+  padding: 0 12px;
+}
+
+.browser-viewer .input label {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+}
+.browser-viewer .input textarea {
+  width: 100%;
+  min-height: 72px;
+  resize: vertical;
+  border: 1px solid #dadce0;
+  border-radius: 4px;
+  padding: 8px;
+}
+.browser-viewer .input button {
+  margin: 8px 0;
+  padding: 7px 12px;
+  border: 1px solid #dadce0;
+  border-radius: 4px;
+  background: #f8f9fa;
+}
+.browser-viewer .notice {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  max-width: calc(100% - 24px);
+  margin: 0;
+  padding: 10px 14px;
+  border: 1px solid #dadce0;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 2px 8px #2021241a;
+  color: #5f6368;
+  font-size: 12px;
+  line-height: 1.5;
+  z-index: 1;
+}
+.browser-viewer .notice:empty {
+  display: none;
+}
+@media (max-width: 480px) {
+  .browser-viewer .navigation {
+    padding-inline: 4px;
+    gap: 0;
+  }
+  .browser-viewer .address-form {
+    margin-inline: 2px;
+    padding-inline: 8px;
+  }
+  .browser-viewer .control-menu > summary {
+    padding-inline: 7px;
+  }
+  .browser-viewer .status {
+    font-size: 11px;
+    gap: 4px;
+  }
+  .browser-viewer .menu-panel {
+    width: min(284px, calc(100vw - 16px));
+  }
+}
+.browser-viewer .auth-dialog {
+  width: min(400px, calc(100% - 24px));
+  max-height: calc(100% - 24px);
+  overflow: auto;
+  padding: 24px;
+  border: 1px solid #dadce0;
+  border-radius: 12px;
+  color: #202124;
+  background: #fff;
+  box-shadow: 0 12px 48px #20212440;
+}
+.browser-viewer .auth-dialog::backdrop {
+  background: #20212455;
+}
+.browser-viewer .auth-dialog h2 {
+  margin: 0 0 12px;
+  font-size: 20px;
+  font-weight: 500;
+}
+.browser-viewer .auth-origin {
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+.browser-viewer .auth-note {
+  font-size: 12px;
+  line-height: 1.5;
+  color: #5f6368;
+}
+.browser-viewer .auth-fields {
+  display: grid;
+  gap: 14px;
+  margin: 20px 0;
+}
+.browser-viewer .auth-fields label {
+  display: grid;
+  gap: 6px;
+}
+.browser-viewer .auth-fields input {
+  width: 100%;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #80868b;
+  border-radius: 4px;
+}
+.browser-viewer .auth-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 20px;
+}
+.browser-viewer .auth-dialog button {
+  padding: 8px 16px;
+  border: 1px solid #dadce0;
+  border-radius: 4px;
+  background: #fff;
+}
+.browser-viewer .auth-dialog .auth-submit {
+  color: #fff;
+  background: #1a73e8;
+  border-color: #1a73e8;
+}
+.browser-viewer .auth-options {
+  display: grid;
+  gap: 8px;
+}

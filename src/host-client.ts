@@ -9,6 +9,13 @@ export interface Registration {
   allowedDomains?: string[];
 }
 
+export interface BrowserAccess {
+  executionId: string;
+  cdpUrl: string;
+  viewerUrl: string;
+  expiresAt: number;
+}
+
 export interface Endpoint {
   protocol: "browser-sandbox.host/v1";
   executorUid: number;

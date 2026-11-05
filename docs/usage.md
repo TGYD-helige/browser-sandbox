@@ -109,7 +109,7 @@ Profile preparation (including acquisition and restore), archive saves, and owne
 
 The gateway accepts the execution WebSocket before cold startup completes. The bundled CDP client allows 60 seconds for commands sent before the first reply, covering the default 45-second startup budget plus the ordinary 15-second command budget. Commands sent after that reply keep the 15-second timeout. Other CDP clients must allow for preparation in their initial command deadline; a successful WebSocket handshake alone does not mean Chrome is ready.
 
-The first release intentionally targets the verified Linux topology. Remote TCP control, arbitrary UID allocation policies, Windows/macOS service mode, and a generic browser management UI are outside this implementation.
+The browser runtime targets the supported Linux topology. Optional authenticated remote access and a lightweight live viewer are described in [live viewing and deployment](./live-view.md). The private host-control socket remains local; native Windows/macOS runtime mode and a general browser-management UI are outside this implementation.
 
 ## Manage a live browser session
 
