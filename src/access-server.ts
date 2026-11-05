@@ -29,7 +29,7 @@ interface Grant {
   browserSignal?: AbortSignal;
   expiresAt: number;
   life: AbortController;
-  connections: Map<any, (browserEnded: boolean) => boolean | void>;
+  connections: Map<any, (browserEnded: boolean) => boolean>;
   timer: ReturnType<typeof setTimeout>;
   cleanup(): void;
   browserEnded(): void;
@@ -128,6 +128,7 @@ export async function createAccessServer({
     connection: any,
     close = (_browserEnded: boolean) => {
       connection.destroy ? connection.destroy() : connection.terminate();
+      return false;
     },
   ) {
     if (grant.connections.has(connection)) return;
@@ -234,6 +235,7 @@ export async function createAccessServer({
       } else {
         req.destroy();
         res.destroy();
+        return false;
       }
     });
     await files(req, res);
@@ -252,7 +254,10 @@ export async function createAccessServer({
       const grant = resolve(token, "cdp");
       if (!grant) return null;
       track(grant, req.socket, (browserEnded) => {
-        if (!browserEnded) return req.socket.destroy();
+        if (!browserEnded) {
+          req.socket.destroy();
+          return false;
+        }
         // The CDP proxy must send its startup-failure close frame before teardown.
         const timer = setTimeout(() => req.socket.destroy(), 1000);
         timer.unref();

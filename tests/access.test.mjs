@@ -1109,3 +1109,33 @@ test("CDP admission rechecks a grant revoked while authorization was awaited", a
   assert.equal(status, 403);
   assert.equal(launches, 0);
 });
+
+test("a stop receipt identifies the stopped generation when a replacement is already starting", async (t) => {
+  const f = await fixture(t, {}, { resolvePeerUid: async () => 100001 });
+  const access = await f.issue();
+  await f.agent(access.cdpUrl);
+  const original = await sessionRequest(access.cdpUrl);
+  let notifyClosing, release;
+  const entered = new Promise((resolve) => {
+    notifyClosing = resolve;
+  });
+  const closing = new Promise((resolve) => {
+    release = resolve;
+  });
+  f.onBrowserClose(async () => {
+    notifyClosing();
+    await closing;
+  });
+  const stopping = sessionRequest(access.cdpUrl, "stop");
+  await entered;
+  try {
+    const replacement = f.rawAgent(f.privateEndpoint);
+    await once(replacement, "open");
+    release();
+    const stopped = await stopping;
+    assert.equal(stopped.state, "stopped");
+    assert.equal(stopped.generation, original.generation);
+  } finally {
+    release();
+  }
+});

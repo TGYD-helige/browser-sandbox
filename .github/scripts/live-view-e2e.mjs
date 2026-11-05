@@ -11,6 +11,7 @@ import { promisify } from "node:util";
 import { chromium } from "playwright-core";
 import WebSocket, { WebSocketServer } from "ws";
 import { createGateway } from "../../dist/gateway.js";
+import { sessionRequest } from "../../dist/session.js";
 
 const executablePath = process.env.CHROME_EXECUTABLE;
 if (!executablePath)
@@ -338,7 +339,7 @@ try {
     }
     const result = await resultPromise;
     await viewer.locator(".auth-dialog").waitFor({ state: "hidden" });
-    assert.equal(result.controlReleased, true);
+    assert.equal(result.controlReleased, true, JSON.stringify(result));
     assert.equal(JSON.stringify(result).includes("fixture-password"), false);
     agent = await chromium.connectOverCDP(access.cdpUrl);
     page = agent.contexts()[0].pages()[0];
@@ -360,7 +361,11 @@ try {
     (await requestAuth(authSpec, () => viewer.locator(".auth-cancel").click())).status,
     "declined",
   );
-  assert.equal((await requestAuth({ ...authSpec, timeoutMs: 100 })).status, "expired");
+  // Exercise expiry while the user prompt is waiting, after control has been acquired.
+  assert.equal(
+    (await requestAuth({ ...authSpec, timeoutMs: 2000 }, async () => {})).status,
+    "expired",
+  );
   assert.equal(
     (
       await requestAuth({
@@ -462,6 +467,9 @@ try {
   await viewer.getByText("Disconnected", { exact: true }).waitFor();
   assert.equal(await viewer.locator("form.input button").isEnabled(), false);
   assert.deepEqual(errors, []);
+  const stopAccess = await gateway.command({ op: "access_create", executionId }, true);
+  assert.equal((await sessionRequest(stopAccess.cdpUrl, "stop")).state, "stopped");
+  await assert.rejects(sessionRequest(stopAccess.cdpUrl));
   await gateway.command({ op: "finalize", executionId }, true);
   console.log(
     JSON.stringify({
@@ -479,6 +487,7 @@ try {
         "handback",
         "reconnect",
         "revocation",
+        "remote stop response before generation-bound connection close",
         "authentication method selection, cancellation, timeout, invalid locator",
         "private credential submission and fresh login-success inspection",
         "submitted does not imply login success",

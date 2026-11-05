@@ -316,8 +316,11 @@ export async function createExecutions({
         if (entry.takeover && entry.takeover.state !== "automation")
           fail("browser_control_busy");
         retire(entry);
+        const stopped = { ...entry.session.status(0), state: "stopped" };
         await entry.closing;
-        entry.session.ended("stopped");
+        if (entry.session.status(entry.peers.size).generation === stopped.generation)
+          entry.session.ended("stopped");
+        return stopped;
       } else {
         entry.session.control(request.action, request.durationMs);
         if (entry.session.retained) {
