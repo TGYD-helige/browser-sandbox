@@ -101,6 +101,7 @@ export function createHttpHandler({
         const timer = setTimeout(() => {
           abort.abort();
           req.destroy();
+          res.destroy();
         }, 30_000);
         const disconnected = () => {
           if (!res.writableEnded) abort.abort();

@@ -194,7 +194,9 @@ export async function createAccessServer({
     onSessionStop: (_req, res) => stopResponses.add(res),
     resolveAccess: (token) => resolve(token, "cdp")?.entry,
   });
+  const httpSockets = new WeakSet<object>();
   const server = createServer(async (req, res) => {
+    httpSockets.add(req.socket);
     res.setHeader("cache-control", "no-store");
     res.setHeader("referrer-policy", "no-referrer");
     res.setHeader("x-content-type-options", "nosniff");
@@ -240,7 +242,7 @@ export async function createAccessServer({
     });
     await files(req, res);
   });
-  // Do not admit pipelined work that can tear down a prior terminal response.
+  // Each socket serves one HTTP request; upgrades must also leave its response intact.
   server.maxRequestsPerSocket = 1;
   const cdp = attachCdpProxy({
     server,
@@ -248,6 +250,7 @@ export async function createAccessServer({
     WebSocketServer,
     executions,
     resolvePeerUid: undefined,
+    canUpgrade: (req) => !httpSockets.has(req.socket),
     authorize: async (req) => {
       if (req.headers.origin && !allowedOrigin(req.headers.origin)) return null;
       const token = /^\/execution\/([a-f0-9]{64})$/.exec(req.url ?? "")?.[1];
@@ -270,6 +273,7 @@ export async function createAccessServer({
   const viewers = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
   let waiting = 0;
   server.on("upgrade", (req, socket, head) => {
+    if (httpSockets.has(socket)) return;
     if (/^\/execution\/[a-f0-9]{64}$/.test(req.url ?? "")) return;
     if (
       req.url !== "/view/socket" ||

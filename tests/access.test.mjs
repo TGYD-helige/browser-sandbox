@@ -1139,3 +1139,86 @@ test("a stop receipt identifies the stopped generation when a replacement is alr
     release();
   }
 });
+
+test("a fully read stop request closes at its real deadline while cleanup continues", async (t) => {
+  const f = await fixture(t);
+  const access = await f.issue();
+  await f.agent(access.cdpUrl);
+  let notifyClosing, release;
+  const entered = new Promise((resolve) => {
+    notifyClosing = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let cleaned = false;
+  f.onBrowserClose(async () => {
+    notifyClosing();
+    await gate;
+    cleaned = true;
+  });
+  const socket = connect(Number(new URL(f.origin).port), "127.0.0.1");
+  t.after(() => socket.destroy());
+  socket.on("error", () => {});
+  let output = "";
+  socket.on("data", (data) => {
+    output += data;
+  });
+  const closed = once(socket, "close");
+  await once(socket, "connect");
+  const body = JSON.stringify({ action: "stop" });
+  const started = Date.now();
+  socket.write(
+    `POST ${new URL(access.cdpUrl).pathname}/session HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+  );
+  await entered;
+  let timer;
+  try {
+    const ended = await Promise.race([
+      closed.then(() => true),
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve(false), 31_500);
+      }),
+    ]);
+    assert.equal(ended, true, "the response must close at the 30-second deadline");
+    assert.ok(Date.now() - started >= 29_000, "the actual server deadline must run");
+    assert.equal(output, "");
+    assert.equal(cleaned, false);
+  } finally {
+    clearTimeout(timer);
+    release();
+    socket.destroy();
+  }
+  const fresh = await f.issue();
+  assert.equal((await sessionRequest(fresh.cdpUrl)).state, "stopped");
+  assert.equal(cleaned, true);
+});
+
+for (const transport of ["CDP", "viewer"]) {
+  test(`a pipelined ${transport} upgrade cannot truncate an admitted stop response`, async (t) => {
+    const f = await fixture(t);
+    const access = await f.issue();
+    await f.agent(access.cdpUrl);
+    f.onBrowserClose(() => delay(30));
+    const socket = connect(Number(new URL(f.origin).port), "127.0.0.1");
+    t.after(() => socket.destroy());
+    socket.on("error", () => {});
+    let output = "";
+    socket.on("data", (data) => {
+      output += data;
+    });
+    const closed = once(socket, "close");
+    await once(socket, "connect");
+    const path = new URL(access.cdpUrl).pathname;
+    const upgradePath = transport === "CDP" ? path : "/view/socket";
+    const body = JSON.stringify({ action: "stop" });
+    socket.write(
+      `POST ${path}/session HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}GET ${upgradePath} HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: ${f.origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: MDEyMzQ1Njc4OWFiY2RlZg==\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+    );
+    await closed;
+    assert.match(output, /HTTP\/1\.1 200/);
+    assert.match(output, /"state":"stopped"/);
+    assert.doesNotMatch(output, /101 Switching Protocols/);
+    await assert.rejects(f.agent(access.cdpUrl), /403/);
+  });
+}
