@@ -4,7 +4,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { readExtensionDirs } from "../dist/extensions.js";
+import { createExtensionReader, readExtensionDirs } from "../dist/extensions.js";
 
 test("extension scanning stops when startup is cancelled", async () => {
   const abort = new AbortController();
@@ -12,6 +12,39 @@ test("extension scanning stops when startup is cancelled", async () => {
   await assert.rejects(readExtensionDirs(undefined, abort.signal), {
     name: "AbortError",
   });
+});
+
+test("overlapping scans share work without one cancelled reader cancelling another", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "browser-shared-extension-scan-"));
+  const gate = Promise.withResolvers();
+  const opendir = fs.opendir;
+  let scans = 0;
+  t.mock.method(fs, "opendir", async (...args) => {
+    scans++;
+    await gate.promise;
+    return opendir(...args);
+  });
+  syncBuiltinESMExports();
+  const read = createExtensionReader(root);
+  const first = new AbortController();
+  try {
+    const cancelled = read(first.signal);
+    const active = read(new AbortController().signal);
+    first.abort();
+    await assert.rejects(cancelled, { name: "AbortError" });
+    assert.equal(scans, 1);
+    gate.resolve();
+    assert.deepEqual(await active, []);
+    await mkdir(join(root, "new"));
+    await writeFile(join(root, "new", "manifest.json"), "{}");
+    assert.deepEqual(await read(new AbortController().signal), [join(root, "new")]);
+    assert.equal(scans, 2);
+  } finally {
+    gate.resolve();
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("cancellation during a scan stops before reading the next extension", async (t) => {
