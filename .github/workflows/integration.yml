@@ -37,6 +37,8 @@ jobs:
         with:
           persist-credentials: false
       - run: docker build -t browser-sandbox:local .
+      - name: Verify mounted Chrome extensions
+        run: VERIFY_EXTENSIONS=1 bash .github/scripts/verify-image.sh browser-sandbox:local
       - uses: actions/setup-node@v4
         with:
           node-version: 24

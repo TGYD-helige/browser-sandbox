@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import timers from "node:timers/promises";
 import { createCookieStore } from "./cookies.js";
+import { readExtensionDirs } from "./extensions.js";
 import {
   BrowserCleanupUnconfirmed,
   VerifiedBrowserCheckpointFailure,
@@ -49,6 +50,7 @@ export function createBrowserLauncher({
   base,
   token,
   privacyArgs,
+  extensionsDir = undefined as string | undefined,
   cookieStore = createCookieStore,
 }) {
   const launches = new Map();
@@ -159,6 +161,11 @@ export function createBrowserLauncher({
       filesDir = undefined,
       allowedDomains = [],
     }) {
+      const extensions =
+        extensionsDir === undefined
+          ? []
+          : await readExtensionDirs(extensionsDir, signal);
+      signal.throwIfAborted();
       const trackingId = randomBytes(16).toString("hex");
       const entry: any = {
         sessionBoundary,
@@ -181,6 +188,7 @@ export function createBrowserLauncher({
         "launch",
         JSON.stringify({
           headless: true,
+          ...(extensions.length ? { ignoreDefaultArgs: ["--disable-extensions"] } : {}),
           userDataDir: profileDir,
           // The runtime must checkpoint profiles before Puppeteer's process signal handlers close Chrome.
           handleSIGINT: false,
@@ -190,6 +198,12 @@ export function createBrowserLauncher({
             `--browser-execution-id=${executionId}`,
             `--fingerprint=${fingerprint}`,
             ...privacyArgs,
+            ...(extensions.length
+              ? [
+                  `--disable-extensions-except=${extensions.join(",")}`,
+                  `--load-extension=${extensions.join(",")}`,
+                ]
+              : []),
             ...(allowedDomains.length
               ? [
                   `--host-resolver-rules=MAP * ~NOTFOUND, ${allowedDomains.map((domain) => `EXCLUDE ${domain}`).join(", ")}`,

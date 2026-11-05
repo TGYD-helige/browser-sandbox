@@ -55,6 +55,22 @@ flowchart LR
 | **Live sessions** | Query, retain, renew, release, or stop the current browser; keep original pages across client disconnects within the hard timeout |
 | **Human takeover** | Coordinate automation and human control with leases and stale-frame protection |
 | **Files and rendering** | Execution-scoped upload/download handling, screenshots, and Chinese/Emoji font support |
+| **Chrome extensions** | Load trusted unpacked extensions from a read-only mounted directory on each browser launch |
+
+## Local Chrome extensions
+
+Add the following settings to your existing sandboxed Compose service:
+
+```yaml
+environment:
+  BROWSER_EXTENSIONS_DIR: /browser-extensions
+volumes:
+  - ./extensions:/browser-extensions:ro
+```
+
+Place each unpacked extension in its own subdirectory, for example `./extensions/my-extension/manifest.json`. Make directories traversable and files readable by the browser's execution UIDs. Adding or removing extension directories takes effect on the next browser launch; running browsers keep their loaded extensions. Use trusted extensions only: they load into every execution browser and may access page and login data according to their permissions.
+
+See [extension setup and limitations](./docs/usage.md#load-local-chrome-extensions) for Docker flags, permissions, and verification. Use an image built from a revision that includes this feature.
 
 ## Live viewer and remote access
 

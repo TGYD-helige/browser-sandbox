@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -148,14 +148,17 @@ for (const quiesce of [false, true])
   });
 function fixture(
   cookieStore = () => ({ restore: async () => {}, save: async () => {} }),
+  extensionsDir = undefined,
 ) {
   const sockets = [],
     requests = [];
+  const socketCreated = deferred();
   class Socket extends EventEmitter {
     constructor(url) {
       super();
       this.url = url;
       sockets.push(this);
+      socketCreated.resolve();
     }
     terminate() {
       this.closed = true;
@@ -181,6 +184,7 @@ function fixture(
     base: "http://localhost",
     token: "test",
     privacyArgs: [],
+    extensionsDir,
     cookieStore,
   });
   const req = (index) => ({ parsed: sockets[index].url });
@@ -216,8 +220,48 @@ function fixture(
       fingerprint: "1",
       signal,
     });
-  return { ...runtime, sockets, requests, req, browser, start };
+  return {
+    ...runtime,
+    sockets,
+    requests,
+    req,
+    browser,
+    start,
+    socketCreated: socketCreated.promise,
+  };
 }
+
+test("launcher enables configured extensions without bypassing other Chrome defaults", async () => {
+  const root = await mkdtemp(join(tmpdir(), "browser-launch-extensions-"));
+  try {
+    await mkdir(join(root, "example"));
+    await writeFile(join(root, "example", "manifest.json"), "{}");
+    const f = fixture(undefined, root);
+    const pending = f.start(new AbortController().signal);
+    await f.socketCreated;
+    const options = JSON.parse(f.sockets[0].url.searchParams.get("launch"));
+    assert.deepEqual(options.ignoreDefaultArgs, ["--disable-extensions"]);
+    assert(options.args.includes(`--load-extension=${join(root, "example")}`));
+    assert(
+      options.args.includes(`--disable-extensions-except=${join(root, "example")}`),
+    );
+    assert.equal(options.headless, true);
+    const starting = f.browserManager.getBrowserForRequest(f.req(0));
+    const browser = f.browser();
+    f.requests[0].resolve(browser);
+    await starting;
+    f.sockets[0].emit("open");
+    const handle = await pending;
+    browser.exit();
+    await handle.close();
+    const abort = new AbortController();
+    abort.abort();
+    await assert.rejects(f.start(abort.signal), { name: "AbortError" });
+    assert.equal(f.sockets.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("a failed startup cannot claim retirement when process termination throws", async () => {
   const f = fixture(),
