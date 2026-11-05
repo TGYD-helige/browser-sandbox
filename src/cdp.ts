@@ -8,6 +8,8 @@ export async function connectCdp(endpoint: string, signal?: AbortSignal) {
   });
   let sequence = 0;
   let ready = false;
+  const listeners = new Set<(event: any) => void>();
+  const closed = new Promise<void>((resolve) => socket.once("close", resolve));
   const pending = new Map<
     number,
     {
@@ -35,7 +37,10 @@ export async function connectCdp(endpoint: string, signal?: AbortSignal) {
       return close();
     }
     const call = pending.get(response.id);
-    if (!call) return;
+    if (!call) {
+      if (response.method) for (const listener of listeners) listener(response);
+      return;
+    }
     ready = true;
     pending.delete(response.id);
     clearTimeout(call.timer);
@@ -51,6 +56,11 @@ export async function connectCdp(endpoint: string, signal?: AbortSignal) {
   });
   return {
     close,
+    closed,
+    subscribe(listener: (event: any) => void) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
     call(
       method: string,
       params: Record<string, unknown> = {},

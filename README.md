@@ -56,6 +56,12 @@ flowchart LR
 | **Human takeover** | Coordinate automation and human control with leases and stale-frame protection |
 | **Files and rendering** | Execution-scoped upload/download handling, screenshots, and Chinese/Emoji font support |
 
+## Live viewer and remote access
+
+Enable the optional access listener to watch the same browser from a local webpage or a remote HTTPS/WSS endpoint. The bundled browser-viewer Web Component supports page selection and confirmed human takeover with basic input. Local, Docker, Kubernetes, and Worker-fronted origins use the same execution contract; the browser remains on the supported Linux runtime. See [live viewing and deployment](./docs/live-view.md) for authorization, setup, embedding, and limitations.
+
+The optional [browser-sandbox-auth skill](./skills/browser-sandbox-auth/SKILL.md) teaches agents to request secure sign-in through their existing code execution tool, without registering another model tool. This checkout exposes it through .agents/skills; other harnesses can install the skill directory using their own skill discovery mechanism. The package includes skills/browser-sandbox-auth. The host must still provide the browser endpoint, viewer, and automation coordination described in the live-view guide.
+
 ## Profiles
 
 Execution identity and persistent browser identity are separate. The host authorizes access; knowing a profileId does not grant access to its data.

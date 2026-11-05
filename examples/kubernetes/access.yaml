@@ -1,0 +1,33 @@
+# Apply to an existing runtime Pod after configuring its required security context.
+# Label the specific Pod browser-sandbox-instance=example; do not select interchangeable instances.
+apiVersion: v1
+kind: Service
+metadata:
+  name: browser-sandbox-example
+spec:
+  selector:
+    browser-sandbox-instance: example
+  ports:
+    - name: access
+      port: 8080
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: browser-sandbox-example
+spec:
+  tls:
+    - hosts: [browser.example.com]
+      secretName: browser-example-tls
+  rules:
+    - host: browser.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: browser-sandbox-example
+                port:
+                  name: access

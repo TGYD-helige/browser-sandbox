@@ -15,10 +15,12 @@ import {
   validProfileId,
 } from "./local-profiles.js";
 import { normalizeAllowedDomains } from "./network-policy.js";
+import { Observation } from "./observation.js";
 import { createProfileWork } from "./profile-work.js";
 import { createProfileArchive } from "./profiles.js";
 import { BrowserSession } from "./session.js";
 import { Takeover } from "./takeover.js";
+import { BrowserViewport } from "./viewport.js";
 
 interface BrowserHandle {
   endpoint: string;
@@ -64,6 +66,9 @@ export interface Execution {
   archive?: any;
   finalized?: any;
   takeover?: Takeover;
+  observation?: Observation;
+  viewport?: BrowserViewport;
+  viewportOwner?: string;
 }
 
 const preparationTiming = channel("browser-sandbox.preparation");
@@ -227,6 +232,9 @@ export async function createExecutions({
     entry.session.ended();
     entry.starting = null;
     entry.takeover = null;
+    entry.observation = null;
+    entry.viewport = null;
+    entry.viewportOwner = undefined;
     entry.abort?.abort();
     // A cancelled successor has not replaced the previous failed checkpoint.
     const previousClosing = entry.closing;
@@ -312,6 +320,38 @@ export async function createExecutions({
         } else if (request.action === "release") disconnected(entry);
       }
       return entry.session.status(entry.peers.size);
+    }
+    if (request.op === "viewport") {
+      if (!host) fail("browser_host_authority_required");
+      const entry = executions.get(request.executionId);
+      if (!entry?.starting || entry.revoked) fail("browser_page_unavailable");
+      const starting = entry.starting;
+      const browser = await starting;
+      signal?.throwIfAborted();
+      if (entry.revoked || entry.starting !== starting) fail("browser_view_lost");
+      if (
+        typeof request.ownerId !== "string" ||
+        !request.ownerId ||
+        request.ownerId.length > 128
+      )
+        fail("browser_viewport_invalid");
+      if (
+        entry.viewport &&
+        !entry.viewport.closed &&
+        entry.viewportOwner !== request.ownerId
+      )
+        fail("browser_viewport_busy");
+      if (!entry.viewport || entry.viewport.closed) {
+        entry.viewport = new BrowserViewport(browser.endpoint, entry.abort.signal);
+        entry.viewportOwner = request.ownerId;
+      }
+      entry.takeover?.invalidateFrame();
+      return entry.viewport.resize(
+        request.targetId,
+        request.width,
+        request.height,
+        AbortSignal.any([entry.abort.signal, ...(signal ? [signal] : [])]),
+      );
     }
     if (request.op === "takeover") {
       if (!host) fail("browser_host_authority_required");
@@ -631,6 +671,25 @@ export async function createExecutions({
     },
     retire,
     reclaimIdle,
+    releaseViewport(entry: Execution, ownerId: string) {
+      if (entry.viewportOwner !== ownerId) return;
+      entry.viewport?.close();
+      entry.viewport = undefined;
+      entry.viewportOwner = undefined;
+      entry.takeover?.invalidateFrame();
+    },
+    async observe(entry: Execution, signal: AbortSignal) {
+      if (entry.revoked || !entry.starting) return null;
+      const starting = entry.starting;
+      const browser = await starting;
+      signal.throwIfAborted();
+      if (entry.revoked || entry.starting !== starting)
+        throw Error("browser_view_lost");
+      return (entry.observation ??= new Observation(
+        browser.endpoint,
+        entry.abort.signal,
+      ));
+    },
     get: (id) => executions.get(id),
     resolve: (capability) =>
       [...executions.values()].find(

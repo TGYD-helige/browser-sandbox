@@ -4,6 +4,7 @@ export function attachCdpProxy({
   WebSocketServer,
   executions,
   resolvePeerUid,
+  authorize = undefined,
 }) {
   const ws = new WebSocketServer({
     noServer: true,
@@ -11,10 +12,13 @@ export function attachCdpProxy({
   });
   server.on("upgrade", async (req, socket, head) => {
     const match = /^\/execution\/([a-f0-9]{64})$/.exec(req.url ?? "");
-    const entry = match && executions.resolve(match[1]);
+    if (authorize && !match) return;
+    const entry = authorize
+      ? await authorize(req).catch(() => null)
+      : match && executions.resolve(match[1]);
     let authorized = true;
     try {
-      if (entry?.uid >= 100000)
+      if (!authorize && entry?.uid >= 100000)
         authorized = (await resolvePeerUid(req.socket)) === entry.uid;
     } catch {
       authorized = false;

@@ -1,12 +1,22 @@
 import { transferFile } from "./files.js";
-export function createHttpHandler({ executions, resolvePeerUid, healthy }) {
-  let activeFileTransfers = 0;
+export function createHttpHandler({
+  executions,
+  resolvePeerUid,
+  healthy,
+  resolveAccess = undefined,
+  fileTransfers = { active: 0 },
+  authentication = undefined,
+}) {
   async function authorize(capability, socket) {
-    const entry = executions.resolve(capability);
+    const entry = resolveAccess
+      ? resolveAccess(capability)
+      : executions.resolve(capability);
     if (
       !entry ||
       executions.closing ||
-      (entry.uid >= 100000 && (await resolvePeerUid(socket)) !== entry.uid) ||
+      (!resolveAccess &&
+        entry.uid >= 100000 &&
+        (await resolvePeerUid(socket)) !== entry.uid) ||
       entry.revoked ||
       executions.closing
     )
@@ -15,6 +25,63 @@ export function createHttpHandler({ executions, resolvePeerUid, healthy }) {
   }
   return async (req, res) => {
     try {
+      const authRoute = /^\/execution\/([a-f0-9]{64})\/auth$/.exec(req.url ?? "");
+      if (authRoute) {
+        const entry = await authorize(authRoute[1], req.socket);
+        if (!entry || !authentication) {
+          res.writeHead(403);
+          res.end();
+          return;
+        }
+        if (req.method !== "POST") {
+          res.writeHead(405);
+          res.end();
+          return;
+        }
+        const abort = new AbortController();
+        const disconnected = () => {
+          if (!res.writableEnded) abort.abort();
+        };
+        res.once("close", disconnected);
+        const timer = setTimeout(() => {
+          abort.abort();
+          req.destroy();
+        }, 620_000);
+        const readTimer = setTimeout(() => {
+          abort.abort();
+          req.destroy();
+        }, 10_000);
+        try {
+          const chunks: Buffer[] = [];
+          let size = 0;
+          for await (const chunk of req) {
+            size += chunk.length;
+            if (size > 8192) {
+              res.writeHead(413);
+              res.end();
+              return;
+            }
+            chunks.push(chunk);
+          }
+          const input = Buffer.concat(chunks).toString("utf8");
+          clearTimeout(readTimer);
+          const result = await authentication.request(
+            entry,
+            JSON.parse(input),
+            abort.signal,
+          );
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "cache-control": "no-store",
+          });
+          res.end(JSON.stringify(result));
+        } finally {
+          clearTimeout(timer);
+          clearTimeout(readTimer);
+          res.off("close", disconnected);
+        }
+        return;
+      }
       const sessionRoute = /^\/execution\/([a-f0-9]{64})\/session$/.exec(req.url ?? "");
       if (sessionRoute) {
         const entry = await authorize(sessionRoute[1], req.socket);
@@ -81,12 +148,12 @@ export function createHttpHandler({ executions, resolvePeerUid, healthy }) {
           res.end();
           return;
         }
-        if (activeFileTransfers >= 16) {
+        if (fileTransfers.active >= 16) {
           res.writeHead(429);
           res.end();
           return;
         }
-        activeFileTransfers++;
+        fileTransfers.active++;
         const cancel = () => {
           req.destroy();
           res.destroy();
@@ -103,7 +170,7 @@ export function createHttpHandler({ executions, resolvePeerUid, healthy }) {
         try {
           await transfer;
         } finally {
-          activeFileTransfers--;
+          fileTransfers.active--;
           entry.fileTransfers.delete(transfer);
           entry.lifetime.signal.removeEventListener("abort", cancel);
         }

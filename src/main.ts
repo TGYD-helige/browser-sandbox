@@ -76,6 +76,14 @@ const gateway = await createGateway({
   launch,
   maxBrowsers: Number(process.env.CONCURRENT ?? 2),
   maxSessionMs: Number(process.env.TIMEOUT ?? 1800000),
+  access: process.env.BROWSER_ACCESS_PORT
+    ? {
+        port: Number(process.env.BROWSER_ACCESS_PORT),
+        host: process.env.BROWSER_ACCESS_HOST ?? "127.0.0.1",
+        publicOrigin: process.env.BROWSER_ACCESS_ORIGIN,
+        viewerOrigins: process.env.BROWSER_VIEWER_ORIGINS?.split(","),
+      }
+    : undefined,
 });
 try {
   await verifyTarget(gateway, WebSocket);
