@@ -5,6 +5,7 @@ import { request } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { execution, resources, until, workload } from "./benchmark-fixture.mjs";
 import { runBatch } from "./benchmark-load.mjs";
+import { trackBenchmark } from "./benchmark-report.mjs";
 
 export async function upload(url, bytes) {
   const hash = createHash("sha256");
@@ -162,19 +163,21 @@ export async function fillTransfers({ base, method, directory }) {
   throw Error("File transfer admission did not recover sixteen slots");
 }
 
-export async function benchmarkFiles({ socket, origin, samples }) {
+export async function benchmarkFiles({ socket, origin, samples, report }) {
   const client = await execution(socket);
   try {
     const { cdp } = await client.ready(origin + "/page");
     const base = client.access.cdpUrl.replace(/^ws/, "http") + "/files/";
-    const cases = [];
+    const cases = report?.pendingCases ?? [];
     for (const [name, bytes, concurrency] of [
       ["files-16MiB", 16 * 1024 * 1024, 1],
       ["files-four-4MiB", 4 * 1024 * 1024, 4],
     ]) {
       const measurements = { upload: [], download: [] },
         memoryBytes = [];
+      trackBenchmark(report, name, measurements, { memoryBytes });
       for (let sample = -3; sample < samples; sample++) {
+        if (report) report.sample = sample;
         const urls = Array.from(
           { length: concurrency },
           () => base + randomUUID() + ".bin",
@@ -228,7 +231,9 @@ export async function benchmarkFiles({ socket, origin, samples }) {
         runtimeFdCount: [],
         processCount: [],
       };
+      trackBenchmark(report, `files-${method}`, measurements, sampled);
       for (let sample = -3; sample < samples; sample++) {
+        if (report) report.sample = sample;
         const before = await resources();
         const held = await fillTransfers({
           base,

@@ -1,15 +1,18 @@
 import assert from "node:assert/strict";
 import { hostRequest } from "../../dist/host-client.js";
 import { execution, until, workload } from "./benchmark-fixture.mjs";
+import { trackBenchmark } from "./benchmark-report.mjs";
 
-export async function benchmarkQueue({ socket, samples }) {
+export async function benchmarkQueue({ socket, samples, report }) {
   const measurements = {
     cancelAndFinalize: [],
     queuedWait: [],
     queueAndStartup: [],
     successorReady: [],
   };
+  trackBenchmark(report, "queue-cancel-recovery", measurements);
   for (let sample = -3; sample < samples; sample++) {
+    if (report) report.sample = sample;
     const clients = [],
       holders = [];
     try {

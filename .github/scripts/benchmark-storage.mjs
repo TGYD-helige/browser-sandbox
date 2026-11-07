@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { attachStorage } from "../../dist/host-client.js";
 import { barrier, execution, workload } from "./benchmark-fixture.mjs";
+import { trackBenchmark } from "./benchmark-report.mjs";
 
 export async function archiveFixture(root) {
   const gates = new Map();
@@ -62,7 +63,7 @@ export async function archiveFixture(root) {
   };
 }
 
-export async function benchmarkStorage({ socket, root, origin, samples }) {
+export async function benchmarkStorage({ socket, root, origin, samples, report }) {
   const site = await archiveFixture(root);
   const profileId = `isolation/${randomUUID()}`,
     key = randomBytes(32).toString("hex");
@@ -105,10 +106,12 @@ export async function benchmarkStorage({ socket, root, origin, samples }) {
       await seeded.client.finish();
       seeded.storage.close();
     }
-    const cases = [];
+    const cases = report?.pendingCases ?? [];
     for (const method of ["GET", "PUT"]) {
       const measurements = { register: [], firstBrowserReady: [], finalize: [] };
+      trackBenchmark(report, `slow-storage-${method}`, measurements);
       for (let sample = -3; sample < samples; sample++) {
+        if (report) report.sample = sample;
         const current = await remote();
         let gate, pending, other;
         try {

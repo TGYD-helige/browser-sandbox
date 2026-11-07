@@ -3,6 +3,11 @@ import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 export function comparePerformance(baseline, current) {
+  for (const report of [baseline, current])
+    assert(
+      report.status === undefined || report.status === "complete",
+      "Incomplete benchmark report",
+    );
   for (const key of ["architecture", "browserVersion", "environment", "cpuSet"])
     assert.equal(current[key], baseline[key], `Incompatible benchmark ${key}`);
   assert(

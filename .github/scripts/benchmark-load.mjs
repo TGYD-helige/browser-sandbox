@@ -5,6 +5,7 @@ import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { hostRequest } from "../../dist/host-client.js";
+import { trackBenchmark } from "./benchmark-report.mjs";
 
 // Settle every client before cleanup, including when one concurrent task fails.
 export async function runBatch(work, concurrency) {
@@ -16,10 +17,11 @@ export async function runBatch(work, concurrency) {
   return results.map((result) => result.value);
 }
 
-export async function benchmarkLoad({ socket, url, samples }) {
+export async function benchmarkLoad({ socket, url, samples, report }) {
   const concurrency = 4;
   const measurements = { firstBrowserReady: [], finalize: [], batch: [] };
   const memoryBytes = [];
+  trackBenchmark(report, "concurrent-temporary", measurements, { memoryBytes });
   const worker = fileURLToPath(new URL("benchmark-image.mjs", import.meta.url));
   const execute = async (index) => {
     const executionId = randomUUID();
@@ -60,6 +62,7 @@ export async function benchmarkLoad({ socket, url, samples }) {
     }
   };
   for (let sample = -3; sample < samples; sample++) {
+    if (report) report.sample = sample;
     const start = performance.now();
     const results = await runBatch(execute, concurrency);
     const duration = performance.now() - start;

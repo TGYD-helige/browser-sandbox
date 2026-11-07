@@ -394,3 +394,107 @@ test("benchmark affinity selects two permitted CPUs without assuming CPU zero is
   assert.throws(() => selectBenchmarkCpus("3"), /two available CPUs/);
   assert.throws(() => selectBenchmarkCpus("invalid"), /Invalid effective CPU set/);
 });
+
+test("failed benchmarks preserve completed raw samples without serializing secrets", async () => {
+  const { writeBenchmarkReport, collectBenchmark } = await import(
+    "./benchmark-report.mjs"
+  );
+  const state = { samples: 20, cases: [] };
+  const output = [];
+  const failure = new Error("https://private.invalid/?token=secret");
+  failure.code = "ERR_ASSERTION";
+  await assert.rejects(
+    writeBenchmarkReport(
+      state,
+      async () => {
+        await collectBenchmark(state, "completed", async () => ({
+          name: "completed",
+          measurements: { batch: [12, 13] },
+        }));
+        await collectBenchmark(state, "failing-workload", async () => {
+          throw failure;
+        });
+      },
+      (json) => output.push(json),
+    ),
+    (error) => error === failure,
+  );
+  assert.equal(output.length, 1);
+  const partial = JSON.parse(output[0]);
+  assert.equal(partial.status, "failed");
+  assert.equal(partial.activeWorkload, "failing-workload");
+  assert.deepEqual(partial.cases[0].measurements.batch, [12, 13]);
+  assert.deepEqual(partial.failure, { code: "ERR_ASSERTION" });
+  assert(!output[0].includes("secret"));
+  const complete = { cases: [] };
+  await writeBenchmarkReport(
+    complete,
+    async () => {},
+    (json) => output.push(json),
+  );
+  assert.equal(JSON.parse(output[1]).status, "complete");
+});
+
+test("soak assertion diagnostics retain in-progress samples and completed subcases", async () => {
+  const { writeBenchmarkReport, collectBenchmark, trackBenchmark } = await import(
+    "./benchmark-report.mjs"
+  );
+  const { resourceGrowth } = await import("./benchmark-soak.mjs");
+  const state = { cases: [] };
+  let output;
+  await assert.rejects(
+    writeBenchmarkReport(
+      state,
+      async () => {
+        await collectBenchmark(state, "extended", async () => {
+          state.pendingCases.push({
+            name: "previous-subcase",
+            measurements: { batch: [7] },
+          });
+          const sampled = {
+            memoryBytes: [],
+            runtimeFdCount: [],
+            processCount: [],
+            diskBytes: [],
+          };
+          const measurements = { cycleBatch: [] };
+          trackBenchmark(state, "soak-temporary", measurements, sampled);
+          const rows = [];
+          for (let sample = 0; sample < 20; sample++) {
+            state.sample = sample;
+            const row = {
+              memoryBytes: 1000,
+              runtimeFdCount: 20 + sample,
+              processCount: 4,
+              diskBytes: 0,
+            };
+            rows.push(row);
+            measurements.cycleBatch.push(10);
+            for (const key of Object.keys(sampled)) sampled[key].push(row[key]);
+          }
+          resourceGrowth(rows);
+          return [];
+        });
+      },
+      (json) => {
+        output = JSON.parse(json);
+      },
+    ),
+    /file descriptors grew/,
+  );
+  assert.equal(output.status, "failed");
+  assert.equal(output.sample, 19);
+  assert.equal(output.pendingCases[0].name, "previous-subcase");
+  assert.equal(output.current.name, "soak-temporary");
+  assert.deepEqual(output.current.measurements.cycleBatch, Array(20).fill(10));
+  assert.deepEqual(
+    output.current.resources.runtimeFdCount,
+    Array.from({ length: 20 }, (_, index) => 20 + index),
+  );
+});
+
+test("a failed report cannot pass comparison even with all duration samples", () => {
+  const partial = { ...report(), status: "failed" };
+  assert.throws(() => comparePerformance(report(), partial), /Incomplete benchmark/);
+  assert.throws(() => comparePerformance(partial, report()), /Incomplete benchmark/);
+});

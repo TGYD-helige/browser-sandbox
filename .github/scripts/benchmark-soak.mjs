@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { lstat, readdir } from "node:fs/promises";
 import { diskUsage, execution, resources, workload } from "./benchmark-fixture.mjs";
+import { trackBenchmark } from "./benchmark-report.mjs";
 
 export function resourceGrowth(rows) {
   assert(rows.length >= 10);
@@ -30,13 +31,21 @@ export function resourceGrowth(rows) {
   return growth;
 }
 
-export async function benchmarkSoak({ socket, origin, samples, cycles = samples }) {
+export async function benchmarkSoak({
+  socket,
+  origin,
+  samples,
+  cycles = samples,
+  report,
+}) {
   assert(Number.isInteger(cycles) && cycles >= samples && cycles % samples === 0);
   const measurements = { cycleBatch: [] },
     rows = [],
     sampled = { memoryBytes: [], runtimeFdCount: [], processCount: [], diskBytes: [] };
+  trackBenchmark(report, "soak-temporary", measurements, sampled);
   const perSample = cycles / samples;
   for (let sample = -3; sample < samples; sample++) {
+    if (report) report.sample = sample;
     const start = performance.now();
     for (let cycle = 0; cycle < perSample; cycle++) {
       const client = await execution(socket);

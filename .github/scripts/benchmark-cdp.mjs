@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { execution, resources, summarize, workload } from "./benchmark-fixture.mjs";
 import { runBatch } from "./benchmark-load.mjs";
+import { trackBenchmark } from "./benchmark-report.mjs";
 
-export async function benchmarkCdp({ socket, origin, samples }) {
+export async function benchmarkCdp({ socket, origin, samples, report }) {
   const client = await execution(socket);
   try {
     const { cdp, sessionId } = await client.ready(origin + "/page");
-    const cases = [];
+    const cases = report?.pendingCases ?? [];
     const connections = [cdp];
     for (let i = 1; i < 4; i++) connections.push(await client.connect());
     for (const [name, count, parallel] of [
@@ -17,6 +18,7 @@ export async function benchmarkCdp({ socket, origin, samples }) {
     ]) {
       const measurements = { batch: [], commandP95: [] };
       const sampled = { cpuMicros: [], memoryBytes: [] };
+      trackBenchmark(report, name, measurements, sampled);
       let transferredBytes = 0;
       if (name === "cdp-screenshot") {
         // Deterministic noisy pixels prevent a tiny blank PNG from hiding large-response costs.
@@ -29,6 +31,7 @@ export async function benchmarkCdp({ socket, origin, samples }) {
         );
       }
       for (let sample = -3; sample < samples; sample++) {
+        if (report) report.sample = sample;
         const before = await resources();
         const roundTrips = [];
         const start = performance.now();

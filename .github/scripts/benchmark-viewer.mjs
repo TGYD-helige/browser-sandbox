@@ -3,6 +3,7 @@ import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 import WebSocket from "ws";
 import { execution, resources, until, workload } from "./benchmark-fixture.mjs";
+import { trackBenchmark } from "./benchmark-report.mjs";
 
 export async function decodeFrameRgb(cdp, sessionId, data) {
   const { result, exceptionDetails } = await cdp.call(
@@ -98,7 +99,7 @@ async function observe(viewerUrl) {
   }
 }
 
-export async function benchmarkViewer({ socket, origin, samples }) {
+export async function benchmarkViewer({ socket, origin, samples, report }) {
   const client = await execution(socket);
   try {
     const { cdp, sessionId, targetId } = await client.ready(origin + "/page");
@@ -112,7 +113,7 @@ export async function benchmarkViewer({ socket, origin, samples }) {
       },
       sessionId,
     );
-    const cases = [];
+    const cases = report?.pendingCases ?? [];
     for (const count of [0, 1, 4]) {
       const measurements = { cdpBatch: [] },
         sampled = {
@@ -127,8 +128,10 @@ export async function benchmarkViewer({ socket, origin, samples }) {
         measurements.frameInterval = [];
         measurements.updateToFrame = [];
       }
+      trackBenchmark(report, `viewer-${count}`, measurements, sampled);
       const framesPerSecond = [];
       for (let sample = -3; sample < samples; sample++) {
+        if (report) report.sample = sample;
         const viewers = [];
         try {
           for (let i = 0; i < count; i++)
