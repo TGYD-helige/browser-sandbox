@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: Existing Git version tag at the master commit being built (for example v0.1.0)
+        description: Existing Git version tag reachable from master (for example v0.1.1)
         type: string
         required: true
       publish_latest:
@@ -32,6 +32,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       image: ${{ steps.validate.outputs.image }}
+      source_sha: ${{ steps.validate.outputs.source_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,8 +55,8 @@ jobs:
             echo "Create and push the Git version tag before publishing." >&2
             exit 1
           fi
-          if [[ "$source_sha" != "$GITHUB_SHA" ]]; then
-            echo "The Git version tag must point to the master commit being built." >&2
+          if ! git merge-base --is-ancestor "$source_sha" "$GITHUB_SHA"; then
+            echo "The Git version tag must be reachable from the workflow master commit." >&2
             exit 1
           fi
           read -ra names <<< "$IMAGE_NAMES"
@@ -64,6 +65,7 @@ jobs:
             [[ "$name" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || exit 1
           done
           echo "image=$REGISTRY/$NAMESPACE/${names[0]}" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
 
   image:
     needs: prepare
@@ -80,6 +82,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.prepare.outputs.source_sha }}
           persist-credentials: false
       - name: Build and verify native image
         run: |
@@ -92,62 +95,82 @@ jobs:
         run: |
           docker build -f Dockerfile.e2e -t browser-sandbox-e2e:local .
           node .github/scripts/e2e.mjs pi
+      - name: Export verified image
+        run: |
+          docker save --output image.tar browser-sandbox:local
+          sha256sum image.tar > image.tar.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-image-archive-${{ matrix.architecture }}
+          path: |
+            image.tar
+            image.tar.sha256
+          compression-level: 1
+          retention-days: 1
+          if-no-files-found: error
+
+  transfer:
+    needs: [prepare, image]
+    runs-on: ${{ vars.BROWSER_IMAGE_PUBLISH_RUNNER || 'arc-simple' }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        architecture: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: browser-image-archive-${{ matrix.architecture }}
       - uses: docker/login-action@v3
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/browser-image-auth
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ vars.BAIDU_CCR_USERNAME }}
           password: ${{ secrets.BAIDU_CCR_PASSWORD }}
       - name: Push verified architecture image
         env:
+          DOCKER_CONFIG: ${{ runner.temp }}/browser-image-auth
           IMAGE: ${{ needs.prepare.outputs.image }}
           ARCH: ${{ matrix.architecture }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          export tag="$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ARCH"
-          docker tag browser-sandbox:local "$tag"
-          docker image history browser-sandbox:local
-          # A terminal exposes per-layer byte progress that Docker omits in CI pipes.
-          timeout --signal=TERM --kill-after=30s 10m \
-            script --quiet --return --command 'docker push "$tag"' /dev/null
-          docker image inspect "$tag" --format '{{index .RepoDigests 0}}' > "$ARCH.txt"
+        run: bash .github/scripts/push-image-archive.sh
       - uses: actions/upload-artifact@v4
         with:
           name: browser-build-digest-${{ matrix.architecture }}
           path: ${{ matrix.architecture }}.txt
           if-no-files-found: error
+      - name: Remove downloaded image archive
+        if: always()
+        run: rm -f image.tar image.tar.sha256 config.json "${{ matrix.architecture }}.digest"
 
   publish:
-    needs: [prepare, image]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    needs: [prepare, transfer]
+    runs-on: ${{ vars.BROWSER_IMAGE_PUBLISH_RUNNER || 'arc-simple' }}
+    timeout-minutes: 25
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           pattern: browser-build-digest-*
           merge-multiple: true
       - uses: docker/login-action@v3
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/browser-image-auth
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ vars.BAIDU_CCR_USERNAME }}
           password: ${{ secrets.BAIDU_CCR_PASSWORD }}
-      - uses: docker/setup-buildx-action@v3
       - name: Publish verified multi-architecture images
-        shell: bash
-        run: |
-          set -euo pipefail
-          read -ra names <<< "$IMAGE_NAMES"
-          for name in "${names[@]}"; do
-            image="$REGISTRY/$NAMESPACE/$name"
-            tags=(--tag "$image:sha-$GITHUB_SHA" --tag "$image:$IMAGE_TAG")
-            if [[ "$PUBLISH_LATEST" == true ]]; then
-              tags+=(--tag "$image:latest")
-            fi
-            docker buildx imagetools create "${tags[@]}" \
-              "$(cat amd64.txt)" "$(cat arm64.txt)"
-            printf 'Published %s (Linux AMD64/ARM64).\n' \
-              "${tags[*]}" >> "$GITHUB_STEP_SUMMARY"
-          done
+        timeout-minutes: 20
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/browser-image-auth
+          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+        run: bash .github/scripts/publish-image-index.sh
 
   release-notes:
     needs: publish
