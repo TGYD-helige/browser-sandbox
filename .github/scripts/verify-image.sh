@@ -40,7 +40,9 @@ for ((attempt=0;attempt<90;attempt++)); do
   if ((attempt==89)); then docker logs "$container_id"; exit 1; fi
   sleep 1
 done
-docker exec "$container_id" node /opt/browser-sandbox/.github/scripts/image-layout.mjs
+if [[ "${VERIFY_IMAGE_LAYOUT:-1}" == 1 ]]; then
+  docker exec "$container_id" node /opt/browser-sandbox/.github/scripts/image-layout.mjs
+fi
 docker exec "$container_id" node /opt/browser-sandbox/examples/host.mjs
 docker exec -e PROFILE_ID=example/persistent "$container_id" node /opt/browser-sandbox/examples/host.mjs
 docker exec -e PROFILE_ID=example/persistent "$container_id" node /opt/browser-sandbox/examples/host.mjs
