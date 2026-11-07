@@ -4,14 +4,26 @@ image="${1:-browser-sandbox:local}"
 docker image inspect "$image" --format 'Image: {{.Architecture}} {{.Size}} bytes'
 profile_dir="$(mktemp -d)"
 container_id=""
+extract_id=""
 cleanup() {
-  if [[ -n "$container_id" ]]; then docker rm -f "$container_id" >/dev/null; fi
+  local verification_status=$?
+  if [[ -n "$container_id" ]]; then
+    if ((verification_status != 0)); then
+      docker inspect --format 'Runtime state: running={{.State.Running}} oom={{.State.OOMKilled}} exit={{.State.ExitCode}}' "$container_id" || true
+      # Upstream errors may include capability URLs; retain only known diagnostic codes.
+      docker logs "$container_id" 2>&1 | node --input-type=module -e 'let input=""; for await (const chunk of process.stdin) { input+=chunk; if(input.length>1048576)input=input.slice(-1048576); } console.error([...new Set(input.match(/\bbrowser_[a-z_]+\b|\b(?:ENOSPC|EACCES|ENOENT|EROFS|EPERM|ERR_[A-Z_]+)\b/g) ?? [])].join("\n"));' || true
+    fi
+    docker rm -f "$container_id" >/dev/null || true
+  fi
+  if [[ -n "$extract_id" ]]; then docker rm -f "$extract_id" >/dev/null || true; fi
   rm -rf "$profile_dir"
+  return "$verification_status"
 }
 trap cleanup EXIT
 extract_id="$(docker create "$image")"
 docker cp "$extract_id:/opt/browser-sandbox/seccomp.json" "$profile_dir/seccomp.json"
 docker rm "$extract_id" >/dev/null
+extract_id=""
 extension_args=()
 if [[ "${VERIFY_EXTENSIONS:-0}" == "1" ]]; then
   mkdir -p "$profile_dir/extensions/fixture"
@@ -38,7 +50,7 @@ container_id="$(docker run -d --init --cap-drop ALL \
   --shm-size 512m --memory 2g --cpus 2 ${runtime_args[@]+"${runtime_args[@]}"} "$image" ${command_args[@]+"${command_args[@]}"})"
 for ((attempt=0;attempt<90;attempt++)); do
   if docker exec "$container_id" node /opt/browser-sandbox/dist/healthcheck.js >/dev/null 2>&1; then break; fi
-  if ((attempt==89)); then docker logs "$container_id"; exit 1; fi
+  if ((attempt==89)); then echo 'Browser image readiness failed' >&2; exit 1; fi
   sleep 1
 done
 if [[ "${VERIFY_IMAGE_LAYOUT:-1}" == 1 ]]; then

@@ -47,7 +47,7 @@ jobs:
           BASE_REF: ${{ inputs.baseline_ref || github.event.pull_request.base.sha || github.event.before }}
       - uses: actions/upload-artifact@v4
         with:
-          name: browser-performance-${{ matrix.runner }}
+          name: browser-performance-${{ matrix.runner }}-attempt-${{ github.run_attempt }}
           path: performance-${{ matrix.runner }}/*.json
           if-no-files-found: error
         if: always()
@@ -77,7 +77,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: live-viewer
+          name: live-viewer-attempt-${{ github.run_attempt }}
           path: viewer-artifacts
           if-no-files-found: warn
 
@@ -128,7 +128,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: unused-harness-performance
+          name: unused-harness-performance-attempt-${{ github.run_attempt }}
           path: unused-harness-performance.json
           if-no-files-found: error
 

@@ -14,8 +14,8 @@ git fetch --depth=1 origin "$base_ref"
 git archive FETCH_HEAD | tar -x -C "$context"
 test -f "$context/Dockerfile"
 # Apply the identical measurement client, leaving the baseline runtime unchanged.
-cp .github/scripts/benchmark-*.mjs "$context/.github/scripts/"
-printf '\nCOPY .github/scripts/benchmark-*.mjs /opt/browser-sandbox/.github/scripts/\n' >> "$context/Dockerfile"
+cp .github/scripts/benchmark-*.mjs .github/scripts/image-smoke.mjs "$context/.github/scripts/"
+printf '\nCOPY .github/scripts/benchmark-*.mjs .github/scripts/image-smoke.mjs /opt/browser-sandbox/.github/scripts/\n' >> "$context/Dockerfile"
 docker build -t "$baseline_image" "$context"
 # Historical baselines need not satisfy the current browser-layout contract.
 VERIFY_IMAGE_LAYOUT=0 BENCHMARK_OUTPUT="$output/baseline.json" bash .github/scripts/verify-image.sh "$baseline_image"

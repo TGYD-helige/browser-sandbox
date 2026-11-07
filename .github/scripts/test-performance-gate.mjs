@@ -351,3 +351,37 @@ test("real file routes recover between full download and incomplete upload cohor
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("image verification cleans an acquired extraction container and preserves the original failure", async () => {
+  const { mkdtemp, writeFile, readFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const root = await mkdtemp(join(tmpdir(), "image-cleanup-"));
+  try {
+    const log = join(root, "docker.log");
+    await writeFile(
+      join(root, "docker"),
+      '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$DOCKER_CALL_LOG"\nif [[ "$1" == image ]];then exit 0;fi\nif [[ "$1" == create ]];then echo fixture-extract;exit 0;fi\nif [[ "$1" == cp ]];then exit 7;fi\nif [[ "$1" == rm ]];then exit 0;fi\nexit 99\n',
+      { mode: 0o755 },
+    );
+    await assert.rejects(
+      promisify(execFile)(
+        "bash",
+        [".github/scripts/verify-image.sh", "fixture:image"],
+        {
+          env: {
+            ...process.env,
+            PATH: root + ":" + process.env.PATH,
+            DOCKER_CALL_LOG: log,
+          },
+        },
+      ),
+      (error) => error.code === 7,
+    );
+    assert((await readFile(log, "utf8")).includes("rm -f fixture-extract"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -147,5 +147,20 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   );
   const result = comparePerformance(...reports);
   console.log(JSON.stringify(result, null, 2));
-  if (!result.passed) process.exitCode = 1;
+  console.error(
+    `Performance comparison: ${result.comparisons.length} duration and ${result.resources.length} resource checks; passed=${result.passed}`,
+  );
+  if (!result.passed) {
+    console.error(
+      JSON.stringify(
+        {
+          failedDurations: result.comparisons.filter((entry) => !entry.passed),
+          failedResources: result.resources.filter((entry) => !entry.passed),
+        },
+        null,
+        2,
+      ),
+    );
+    process.exitCode = 1;
+  }
 }
