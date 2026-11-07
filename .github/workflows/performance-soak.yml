@@ -1,6 +1,9 @@
 name: Browser performance soak
 
 on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       baseline_ref:
@@ -21,6 +24,7 @@ concurrency:
 
 jobs:
   soak:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'performance-soak')
     name: Browser soak (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
@@ -37,14 +41,14 @@ jobs:
           node-version: 24
       - name: Validate lifecycle count
         env:
-          CYCLES: ${{ inputs.cycles }}
+          CYCLES: ${{ inputs.cycles || 500 }}
         run: node --input-type=module -e 'import assert from "node:assert/strict"; const n=Number(process.env.CYCLES); assert(Number.isInteger(n) && n>=100 && n<=2000 && n%20===0);'
       - run: docker build -t browser-sandbox:local .
       - name: Compare sustained lifecycle performance and retained resources
         env:
-          BASE_REF: ${{ inputs.baseline_ref }}
+          BASE_REF: ${{ inputs.baseline_ref || github.event.pull_request.base.sha }}
           BENCHMARK_SUITE: soak
-          SOAK_CYCLES: ${{ inputs.cycles }}
+          SOAK_CYCLES: ${{ inputs.cycles || 500 }}
         run: bash .github/scripts/benchmark-pair.sh "$BASE_REF" "soak-${{ matrix.runner }}"
       - uses: actions/upload-artifact@v4
         if: always()

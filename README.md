@@ -121,7 +121,7 @@ Resource maxima have separate initial regression budgets: memory uses baseline Ã
 
 For manual quality runs, select `baseline_ref` and optionally disable the Pi model-driven session test with `run_model`. The baseline must support preparation timing diagnostics and the access listener; missing required measurements fail the run. Model-driven steps need the configured OpenAI-compatible endpoint, model, and API-key settings and are skipped for fork pull requests.
 
-The separate **Browser performance soak** workflow is manual and defaults to 500 measured lifecycles per image, plus warmup cycles, on both architectures. Its `cycles` input accepts multiples of 20 from 100 to 2,000. The ordinary PR workflow includes a shorter 20-cycle run. The long workflow is not a required PR check.
+The separate **Browser performance soak** workflow runs on manual dispatch or on pull requests carrying the `performance-soak` label and defaults to 500 measured lifecycles per image, plus warmup cycles, on both architectures. Its `cycles` input accepts multiples of 20 from 100 to 2,000. The ordinary PR workflow includes a shorter 20-cycle run. The long workflow is not a required PR check.
 
 These controlled fixtures are regression guards, not production SLAs or proof that all leaks are absent. Profile payload sizes describe injected data rather than total archive size. Viewer timings measure authenticated frame delivery, excluding client image decoding and screen paint. Storage uses a local controlled HTTP server; network/cloud latency and real-site variability require workload-specific measurements.
 
