@@ -1,0 +1,54 @@
+name: Browser performance soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Baseline commit with the same browser version and preparation diagnostics
+        type: string
+        default: master
+      cycles:
+        description: Measured browser lifecycles per image (multiple of 20, from 100 to 2000)
+        type: number
+        default: 500
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-performance-soak-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  soak:
+    name: Browser soak (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Validate lifecycle count
+        env:
+          CYCLES: ${{ inputs.cycles }}
+        run: node --input-type=module -e 'import assert from "node:assert/strict"; const n=Number(process.env.CYCLES); assert(Number.isInteger(n) && n>=100 && n<=2000 && n%20===0);'
+      - run: docker build -t browser-sandbox:local .
+      - name: Compare sustained lifecycle performance and retained resources
+        env:
+          BASE_REF: ${{ inputs.baseline_ref }}
+          BENCHMARK_SUITE: soak
+          SOAK_CYCLES: ${{ inputs.cycles }}
+        run: bash .github/scripts/benchmark-pair.sh "$BASE_REF" "soak-${{ matrix.runner }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-soak-${{ matrix.runner }}
+          path: soak-${{ matrix.runner }}/*.json
+          if-no-files-found: error

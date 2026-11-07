@@ -104,9 +104,26 @@ Run `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm lint`, and `pnpm t
 
 The **Functional and performance gates** workflow runs on pull requests and master pushes. It checks native AMD64/ARM64 images, extensions, live viewing and authentication, Pi session handoff, and unused-browser overhead. Its final **Functional and performance gate** check succeeds only when all four prerequisite jobs succeed; configure this check as required in branch protection to enforce it at merge time. The separate **Browser integration** workflow retains the harness and model-driven browser tests.
 
-Performance runs use 20 measured samples after three warmups per workload, comparing the same measurement client against the base and proposed runtimes on the same runner. Duration budgets are baseline P95 × 1.25 + 25 ms, including Profile acquisition, restoration, browser launch, first readiness, and finalization. A four-client workload exercises the image's two browser slots, reports throughput, and limits post-finalization cgroup memory to baseline maximum × 1.25 + 64 MiB. These are regression guards for controlled fixtures, not production latency or memory-leak guarantees. Raw samples and comparisons are uploaded as workflow artifacts, including on failure.
+Performance runs use 20 measured samples after three warmups per workload, comparing the same measurement client against the base and proposed runtimes on the same runner. Duration budgets are baseline P95 × 1.25 + 25 ms. Raw samples and comparisons are uploaded as workflow artifacts, including on comparison failure.
 
-For manual runs, select the workflow's `baseline_ref` and optionally disable its Pi model-driven session test with `run_model`. The baseline must support preparation timing diagnostics; missing timing data fails the run instead of silently skipping those phases. Model-driven steps need the configured OpenAI-compatible endpoint, model, and API-key settings and are skipped for fork pull requests.
+| Workload | Measurements and checks |
+|---|---|
+| Unused, temporary, local persistent, and remote Profiles | Registration, Profile acquisition/restoration, browser launch, first rendered screenshot, finalization, and archive transfer. Local Profiles alternate execution UIDs; the larger fixture includes 100 persistent Cookies, IndexedDB, and 1,000 synthetic small files. |
+| Four clients competing for two browser slots | Slowest-client readiness/finalization, batch duration, throughput, and retained cgroup memory. |
+| CDP traffic | Small commands, four simultaneous connections, 1 MiB responses, and noisy screenshots larger than 1 MiB; fixed-work batch durations and throughput. |
+| Slow archive restore/upload | A controlled first-chunk barrier holds the transfer until an unrelated execution registers, renders, and finalizes. That work must complete before the transfer is released. |
+| Queue cancellation | Cancel and finalize a third starting client behind two live browsers, reject its revoked grant, then release a slot and measure successor readiness. |
+| Files | Streamed 16 MiB transfers, four concurrent 4 MiB transfers, digest verification, slow readers, and cancelled uploads. Fill all sixteen transfer slots, confirm admission rejection, measure CDP responsiveness, then cancel and verify capacity recovery. |
+| Viewer | Zero, one, or four authenticated viewer WebSockets against an animated page; first frame, frame intervals, CDP latency, CPU, memory, runtime file descriptors, process count, frame rate, and wire traffic. |
+| Repeated lifecycles | Real navigation/screenshots and finalization, with execution directory removal checked after every cycle and resource growth checked across batches. |
+
+Resource maxima have separate initial regression budgets: memory uses baseline × 1.25 + 64 MiB, normalized CPU usage uses baseline × 1.25 + 50,000 microseconds per second, viewer traffic uses baseline × 1.25 + 64 KiB per second, runtime file descriptors allow four additional descriptors, and process count allows two additional processes. Temporary disk usage allows baseline × 1.25 + 64 KiB. Repeated-lifecycle runs additionally reject growth beyond 128 MiB of memory, four runtime descriptors, two processes, or 64 KiB of temporary data between the median first and last five batches, even if the baseline also grows.
+
+For manual quality runs, select `baseline_ref` and optionally disable the Pi model-driven session test with `run_model`. The baseline must support preparation timing diagnostics and the access listener; missing required measurements fail the run. Model-driven steps need the configured OpenAI-compatible endpoint, model, and API-key settings and are skipped for fork pull requests.
+
+The separate **Browser performance soak** workflow is manual and defaults to 500 measured lifecycles per image, plus warmup cycles, on both architectures. Its `cycles` input accepts multiples of 20 from 100 to 2,000. The ordinary PR workflow includes a shorter 20-cycle run. The long workflow is not a required PR check.
+
+These controlled fixtures are regression guards, not production SLAs or proof that all leaks are absent. Profile payload sizes describe injected data rather than total archive size. Viewer timings measure authenticated frame delivery, excluding client image decoding and screen paint. Storage uses a local controlled HTTP server; network/cloud latency and real-site variability require workload-specific measurements.
 
 ## References
 

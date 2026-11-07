@@ -23,7 +23,7 @@ fi
 runtime_args=()
 command_args=()
 if [[ -n "${BENCHMARK_OUTPUT:-}" ]]; then
-  runtime_args=(--entrypoint node)
+  runtime_args=(--entrypoint node -e BROWSER_ACCESS_PORT=8080)
   command_args=(--import /opt/browser-sandbox/.github/scripts/benchmark-observer.mjs /opt/browser-sandbox/dist/main.js)
 fi
 # Bash 3.2 treats an empty array as unset under nounset.
@@ -45,6 +45,6 @@ docker exec -e PROFILE_ID=example/persistent "$container_id" node /opt/browser-s
 
 docker exec "$container_id" node /opt/browser-sandbox/.github/scripts/image-smoke.mjs
 if [[ -n "${BENCHMARK_OUTPUT:-}" ]]; then
-  docker exec -e SAMPLES="${BENCHMARK_SAMPLES:-20}" -e REQUIRE_PREPARATION_TIMINGS="${REQUIRE_PREPARATION_TIMINGS:-1}" "$container_id" \
+  docker exec -e BENCHMARK_SUITE="${BENCHMARK_SUITE:-standard}" -e SOAK_CYCLES="${SOAK_CYCLES:-500}" -e SAMPLES="${BENCHMARK_SAMPLES:-20}" -e REQUIRE_PREPARATION_TIMINGS="${REQUIRE_PREPARATION_TIMINGS:-1}" "$container_id" \
     node /opt/browser-sandbox/.github/scripts/benchmark-image.mjs > "$BENCHMARK_OUTPUT"
 fi

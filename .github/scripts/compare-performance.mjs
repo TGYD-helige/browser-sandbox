@@ -13,6 +13,19 @@ export function comparePerformance(baseline, current) {
   for (const before of baseline.cases) {
     const after = current.cases.find((entry) => entry.name === before.name);
     assert(after, `Missing workload ${before.name}`);
+    for (const key of [
+      "operationsPerSample",
+      "bytesPerSample",
+      "viewers",
+      "observationWindowMs",
+      "cycles",
+      "cyclesPerSample",
+    ])
+      assert.equal(
+        after[key],
+        before[key],
+        `Incompatible workload ${before.name}/${key}`,
+      );
     assert.deepEqual(
       Object.keys(after.phases).sort(),
       Object.keys(before.phases).sort(),
@@ -73,6 +86,45 @@ export function comparePerformance(baseline, current) {
       limitBytes,
       passed: currentBytes <= limitBytes,
     });
+  }
+  const resourceBudgets = {
+    memoryBytes: [1.25, 64 * 1024 * 1024],
+    cpuMicros: [1.25, 50000],
+    runtimeFdCount: [1, 4],
+    processCount: [1, 2],
+    diskBytes: [1.25, 64 * 1024],
+    viewerBytes: [1.25, 64 * 1024],
+  };
+  for (const before of baseline.cases) {
+    const after = current.cases.find((entry) => entry.name === before.name);
+    assert.deepEqual(
+      Object.keys(after.resources ?? {}).sort(),
+      Object.keys(before.resources ?? {}).sort(),
+      `Incompatible resources for ${before.name}`,
+    );
+    for (const [key, oldValues] of Object.entries(before.resources ?? {})) {
+      assert(resourceBudgets[key], `Missing budget for ${key}`);
+      const newValues = after.resources[key];
+      for (const values of [oldValues, newValues]) {
+        assert.equal(values.length, baseline.samples, "Missing resource samples");
+        assert(
+          values.every((value) => Number.isFinite(value) && value >= 0),
+          "Invalid resource measurement",
+        );
+      }
+      const baselineValue = Math.max(...oldValues),
+        currentValue = Math.max(...newValues);
+      const [ratio, allowance] = resourceBudgets[key];
+      const limit = baselineValue * ratio + allowance;
+      resources.push({
+        workload: before.name,
+        resource: key,
+        baselineValue,
+        currentValue,
+        limit,
+        passed: currentValue <= limit,
+      });
+    }
   }
   return {
     resources,
