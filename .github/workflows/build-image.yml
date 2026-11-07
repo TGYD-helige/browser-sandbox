@@ -104,9 +104,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ARCH"
+          export tag="$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ARCH"
           docker tag browser-sandbox:local "$tag"
-          docker push "$tag"
+          docker image history browser-sandbox:local
+          # A terminal exposes per-layer byte progress that Docker omits in CI pipes.
+          timeout --signal=TERM --kill-after=30s 10m \
+            script --quiet --return --command 'docker push "$tag"' /dev/null
           docker image inspect "$tag" --format '{{index .RepoDigests 0}}' > "$ARCH.txt"
       - uses: actions/upload-artifact@v4
         with:

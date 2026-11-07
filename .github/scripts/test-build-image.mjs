@@ -18,6 +18,58 @@ function script(name) {
   return block.replace(/^ {10}/gm, "");
 }
 
+test("architecture pushes have a deadline and never publish a digest after failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "build-image-push-"));
+  try {
+    const env = {
+      ...process.env,
+      PATH: `${root}:${process.env.PATH}`,
+      IMAGE: "registry.example.com/example/browser",
+      GITHUB_RUN_ID: "123",
+      GITHUB_RUN_ATTEMPT: "2",
+      ARCH: "arm64",
+      TRACE: join(root, "trace"),
+    };
+    await writeFile(
+      join(root, "timeout"),
+      '#!/bin/sh\nprintf "deadline %s\\n" "$*" >> "$TRACE"\n[ "$1" = --signal=TERM ] && [ "$2" = --kill-after=30s ] && [ "$3" = 10m ] || exit 99\nshift 3\nexec "$@"\n',
+      { mode: 0o700 },
+    );
+    await writeFile(
+      join(root, "script"),
+      '#!/bin/sh\n[ "$1" = --quiet ] && [ "$2" = --return ] && [ "$3" = --command ] || exit 98\nexec bash -c "$4"\n',
+      { mode: 0o700 },
+    );
+    await writeFile(
+      join(root, "docker"),
+      '#!/bin/sh\nprintf "docker %s\\n" "$*" >> "$TRACE"\nif [ "$1" = push ]; then exit "$PUSH_STATUS"; fi\nif [ "$1 $2" = "image inspect" ]; then printf "%s@sha256:verified\\n" "$IMAGE"; fi\n',
+      { mode: 0o700 },
+    );
+    for (const status of [124, 9, 0]) {
+      await writeFile(env.TRACE, "");
+      const push = run("bash", ["-c", script("Push verified architecture image")], {
+        cwd: root,
+        env: { ...env, PUSH_STATUS: String(status) },
+      });
+      if (status === 0) await push;
+      else await assert.rejects(push, (error) => error.code === status);
+      const trace = await readFile(env.TRACE, "utf8");
+      assert.match(trace, /deadline --signal=TERM --kill-after=30s 10m script/);
+      assert.match(
+        trace,
+        /docker push registry.example.com\/example\/browser:build-123-2-arm64/,
+      );
+      assert.equal(trace.includes("docker image inspect"), status === 0);
+    }
+    assert.equal(
+      await readFile(join(root, "arm64.txt"), "utf8"),
+      `${env.IMAGE}@sha256:verified\n`,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("image publication checks source tags and only updates latest when selected", async () => {
   const root = await mkdtemp(join(tmpdir(), "build-image-"));
   try {

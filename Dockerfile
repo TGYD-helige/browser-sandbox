@@ -15,7 +15,7 @@ RUN pnpm build && pnpm prune --prod
 
 FROM ${CLOAK_IMAGE} AS cloak
 COPY scripts/extract-cloak.py /tmp/extract-cloak.py
-RUN python /tmp/extract-cloak.py
+RUN python /tmp/extract-cloak.py && chmod -R go-w /cloak
 
 FROM ${BROWSERLESS_IMAGE}
 USER root
@@ -28,7 +28,7 @@ COPY package.json ./
 COPY examples ./examples
 COPY .github/scripts/image-smoke.mjs .github/scripts/benchmark-image.mjs .github/scripts/benchmark-observer.mjs ./.github/scripts/
 COPY config/seccomp-source.json ./seccomp-source.json
-RUN chmod -R go-w /opt/google/chrome /opt/browser-sandbox \
+RUN chmod -R go-w /opt/browser-sandbox \
   && chmod 0755 /opt/browser-sandbox/dist/chrome.js \
   && cd "${APP_DIR}" \
   && ln -sf /opt/browser-sandbox/dist/chrome.js "$(node -p "require('playwright-core').chromium.executablePath()")" \
