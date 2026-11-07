@@ -17,6 +17,7 @@ test -f "$context/Dockerfile"
 cp .github/scripts/benchmark-*.mjs "$context/.github/scripts/"
 printf '\nCOPY .github/scripts/benchmark-*.mjs /opt/browser-sandbox/.github/scripts/\n' >> "$context/Dockerfile"
 docker build -t "$baseline_image" "$context"
-BENCHMARK_OUTPUT="$output/baseline.json" bash .github/scripts/verify-image.sh "$baseline_image"
+# Historical baselines need not satisfy the current browser-layout contract.
+VERIFY_IMAGE_LAYOUT=0 BENCHMARK_OUTPUT="$output/baseline.json" bash .github/scripts/verify-image.sh "$baseline_image"
 BENCHMARK_OUTPUT="$output/current.json" bash .github/scripts/verify-image.sh "${BROWSER_IMAGE:-browser-sandbox:local}"
 node .github/scripts/compare-performance.mjs "$output/baseline.json" "$output/current.json" > "$output/comparison.json"
