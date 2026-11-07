@@ -17,7 +17,8 @@ if [[ -f "$context/Dockerfile" ]]; then
   cp .github/scripts/benchmark-image.mjs .github/scripts/benchmark-observer.mjs "$context/.github/scripts/"
   printf '\nCOPY .github/scripts/benchmark-observer.mjs /opt/browser-sandbox/.github/scripts/\n' >> "$context/Dockerfile"
   docker build -t "$baseline_image" "$context"
-  REQUIRE_PREPARATION_TIMINGS=0 BENCHMARK_OUTPUT="$output/baseline.json" bash .github/scripts/verify-image.sh "$baseline_image"
+  # Historical images do not implement the current browser-layout contract.
+  VERIFY_IMAGE_LAYOUT=0 REQUIRE_PREPARATION_TIMINGS=0 BENCHMARK_OUTPUT="$output/baseline.json" bash .github/scripts/verify-image.sh "$baseline_image"
 fi
 BENCHMARK_OUTPUT="$output/current.json" bash .github/scripts/verify-image.sh browser-sandbox:local
 if [[ -f "$output/baseline.json" ]]; then
