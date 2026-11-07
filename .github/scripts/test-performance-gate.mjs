@@ -263,3 +263,91 @@ test("frame correlation waits for matching rendered content, not just a new fram
   image = { data: "matching", receivedAt: 25, sequence: 2 };
   assert.equal((await pending).latency, 15);
 });
+
+test("held-slot acquisition waits for real admission and retains all sixteen slots", async () => {
+  const { createServer } = await import("node:http");
+  const { once } = await import("node:events");
+  const { fillTransfers } = await import("./benchmark-files.mjs");
+  let capacity = 0,
+    active = 0,
+    denied;
+  const rejected = new Promise((resolve) => {
+    denied = resolve;
+  });
+  const site = createServer((_req, res) => {
+    if (active >= capacity) {
+      res.writeHead(429).end();
+      denied();
+      return;
+    }
+    active++;
+    res.once("close", () => active--);
+    res.writeHead(200, { "content-length": 16 * 1024 * 1024 });
+    res.write(Buffer.alloc(1024));
+  });
+  site.listen(0, "127.0.0.1");
+  await once(site, "listening");
+  let held = [];
+  try {
+    const base = `http://127.0.0.1:${site.address().port}/`;
+    const pending = fillTransfers({ base, method: "GET" });
+    await rejected;
+    capacity = 16;
+    held = await pending;
+    assert.equal(active, 16);
+    const extra = await fetch(base + "probe");
+    await extra.arrayBuffer();
+    assert.equal(extra.status, 429);
+  } finally {
+    await Promise.all(held.map((entry) => entry.close()));
+    site.closeAllConnections();
+    await new Promise((resolve) => site.close(resolve));
+  }
+});
+
+test("real file routes recover between full download and incomplete upload cohorts", async () => {
+  const { createGateway } = await import("../../dist/gateway.js");
+  const { default: WebSocket, WebSocketServer } = await import("ws");
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { randomUUID } = await import("node:crypto");
+  const { fillTransfers, upload } = await import("./benchmark-files.mjs");
+  const root = await mkdtemp(join(tmpdir(), "file-admission-"));
+  const gateway = await createGateway({
+    WebSocket,
+    WebSocketServer,
+    port: 0,
+    socketPath: join(root, "control.sock"),
+    dataRoot: join(root, "data"),
+    access: { port: 0 },
+    healthy: async () => true,
+    launch: async () => {
+      throw Error("Files must not launch a browser");
+    },
+  });
+  let held = [];
+  try {
+    const executionId = randomUUID();
+    await gateway.command({ op: "register", executionId, executorUid: 100096 }, true);
+    const access = await gateway.command({ op: "access_create", executionId }, true);
+    const base = access.cdpUrl.replace(/^ws/, "http") + "/files/";
+    await upload(base + "held.bin", 16 * 1024 * 1024);
+    for (const method of ["GET", "PUT", "GET", "PUT"]) {
+      held = await fillTransfers({
+        base,
+        method,
+        directory: join(root, "data", executionId, "files"),
+      });
+      const extra = await fetch(base + "held.bin");
+      await extra.arrayBuffer();
+      assert.equal(extra.status, 429);
+      await Promise.all(held.map((entry) => entry.close()));
+      held = [];
+    }
+  } finally {
+    await Promise.all(held.map((entry) => entry.close()));
+    await gateway.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});

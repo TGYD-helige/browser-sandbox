@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, rm } from "node:fs/promises";
 import { request } from "node:http";
+import { setTimeout as delay } from "node:timers/promises";
 import { execution, resources, until, workload } from "./benchmark-fixture.mjs";
 import { runBatch } from "./benchmark-load.mjs";
 
@@ -51,7 +52,8 @@ export function holdTransfer(url, method) {
   req.setTimeout(10000, () => req.destroy(Error("Held transfer timed out")));
   let failure,
     cleanupStarted = false,
-    admissionRejected = false;
+    admissionRejected = false,
+    status;
   const remember = (error) => {
     if (!cleanupStarted && !admissionRejected) failure ??= error;
   };
@@ -64,6 +66,7 @@ export function holdTransfer(url, method) {
   req.on("error", remember);
   const ready = new Promise((resolve, reject) => {
     req.once("response", (response) => {
+      status = response.statusCode;
       response.on("error", remember);
       response.once("aborted", () =>
         remember(Error("Held transfer aborted before cancellation")),
@@ -71,7 +74,7 @@ export function holdTransfer(url, method) {
       if (response.statusCode !== 200) {
         admissionRejected = true;
         response.resume();
-        reject(Error("Held transfer was not admitted"));
+        reject(Error(`Held transfer was not admitted (${method} ${status})`));
       } else {
         response.pause();
         resolve();
@@ -88,6 +91,8 @@ export function holdTransfer(url, method) {
   return {
     ready,
     closed,
+    status: () => status,
+    error: () => failure,
     async close() {
       cleanupStarted = true;
       req.destroy();
@@ -95,6 +100,66 @@ export function holdTransfer(url, method) {
       if (failure) throw failure;
     },
   };
+}
+
+export async function fillTransfers({ base, method, directory }) {
+  const deadline = performance.now() + 10000;
+  while (performance.now() < deadline) {
+    const names = Array.from({ length: 16 }, () => randomUUID() + ".bin");
+    const held = names.map((name) =>
+      holdTransfer(method === "GET" ? base + "held.bin" : base + name, method),
+    );
+    let keep = false;
+    try {
+      let admitted;
+      if (method === "GET") {
+        const replies = await Promise.allSettled(held.map((entry) => entry.ready));
+        for (let i = 0; i < replies.length; i++)
+          if (replies[i].status === "rejected" && held[i].status() !== 429)
+            throw replies[i].reason;
+        admitted = replies.every((entry) => entry.status === "fulfilled");
+      } else {
+        admitted =
+          (await until(
+            async () => {
+              for (const entry of held) {
+                if (entry.error()) throw entry.error();
+                if (entry.status() !== undefined && entry.status() !== 429)
+                  throw Error(`Unexpected held upload status ${entry.status()}`);
+              }
+              if (held.some((entry) => entry.status() === 429)) return "retry";
+              const sizes = await Promise.all(
+                names.map(async (name) => {
+                  try {
+                    return (await lstat(`${directory}/${name}`)).size;
+                  } catch (error) {
+                    if (error.code === "ENOENT") return 0;
+                    throw error;
+                  }
+                }),
+              );
+              return sizes.every((size) => size === 64 * 1024) ? "admitted" : null;
+            },
+            "Held uploads did not reach the runtime",
+            Math.max(1, deadline - performance.now()),
+          )) === "admitted";
+      }
+      if (admitted) {
+        keep = true;
+        return held;
+      }
+    } finally {
+      if (!keep) {
+        await Promise.all(held.map((entry) => entry.close()));
+        if (method === "PUT")
+          await Promise.all(
+            names.map((name) => rm(`${directory}/${name}`, { force: true })),
+          );
+      }
+    }
+    await delay(10);
+  }
+  throw Error("File transfer admission did not recover sixteen slots");
 }
 
 export async function benchmarkFiles({ socket, origin, samples }) {
@@ -165,28 +230,12 @@ export async function benchmarkFiles({ socket, origin, samples }) {
       };
       for (let sample = -3; sample < samples; sample++) {
         const before = await resources();
-        const names = Array.from({ length: 16 }, () => randomUUID() + ".bin");
-        const held = names.map((name) =>
-          holdTransfer(method === "GET" ? large : base + name, method),
-        );
+        const held = await fillTransfers({
+          base,
+          method,
+          directory: `/browser-data/${client.executionId}/files`,
+        });
         try {
-          if (method === "GET") await Promise.all(held.map((entry) => entry.ready));
-          else
-            await until(async () => {
-              const sizes = await Promise.all(
-                names.map(async (name) => {
-                  try {
-                    return (
-                      await lstat(`/browser-data/${client.executionId}/files/${name}`)
-                    ).size;
-                  } catch (error) {
-                    if (error.code === "ENOENT") return 0;
-                    throw error;
-                  }
-                }),
-              );
-              return sizes.every((size) => size === 64 * 1024);
-            }, "Held uploads did not reach the runtime");
           const denied = await fetch(probe, { signal: AbortSignal.timeout(5000) });
           await denied.arrayBuffer();
           assert.equal(
@@ -200,30 +249,18 @@ export async function benchmarkFiles({ socket, origin, samples }) {
           const memory = (await resources()).memoryBytes;
           start = performance.now();
           await Promise.all(held.map((entry) => entry.close()));
-          await until(async () => {
-            // Small requests can finish before later requests enter; hold all recovered slots open.
-            const recovered = Array.from({ length: 16 }, () =>
-              holdTransfer(large, "GET"),
+          const recovered = await fillTransfers({ base, method: "GET" });
+          try {
+            const rejected = await fetch(probe, { signal: AbortSignal.timeout(5000) });
+            await rejected.arrayBuffer();
+            assert.equal(
+              rejected.status,
+              429,
+              "Recovered slots must be held simultaneously",
             );
-            try {
-              const admitted = await Promise.allSettled(
-                recovered.map((entry) => entry.ready),
-              );
-              if (admitted.some((entry) => entry.status !== "fulfilled")) return false;
-              const rejected = await fetch(probe, {
-                signal: AbortSignal.timeout(5000),
-              });
-              await rejected.arrayBuffer();
-              assert.equal(
-                rejected.status,
-                429,
-                "Recovered slots must be held simultaneously",
-              );
-              return true;
-            } finally {
-              await Promise.all(recovered.map((entry) => entry.close()));
-            }
-          }, "Cancelled transfers retained capacity");
+          } finally {
+            await Promise.all(recovered.map((entry) => entry.close()));
+          }
           const after = await until(async () => {
             const value = await resources();
             return value.runtimeFdCount <= before.runtimeFdCount + 2 &&
