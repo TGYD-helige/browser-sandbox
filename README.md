@@ -123,7 +123,7 @@ For manual quality runs, select `baseline_ref` and optionally disable the Pi mod
 
 The separate **Browser performance soak** workflow runs on manual dispatch or on pull requests carrying the `performance-soak` label and defaults to 500 measured lifecycles per image, plus warmup cycles, on both architectures. Its `cycles` input accepts multiples of 20 from 100 to 2,000. The ordinary PR workflow includes a shorter 20-cycle run. The long workflow is not a required PR check.
 
-These controlled fixtures are regression guards, not production SLAs or proof that all leaks are absent. Profile payload sizes describe injected data rather than total archive size. Viewer timings correlate a renderer color update with received JPEG content; marker decoding runs outside the CPU/bandwidth observation window and is excluded from the latency endpoint. Client screen paint is not measured. The viewer fixture reuses the image’s existing ffmpeg executable. Storage uses a local controlled HTTP server; network/cloud latency and real-site variability require workload-specific measurements.
+These controlled fixtures are regression guards, not production SLAs or proof that all leaks are absent. Profile payload sizes describe injected data rather than total archive size. Viewer timings correlate a renderer color update with received JPEG content; marker decoding runs outside the CPU/bandwidth observation window and is excluded from the latency endpoint. Client screen paint is not measured. The viewer fixture reuses Chrome’s native JPEG decoding through an offscreen canvas. Storage uses a local controlled HTTP server; network/cloud latency and real-site variability require workload-specific measurements.
 
 ## References
 

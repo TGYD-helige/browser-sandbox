@@ -1,36 +1,40 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
-import { promisify } from "node:util";
 import WebSocket from "ws";
 import { execution, resources, until, workload } from "./benchmark-fixture.mjs";
 
-const exec = promisify(execFile);
-export async function decodeFrameRgb(data) {
-  const decoded = exec(
-    "ffmpeg",
-    [
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-i",
-      "pipe:0",
-      "-vf",
-      "format=rgb24,crop=1:1:16:16",
-      "-frames:v",
-      "1",
-      "-f",
-      "rawvideo",
-      "pipe:1",
-    ],
-    { timeout: 5000, maxBuffer: 1024 * 1024, encoding: "buffer" },
+export async function decodeFrameRgb(cdp, sessionId, data) {
+  const { result, exceptionDetails } = await cdp.call(
+    "Runtime.evaluate",
+    {
+      expression: `(async () => { const response=await fetch(${JSON.stringify("data:image/jpeg;base64,")}+${JSON.stringify(data)});const image=await createImageBitmap(await response.blob());try{const canvas=new OffscreenCanvas(1,1);const context=canvas.getContext('2d');context.drawImage(image,16,16,1,1,0,0,1,1);return Array.from(context.getImageData(0,0,1,1).data).slice(0,3);}finally{image.close();} })()`,
+      awaitPromise: true,
+      returnByValue: true,
+    },
+    sessionId,
   );
-  decoded.child.stdin.on("error", () => {});
-  decoded.child.stdin.end(Buffer.from(data, "base64"));
-  const { stdout } = await decoded;
-  assert.equal(stdout.length, 3, "Frame marker pixel was not decoded");
-  return [...stdout];
+  assert(!exceptionDetails, "Renderer could not decode its viewer JPEG");
+  assert(
+    Array.isArray(result.value) &&
+      result.value.length === 3 &&
+      result.value.every((value) => Number.isFinite(value)),
+    "Frame marker pixel was not decoded",
+  );
+  return result.value;
+}
+
+export async function waitForMarker({ latest, decode, expected, updatedAt }) {
+  let seen = 0;
+  return until(async () => {
+    const image = latest();
+    if (!image || image.receivedAt < updatedAt || image.sequence === seen) return null;
+    seen = image.sequence;
+    const rgb = await decode(image.data);
+    return rgb.every((value, index) => Math.abs(value - expected[index]) <= 25)
+      ? { latency: image.receivedAt - updatedAt }
+      : null;
+  }, "Viewer delivered stale renderer frames");
 }
 
 async function observe(viewerUrl) {
@@ -172,21 +176,14 @@ export async function benchmarkViewer({ socket, origin, samples }) {
             );
             // Decode outside the CPU/bandwidth window; latency ends at frame receipt, before decoding.
             const delivered = await Promise.all(
-              viewers.map(async (viewer) => {
-                let seen = 0;
-                return until(async () => {
-                  const image = viewer.latest();
-                  if (!image || image.receivedAt < updatedAt || image.sequence === seen)
-                    return null;
-                  seen = image.sequence;
-                  const rgb = await decodeFrameRgb(image.data);
-                  return rgb.every(
-                    (value, index) => Math.abs(value - expected[index]) <= 25,
-                  )
-                    ? { latency: image.receivedAt - updatedAt }
-                    : null;
-                }, "Viewer delivered stale renderer frames");
-              }),
+              viewers.map((viewer) =>
+                waitForMarker({
+                  latest: viewer.latest,
+                  expected,
+                  updatedAt,
+                  decode: (data) => decodeFrameRgb(cdp, sessionId, data),
+                }),
+              ),
             );
             updateToFrame = Math.max(...delivered.map((frame) => frame.latency));
           }

@@ -240,26 +240,26 @@ test("held transfers report an unexpected disconnect after admission", async () 
   }
 });
 
-test("frame correlation decodes the rendered marker rather than trusting frame cadence", async () => {
-  const { execFileSync } = await import("node:child_process");
-  const { decodeFrameRgb } = await import("./benchmark-viewer.mjs");
-  const jpeg = execFileSync("ffmpeg", [
-    "-hide_banner",
-    "-loglevel",
-    "error",
-    "-f",
-    "lavfi",
-    "-i",
-    "color=c=0xe6141e:s=64x64",
-    "-frames:v",
-    "1",
-    "-f",
-    "image2pipe",
-    "-vcodec",
-    "mjpeg",
-    "pipe:1",
-  ]);
-  const rgb = await decodeFrameRgb(jpeg.toString("base64"));
-  assert(rgb.every((value, index) => Math.abs(value - [230, 20, 30][index]) < 5));
-  await assert.rejects(decodeFrameRgb(Buffer.from("not a frame").toString("base64")));
+test("frame correlation waits for matching rendered content, not just a new frame", async () => {
+  const { waitForMarker } = await import("./benchmark-viewer.mjs");
+  let image = { data: "stale", receivedAt: 20, sequence: 1 };
+  let entered;
+  const firstDecoded = new Promise((resolve) => {
+    entered = resolve;
+  });
+  const pending = waitForMarker({
+    latest: () => image,
+    expected: [230, 20, 30],
+    updatedAt: 10,
+    async decode(data) {
+      if (data === "stale") {
+        entered();
+        return [20, 40, 230];
+      }
+      return [230, 20, 29];
+    },
+  });
+  await firstDecoded;
+  image = { data: "matching", receivedAt: 25, sequence: 2 };
+  assert.equal((await pending).latency, 15);
 });

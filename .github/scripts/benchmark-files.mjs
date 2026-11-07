@@ -227,7 +227,8 @@ export async function benchmarkFiles({ socket, origin, samples }) {
           const after = await until(async () => {
             const value = await resources();
             return value.runtimeFdCount <= before.runtimeFdCount + 2 &&
-              value.processCount <= before.processCount + 2
+              value.processCount <= before.processCount + 2 &&
+              value.memoryBytes <= before.memoryBytes + 128 * 1024 * 1024
               ? value
               : null;
           }, "Cancelled transfers retained runtime resources");
