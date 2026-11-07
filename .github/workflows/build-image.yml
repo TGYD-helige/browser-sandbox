@@ -1,178 +1,47 @@
-name: Build browser images
-
+name: Image relay capability probe
 on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: Existing Git version tag at the master commit being built (for example v0.1.0)
         type: string
-        required: true
       publish_latest:
-        description: Also publish this version as latest
         type: boolean
         default: false
-
 permissions:
   contents: read
-
-concurrency:
-  group: browser-image-build
-  cancel-in-progress: false
-
-env:
-  REGISTRY: ${{ vars.BAIDU_CCR_REGISTRY }}
-  NAMESPACE: ${{ vars.BAIDU_CCR_NAMESPACE }}
-  IMAGE_NAMES: ${{ vars.BROWSER_IMAGE_NAMES }}
-  IMAGE_TAG: ${{ inputs.image_tag }}
-  PUBLISH_LATEST: ${{ inputs.publish_latest }}
-
 jobs:
-  prepare:
+  artifact:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    outputs:
-      image: ${{ steps.validate.outputs.image }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Validate publication configuration
-        id: validate
-        shell: bash
+      - name: Create a synthetic ARM64 image without executing it
         run: |
-          set -euo pipefail
-          [[ "$GITHUB_REF" == refs/heads/master ]] || exit 1
-          [[ "$REGISTRY" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]+)?$ ]] || exit 1
-          [[ "$NAMESPACE" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || exit 1
-          [[ "$IMAGE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] || exit 1
-          if [[ "$IMAGE_TAG" == latest || "$IMAGE_TAG" == sha-* ]]; then
-            echo "Use a version tag; latest and sha-* are reserved image tags." >&2
-            exit 1
-          fi
-          if ! source_sha="$(git rev-parse --verify "refs/tags/$IMAGE_TAG^{commit}")"; then
-            echo "Create and push the Git version tag before publishing." >&2
-            exit 1
-          fi
-          if [[ "$source_sha" != "$GITHUB_SHA" ]]; then
-            echo "The Git version tag must point to the master commit being built." >&2
-            exit 1
-          fi
-          read -ra names <<< "$IMAGE_NAMES"
-          ((${#names[@]} > 0))
-          for name in "${names[@]}"; do
-            [[ "$name" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || exit 1
-          done
-          echo "image=$REGISTRY/$NAMESPACE/${names[0]}" >> "$GITHUB_OUTPUT"
-
-  image:
-    needs: prepare
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            architecture: amd64
-          - runner: ubuntu-24.04-arm
-            architecture: arm64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Build and verify native image
-        run: |
-          docker build -t browser-sandbox:local .
-          bash .github/scripts/verify-image.sh browser-sandbox:local
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - name: Verify Pi agent browser-session tools
-        run: |
-          docker build -f Dockerfile.e2e -t browser-sandbox-e2e:local .
-          node .github/scripts/e2e.mjs pi
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ vars.BAIDU_CCR_USERNAME }}
-          password: ${{ secrets.BAIDU_CCR_PASSWORD }}
-      - name: Push verified architecture image
-        env:
-          IMAGE: ${{ needs.prepare.outputs.image }}
-          ARCH: ${{ matrix.architecture }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          export tag="$IMAGE:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$ARCH"
-          docker tag browser-sandbox:local "$tag"
-          docker image history browser-sandbox:local
-          # A terminal exposes per-layer byte progress that Docker omits in CI pipes.
-          timeout --signal=TERM --kill-after=30s 10m \
-            script --quiet --return --command 'docker push "$tag"' /dev/null
-          docker image inspect "$tag" --format '{{index .RepoDigests 0}}' > "$ARCH.txt"
+          head -c 16777216 /dev/urandom > payload
+          printf 'FROM scratch\nCOPY payload /payload\n' > Dockerfile
+          docker build --platform linux/arm64 -t relay-probe:arm64 .
+          docker save --output image.tar relay-probe:arm64
+          sha256sum image.tar > image.tar.sha256
       - uses: actions/upload-artifact@v4
         with:
-          name: browser-build-digest-${{ matrix.architecture }}
-          path: ${{ matrix.architecture }}.txt
-          if-no-files-found: error
-
-  publish:
-    needs: [prepare, image]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+          name: relay-probe
+          path: |
+            image.tar
+            image.tar.sha256
+          compression-level: 0
+          retention-days: 1
+  relay:
+    needs: artifact
+    runs-on: arc-simple
+    timeout-minutes: 5
     steps:
       - uses: actions/download-artifact@v4
         with:
-          pattern: browser-build-digest-*
-          merge-multiple: true
-      - uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ vars.BAIDU_CCR_USERNAME }}
-          password: ${{ secrets.BAIDU_CCR_PASSWORD }}
-      - uses: docker/setup-buildx-action@v3
-      - name: Publish verified multi-architecture images
-        shell: bash
+          name: relay-probe
+      - name: Verify and copy the foreign-architecture archive
         run: |
           set -euo pipefail
-          read -ra names <<< "$IMAGE_NAMES"
-          for name in "${names[@]}"; do
-            image="$REGISTRY/$NAMESPACE/$name"
-            tags=(--tag "$image:sha-$GITHUB_SHA" --tag "$image:$IMAGE_TAG")
-            if [[ "$PUBLISH_LATEST" == true ]]; then
-              tags+=(--tag "$image:latest")
-            fi
-            docker buildx imagetools create "${tags[@]}" \
-              "$(cat amd64.txt)" "$(cat arm64.txt)"
-            printf 'Published %s (Linux AMD64/ARM64).\n' \
-              "${tags[*]}" >> "$GITHUB_STEP_SUMMARY"
-          done
-
-  release-notes:
-    needs: publish
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - name: Create release draft with model summary
-        env:
-          GH_TOKEN: ${{ github.token }}
-          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL_NAME: ${{ vars.OPENAI_MODEL_NAME || secrets.OPENAI_MODEL_NAME }}
-        run: |
-          set -euo pipefail
-          if gh release list --limit 1000 --json tagName --jq '.[].tagName' | grep -Fxq -- "$IMAGE_TAG"; then
-            echo 'Release already exists; preserving its notes.'
-            exit 0
-          fi
-          node .github/scripts/generate-release-summary.mjs "$IMAGE_TAG" release-notes.md
-          gh release create "$IMAGE_TAG" --verify-tag --title "$IMAGE_TAG" --draft --notes-file release-notes.md
+          sha256sum --check image.tar.sha256
+          skopeo --version
+          crane version
+          skopeo inspect --config docker-archive:image.tar | jq -e '.architecture == "arm64" and .os == "linux"'
+          skopeo copy docker-archive:image.tar dir:relay-probe
