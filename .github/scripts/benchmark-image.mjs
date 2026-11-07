@@ -385,7 +385,7 @@ if (process.argv[2] === "worker") {
           suite,
           warmups: 3,
           environment:
-            "Sandboxed image; 2 CPU affinity and quota, 2 GiB RAM; real CDP renderer and local streaming HTTP archive store",
+            "Sandboxed image; 2 CPU affinity and quota, 2 GiB RAM; periodic Docker healthchecks disabled during measurement; real CDP renderer and local streaming HTTP archive store",
           note: "First readiness includes client startup, Profile restore, browser startup, navigation, and screenshot. Finalization includes checkpoint, browser exit, encryption/archive, upload, and commit. HTTP transfer timings are measured at the local storage server. Profile acquisition and source lookup/restore are measured inside the runtime. Browser launch includes Browserless queue wait. Unused executions use a generic Node client without connecting CDP; real harness startup is measured separately. These measurements do not establish production/cloud latency or a comparative performance claim.",
           cases,
         },
