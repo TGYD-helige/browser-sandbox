@@ -34,7 +34,7 @@ export async function writeBenchmarkReport(report, run, write = console.log) {
         ? error.code
         : "benchmark_workload_failed",
     };
-    throw error;
+    throw Error(report.failure.code);
   } finally {
     write(JSON.stringify(report, null, 2));
   }

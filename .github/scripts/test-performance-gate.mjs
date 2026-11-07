@@ -417,7 +417,7 @@ test("failed benchmarks preserve completed raw samples without serializing secre
       },
       (json) => output.push(json),
     ),
-    (error) => error === failure,
+    (error) => error !== failure && error.message === "ERR_ASSERTION",
   );
   assert.equal(output.length, 1);
   const partial = JSON.parse(output[0]);
@@ -480,7 +480,7 @@ test("soak assertion diagnostics retain in-progress samples and completed subcas
         output = JSON.parse(json);
       },
     ),
-    /file descriptors grew/,
+    /ERR_ASSERTION/,
   );
   assert.equal(output.status, "failed");
   assert.equal(output.sample, 19);
@@ -497,4 +497,25 @@ test("a failed report cannot pass comparison even with all duration samples", ()
   const partial = { ...report(), status: "failed" };
   assert.throws(() => comparePerformance(report(), partial), /Incomplete benchmark/);
   assert.throws(() => comparePerformance(partial, report()), /Incomplete benchmark/);
+});
+
+test("benchmark CLI failure output excludes the original exception from stderr", async () => {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const moduleUrl = new URL("benchmark-report.mjs", import.meta.url).href;
+  await assert.rejects(
+    promisify(execFile)(process.execPath, [
+      "--input-type=module",
+      "--eval",
+      `import { writeBenchmarkReport } from ${JSON.stringify(moduleUrl)}; await writeBenchmarkReport({cases:[]}, async()=>{throw Error('https://private.invalid/?token=secret')});`,
+    ]),
+    (error) => {
+      assert.equal(error.code, 1);
+      assert.equal(JSON.parse(error.stdout).status, "failed");
+      assert.match(error.stderr, /benchmark_workload_failed/);
+      assert(!error.stderr.includes("secret"));
+      assert(!error.stderr.includes("private.invalid"));
+      return true;
+    },
+  );
 });
