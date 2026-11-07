@@ -109,7 +109,7 @@ jobs:
         with:
           pattern: digest-*
           merge-multiple: true
-      - name: Publish immutable multi-architecture tag and draft release
+      - name: Publish immutable multi-architecture tag and release
         env:
           GH_TOKEN: ${{ github.token }}
           IMAGE: ${{ needs.eligibility.outputs.image }}

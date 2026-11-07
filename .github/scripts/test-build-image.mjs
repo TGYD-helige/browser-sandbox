@@ -33,6 +33,7 @@ async function fixture(t) {
       GITHUB_RUN_ATTEMPT: "2",
       TRACE: join(root, "trace"),
       GITHUB_REF: "refs/heads/master",
+      GITHUB_EVENT_NAME: "workflow_dispatch",
       GITHUB_OUTPUT: join(root, "output"),
       GITHUB_STEP_SUMMARY: join(root, "summary"),
     },
@@ -61,10 +62,12 @@ test("source tags may precede the workflow commit but must belong to its master 
   await git("tag", "-a", "v1.0.1", "-m", "Annotated");
   await git("commit", "--allow-empty", "-qm", "Workflow fix");
   env.GITHUB_SHA = (await git("rev-parse", "HEAD")).stdout.trim();
+  await git("update-ref", "refs/remotes/origin/master", env.GITHUB_SHA);
   const unrelated = (
     await git("commit-tree", "HEAD^{tree}", "-m", "Unrelated")
   ).stdout.trim();
   await git("tag", "unrelated", unrelated);
+  await git("tag", "v9.9.9", unrelated);
   const validate = (tag, overrides = {}) =>
     run("bash", ["-c", validation()], {
       cwd: root,
@@ -72,12 +75,40 @@ test("source tags may precede the workflow commit but must belong to its master 
     });
   await validate("v1.0.0");
   await validate("v1.0.1");
+  for (const tag of ["v1.0.0", "v1.0.1"]) {
+    await validate(tag, {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: `refs/tags/${tag}`,
+      GITHUB_SHA: sourceSha,
+    });
+  }
+  await assert.rejects(
+    validate("v9.9.9", {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: "refs/tags/v9.9.9",
+      GITHUB_SHA: unrelated,
+    }),
+  );
+  await assert.rejects(
+    validate("v1.0.0", {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: "refs/heads/master",
+    }),
+  );
   assert.match(
     await readFile(env.GITHUB_OUTPUT, "utf8"),
     new RegExp(`source_sha=${sourceSha}`),
   );
   assert.notEqual(sourceSha, env.GITHUB_SHA);
   await assert.rejects(validate("unrelated"), /must be reachable/);
+  await git("tag", "v1.0.0-rc.1", sourceSha);
+  await assert.rejects(
+    validate("v1.0.0-rc.1", {
+      GITHUB_EVENT_NAME: "push",
+      GITHUB_REF: "refs/tags/v1.0.0-rc.1",
+      GITHUB_SHA: sourceSha,
+    }),
+  );
   await assert.rejects(validate("v9.0.0"), /Create and push/);
   for (const tag of ["latest", "sha-reserved", "bad/tag", "", "$(exit 0)"])
     await assert.rejects(validate(tag));
@@ -183,4 +214,45 @@ if [[ "$1" == copy && "\${FAIL_COPY:-false}" == true ]]; then exit 9; fi`,
       .split("\n")
       .some((line) => line.startsWith("tag ")),
   );
+});
+
+test("release publication creates public releases, publishes drafts, and preserves published notes", async (t) => {
+  const { root, env } = await fixture(t);
+  const releaseScript = workflow
+    .split("  release-notes:\n")[1]
+    .split("        run: |\n")[1]
+    .match(/^(?: {10}.*\n|\n)+/)[0]
+    .replace(/^ {10}/gm, "");
+  await stub(
+    root,
+    "gh",
+    `
+if [[ "$2" == list ]]; then
+  [[ "\${LIST_FAIL:-false}" != true ]] || exit 9
+  printf '%s' "$RELEASE_STATE"
+else
+  printf '%s\\n' "$*" >> "$TRACE"
+fi`,
+  );
+  await stub(root, "node", 'printf "Notes" > "$3"');
+  const publish = (state, overrides = {}) =>
+    run("bash", ["-c", releaseScript], {
+      cwd: root,
+      env: { ...env, IMAGE_TAG: "v1.0.0", RELEASE_STATE: state, ...overrides },
+    });
+  await publish("");
+  const created = await readFile(env.TRACE, "utf8");
+  assert.match(created, /release create v1.0.0 --verify-tag/);
+  assert(!created.includes("--draft"));
+  await writeFile(env.TRACE, "");
+  await publish("true");
+  assert.equal(
+    await readFile(env.TRACE, "utf8"),
+    "release edit v1.0.0 --draft=false\n",
+  );
+  await writeFile(env.TRACE, "");
+  await publish("false");
+  assert.equal(await readFile(env.TRACE, "utf8"), "");
+  await assert.rejects(publish("", { LIST_FAIL: "true" }));
+  assert.equal(await readFile(env.TRACE, "utf8"), "");
 });

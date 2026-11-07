@@ -13,4 +13,4 @@ docker buildx imagetools inspect "$image:$tag" > image-manifest.txt
 printf 'Verified Linux AMD64/ARM64 image: %s:%s.\n\nSee docs/usage.md for deployment conditions. Upstream licenses apply separately.\n' "$image" "$tag" > "$notes"
 node "$(dirname "$0")/generate-release-summary.mjs" "$tag" "$notes.changes"
 cat "$notes.changes" >> "$notes"
-gh release create "$tag" --verify-tag --title "$tag" --draft --notes-file "$notes" image-manifest.txt
+gh release create "$tag" --verify-tag --title "$tag" --notes-file "$notes" image-manifest.txt
