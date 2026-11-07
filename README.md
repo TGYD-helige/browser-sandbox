@@ -98,6 +98,16 @@ Only one execution may use a Profile at a time. Persistent data survives executi
 - **Pay for work when used.** Defer browser startup and storage work until needed; keep slow transfers off unrelated control paths.
 - **Preserve safety and data.** Keep sandboxing, authorization, cancellation, exclusive Profile access, and recoverable failure handling intact.
 
+## Verification
+
+Run `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm lint`, and `pnpm test` locally. Linux isolation checks require the supported Linux environment; use `pnpm test:linux` when running from another operating system.
+
+The **Functional and performance gates** workflow runs on pull requests and master pushes. It checks native AMD64/ARM64 images, extensions, live viewing and authentication, Pi session handoff, and unused-browser overhead. Its final **Functional and performance gate** check succeeds only when all four prerequisite jobs succeed; configure this check as required in branch protection to enforce it at merge time. The separate **Browser integration** workflow retains the harness and model-driven browser tests.
+
+Performance runs use 20 measured samples after three warmups per workload, comparing the same measurement client against the base and proposed runtimes on the same runner. Duration budgets are baseline P95 × 1.25 + 25 ms, including Profile acquisition, restoration, browser launch, first readiness, and finalization. A four-client workload exercises the image's two browser slots, reports throughput, and limits post-finalization cgroup memory to baseline maximum × 1.25 + 64 MiB. These are regression guards for controlled fixtures, not production latency or memory-leak guarantees. Raw samples and comparisons are uploaded as workflow artifacts, including on failure.
+
+For manual runs, select the workflow's `baseline_ref` and optionally disable its Pi model-driven session test with `run_model`. The baseline must support preparation timing diagnostics; missing timing data fails the run instead of silently skipping those phases. Model-driven steps need the configured OpenAI-compatible endpoint, model, and API-key settings and are skipped for fork pull requests.
+
 ## References
 
 - [Browserless](https://github.com/browserless/browserless) — upstream browser infrastructure used for startup, concurrency, queueing, and session timeouts.

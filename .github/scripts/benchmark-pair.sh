@@ -12,14 +12,11 @@ trap cleanup EXIT
 mkdir -p "$output"
 git fetch --depth=1 origin "$base_ref"
 git archive FETCH_HEAD | tar -x -C "$context"
-if [[ -f "$context/Dockerfile" ]]; then
-  # Apply the identical measurement client, leaving the baseline runtime unchanged.
-  cp .github/scripts/benchmark-image.mjs .github/scripts/benchmark-observer.mjs "$context/.github/scripts/"
-  printf '\nCOPY .github/scripts/benchmark-observer.mjs /opt/browser-sandbox/.github/scripts/\n' >> "$context/Dockerfile"
-  docker build -t "$baseline_image" "$context"
-  REQUIRE_PREPARATION_TIMINGS=0 BENCHMARK_OUTPUT="$output/baseline.json" bash .github/scripts/verify-image.sh "$baseline_image"
-fi
-BENCHMARK_OUTPUT="$output/current.json" bash .github/scripts/verify-image.sh browser-sandbox:local
-if [[ -f "$output/baseline.json" ]]; then
-  node .github/scripts/compare-performance.mjs "$output/baseline.json" "$output/current.json" > "$output/comparison.json"
-fi
+test -f "$context/Dockerfile"
+# Apply the identical measurement client, leaving the baseline runtime unchanged.
+cp .github/scripts/benchmark-image.mjs .github/scripts/benchmark-observer.mjs .github/scripts/benchmark-load.mjs "$context/.github/scripts/"
+printf '\nCOPY .github/scripts/benchmark-observer.mjs .github/scripts/benchmark-load.mjs /opt/browser-sandbox/.github/scripts/\n' >> "$context/Dockerfile"
+docker build -t "$baseline_image" "$context"
+BENCHMARK_OUTPUT="$output/baseline.json" bash .github/scripts/verify-image.sh "$baseline_image"
+BENCHMARK_OUTPUT="$output/current.json" bash .github/scripts/verify-image.sh "${BROWSER_IMAGE:-browser-sandbox:local}"
+node .github/scripts/compare-performance.mjs "$output/baseline.json" "$output/current.json" > "$output/comparison.json"

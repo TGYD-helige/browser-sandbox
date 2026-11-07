@@ -12,6 +12,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { connectCdp } from "../../dist/cdp.js";
 import { attachStorage, hostRequest } from "../../dist/host-client.js";
+import { benchmarkLoad } from "./benchmark-load.mjs";
 
 export function createBenchmarkSite(root) {
   const transfers = { download: [], upload: [] };
@@ -294,6 +295,7 @@ if (process.argv[2] === "worker") {
         ),
       });
     }
+    cases.push(await benchmarkLoad({ socket, url: origin + "/page", samples }));
     console.log(
       JSON.stringify(
         {

@@ -13,6 +13,11 @@ export function comparePerformance(baseline, current) {
   for (const before of baseline.cases) {
     const after = current.cases.find((entry) => entry.name === before.name);
     assert(after, `Missing workload ${before.name}`);
+    assert.deepEqual(
+      Object.keys(after.phases).sort(),
+      Object.keys(before.phases).sort(),
+      `Incompatible benchmark phases for ${before.name}`,
+    );
     for (const phase of Object.keys(before.phases)) {
       const measured = after.phases[phase];
       assert(measured, `Missing phase ${before.name}/${phase}`);
@@ -46,9 +51,33 @@ export function comparePerformance(baseline, current) {
     }
   }
   assert(comparisons.length > 0, "No comparable measurements");
+  const resources = [];
+  for (const before of baseline.cases.filter((entry) => entry.retainedMemoryBytes)) {
+    const after = current.cases.find((entry) => entry.name === before.name);
+    assert.equal(
+      after.concurrency,
+      before.concurrency,
+      "Incompatible load concurrency",
+    );
+    for (const values of [before.retainedMemoryBytes, after.retainedMemoryBytes]) {
+      assert.equal(values?.length, baseline.samples, "Missing memory samples");
+      assert(values.every((value) => Number.isFinite(value) && value > 0));
+    }
+    const baselineBytes = Math.max(...before.retainedMemoryBytes);
+    const currentBytes = Math.max(...after.retainedMemoryBytes);
+    const limitBytes = baselineBytes * 1.25 + 64 * 1024 * 1024;
+    resources.push({
+      workload: before.name,
+      baselineBytes,
+      currentBytes,
+      limitBytes,
+      passed: currentBytes <= limitBytes,
+    });
+  }
   return {
+    resources,
     budget: "baseline P95 * 1.25 + 25 ms",
-    passed: comparisons.every((entry) => entry.passed),
+    passed: [...comparisons, ...resources].every((entry) => entry.passed),
     comparisons,
   };
 }
