@@ -2,6 +2,8 @@
 
 ## Run the browser
 
+The runtime image contains CloakBrowser Chromium as its only browser. Browserless still manages browser startup, concurrency, queueing, and total session timeouts. Its pinned application, Node runtime, system dependencies, fonts, and license notices remain included.
+
 The current deployment is a private Linux container/Pod network namespace with a trusted root controller. The runtime listens on loopback, not a public port. Clients share that network namespace and use distinct execution UIDs. The trusted host owns the 0600 control socket and supplies authorized execution/Profile identities; an untrusted process must never mount that socket.
 
 Use a compatible Linux host with user namespaces enabled. Chrome keeps its renderer sandbox; startup fails if a real page and screenshot cannot run safely. The runtime must not be exposed as a public unauthenticated browser port.
