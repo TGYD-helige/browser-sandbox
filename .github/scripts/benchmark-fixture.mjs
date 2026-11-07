@@ -149,6 +149,7 @@ export async function execution(socket, registration = {}) {
 
 export async function resources() {
   const cpu = await readFile("/sys/fs/cgroup/cpu.stat", "utf8");
+  const sampledAt = performance.now();
   const memoryBytes = Number(await readFile("/sys/fs/cgroup/memory.current", "utf8"));
   const pids = (await readdir("/proc")).filter((name) => /^\d+$/.test(name));
   let runtimeFdCount;
@@ -173,6 +174,7 @@ export async function resources() {
   return {
     memoryBytes,
     cpuMicros,
+    sampledAt,
     processCount: pids.length,
     runtimeFdCount,
   };

@@ -80,7 +80,8 @@ export async function benchmarkCdp({ socket, origin, samples }) {
           measurements.batch.push(duration);
           measurements.commandP95.push(summarize(roundTrips).p95Ms);
           sampled.cpuMicros.push(
-            ((after.cpuMicros - before.cpuMicros) * 1000) / duration,
+            ((after.cpuMicros - before.cpuMicros) * 1000) /
+              (after.sampledAt - before.sampledAt),
           );
           sampled.memoryBytes.push(after.memoryBytes);
           transferredBytes += bytes;

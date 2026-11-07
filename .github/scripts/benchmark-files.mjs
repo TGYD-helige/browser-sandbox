@@ -42,20 +42,34 @@ export async function download(url, bytes, digest) {
   assert.equal(hash.digest("hex"), digest);
 }
 
-function holdTransfer(url, method) {
+export function holdTransfer(url, method) {
   const req = request(url, {
     method,
+    agent: false,
     headers: method === "PUT" ? { "content-length": 16 * 1024 * 1024 } : {},
   });
   req.setTimeout(10000, () => req.destroy(Error("Held transfer timed out")));
-  let failure;
-  const closed = new Promise((resolve) => req.once("close", resolve));
-  req.on("error", (error) => {
-    if (!req.destroyed) failure = error;
-  });
+  let failure,
+    cleanupStarted = false,
+    admissionRejected = false;
+  const remember = (error) => {
+    if (!cleanupStarted && !admissionRejected) failure ??= error;
+  };
+  const closed = new Promise((resolve) =>
+    req.once("close", () => {
+      if (!cleanupStarted) remember(Error("Held transfer closed before cancellation"));
+      resolve();
+    }),
+  );
+  req.on("error", remember);
   const ready = new Promise((resolve, reject) => {
     req.once("response", (response) => {
+      response.on("error", remember);
+      response.once("aborted", () =>
+        remember(Error("Held transfer aborted before cancellation")),
+      );
       if (response.statusCode !== 200) {
+        admissionRejected = true;
         response.resume();
         reject(Error("Held transfer was not admitted"));
       } else {
@@ -73,7 +87,9 @@ function holdTransfer(url, method) {
   } else req.end();
   return {
     ready,
+    closed,
     async close() {
+      cleanupStarted = true;
       req.destroy();
       await closed;
       if (failure) throw failure;
@@ -139,9 +155,16 @@ export async function benchmarkFiles({ socket, origin, samples }) {
     await upload(large, 16 * 1024 * 1024);
     await upload(probe, 1);
     for (const method of ["GET", "PUT"]) {
-      const measurements = { controlRoundTrip: [], cancelAndRecover: [] },
-        memoryBytes = [];
+      const measurements = { controlRoundTrip: [], cancelAndRecover: [] };
+      const sampled = {
+        memoryBytes: [],
+        heldMemoryBytes: [],
+        retainedMemoryGrowthBytes: [],
+        runtimeFdCount: [],
+        processCount: [],
+      };
       for (let sample = -3; sample < samples; sample++) {
+        const before = await resources();
         const names = Array.from({ length: 16 }, () => randomUUID() + ".bin");
         const held = names.map((name) =>
           holdTransfer(method === "GET" ? large : base + name, method),
@@ -178,19 +201,50 @@ export async function benchmarkFiles({ socket, origin, samples }) {
           start = performance.now();
           await Promise.all(held.map((entry) => entry.close()));
           await until(async () => {
-            const statuses = await runBatch(async () => {
-              const response = await fetch(probe, {
+            // Small requests can finish before later requests enter; hold all recovered slots open.
+            const recovered = Array.from({ length: 16 }, () =>
+              holdTransfer(large, "GET"),
+            );
+            try {
+              const admitted = await Promise.allSettled(
+                recovered.map((entry) => entry.ready),
+              );
+              if (admitted.some((entry) => entry.status !== "fulfilled")) return false;
+              const rejected = await fetch(probe, {
                 signal: AbortSignal.timeout(5000),
               });
-              await response.arrayBuffer();
-              return response.status;
-            }, 16);
-            return statuses.every((status) => status === 200);
+              await rejected.arrayBuffer();
+              assert.equal(
+                rejected.status,
+                429,
+                "Recovered slots must be held simultaneously",
+              );
+              return true;
+            } finally {
+              await Promise.all(recovered.map((entry) => entry.close()));
+            }
           }, "Cancelled transfers retained capacity");
+          const after = await until(async () => {
+            const value = await resources();
+            return value.runtimeFdCount <= before.runtimeFdCount + 2 &&
+              value.processCount <= before.processCount + 2
+              ? value
+              : null;
+          }, "Cancelled transfers retained runtime resources");
+          assert(
+            after.memoryBytes - before.memoryBytes <= 128 * 1024 * 1024,
+            "Cancelled transfers retained excessive memory",
+          );
           if (sample >= 0) {
             measurements.controlRoundTrip.push(control);
             measurements.cancelAndRecover.push(performance.now() - start);
-            memoryBytes.push(memory);
+            sampled.memoryBytes.push(after.memoryBytes);
+            sampled.heldMemoryBytes.push(memory);
+            sampled.retainedMemoryGrowthBytes.push(
+              Math.max(0, after.memoryBytes - before.memoryBytes),
+            );
+            sampled.runtimeFdCount.push(after.runtimeFdCount);
+            sampled.processCount.push(after.processCount);
           }
         } finally {
           await Promise.all(held.map((entry) => entry.close()));
@@ -200,7 +254,7 @@ export async function benchmarkFiles({ socket, origin, samples }) {
         workload(
           `files-${method === "GET" ? "slow-reader" : "cancel-upload"}`,
           measurements,
-          { memoryBytes },
+          sampled,
         ),
       );
     }

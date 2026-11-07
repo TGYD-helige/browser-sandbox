@@ -89,6 +89,8 @@ export function comparePerformance(baseline, current) {
   }
   const resourceBudgets = {
     memoryBytes: [1.25, 64 * 1024 * 1024],
+    heldMemoryBytes: [1.25, 64 * 1024 * 1024],
+    retainedMemoryGrowthBytes: [1.25, 64 * 1024 * 1024],
     cpuMicros: [1.25, 50000],
     runtimeFdCount: [1, 4],
     processCount: [1, 2],

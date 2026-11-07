@@ -1,8 +1,37 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
+import { promisify } from "node:util";
 import WebSocket from "ws";
-import { execution, resources, workload } from "./benchmark-fixture.mjs";
+import { execution, resources, until, workload } from "./benchmark-fixture.mjs";
+
+const exec = promisify(execFile);
+export async function decodeFrameRgb(data) {
+  const decoded = exec(
+    "ffmpeg",
+    [
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      "pipe:0",
+      "-vf",
+      "format=rgb24,crop=1:1:16:16",
+      "-frames:v",
+      "1",
+      "-f",
+      "rawvideo",
+      "pipe:1",
+    ],
+    { timeout: 5000, maxBuffer: 1024 * 1024, encoding: "buffer" },
+  );
+  decoded.child.stdin.on("error", () => {});
+  decoded.child.stdin.end(Buffer.from(data, "base64"));
+  const { stdout } = await decoded;
+  assert.equal(stdout.length, 3, "Frame marker pixel was not decoded");
+  return [...stdout];
+}
 
 async function observe(viewerUrl) {
   const url = new URL(viewerUrl);
@@ -14,6 +43,7 @@ async function observe(viewerUrl) {
   ws.on("error", () => {});
   const closed = new Promise((resolve) => ws.once("close", resolve));
   const stats = { bytes: 0, frames: 0, times: [] };
+  let latest;
   let ready, failed;
   const first = new Promise((resolve, reject) => {
     ready = resolve;
@@ -29,7 +59,9 @@ async function observe(viewerUrl) {
     if (message.type !== "frame") return;
     stats.bytes += raw.length;
     stats.frames++;
-    stats.times.push(performance.now());
+    const receivedAt = performance.now();
+    stats.times.push(receivedAt);
+    latest = { data: message.data, receivedAt, sequence: stats.frames };
     ready();
     if (ws.readyState === WebSocket.OPEN)
       ws.send(JSON.stringify({ type: "ack", sequence: message.sequence }));
@@ -46,6 +78,7 @@ async function observe(viewerUrl) {
     await first;
     return {
       stats,
+      latest: () => latest,
       firstFrameMs: performance.now() - start,
       async close() {
         ws.terminate();
@@ -71,7 +104,7 @@ export async function benchmarkViewer({ socket, origin, samples }) {
     await cdp.call(
       "Runtime.evaluate",
       {
-        expression: `(() => { const c=document.createElement('canvas');c.width=640;c.height=360;document.body.replaceChildren(c);const x=c.getContext('2d');let frame=0;const draw=()=>{x.fillStyle='hsl('+((frame++*17)%360)+' 70% 45%)';x.fillRect(0,0,640,360);x.fillStyle='white';x.font='40px sans-serif';x.fillText(String(frame),40,100);requestAnimationFrame(draw);};draw();})()`,
+        expression: `(() => { document.body.style.margin='0';const c=document.createElement('canvas');c.width=640;c.height=360;document.body.replaceChildren(c);const x=c.getContext('2d');let frame=0;window.benchmarkMarker=[230,20,30];window.benchmarkDraw=()=>{x.fillStyle='hsl('+((frame++*17)%360)+' 70% 45%)';x.fillRect(0,0,640,360);x.fillStyle='white';x.font='40px sans-serif';x.fillText(String(frame),40,100);x.fillStyle='rgb('+window.benchmarkMarker.join(',')+')';x.fillRect(0,0,48,48);};const draw=()=>{window.benchmarkDraw();requestAnimationFrame(draw);};draw();})()`,
       },
       sessionId,
     );
@@ -88,6 +121,7 @@ export async function benchmarkViewer({ socket, origin, samples }) {
       if (count) {
         measurements.firstFrame = [];
         measurements.frameInterval = [];
+        measurements.updateToFrame = [];
       }
       const framesPerSecond = [];
       for (let sample = -3; sample < samples; sample++) {
@@ -95,11 +129,11 @@ export async function benchmarkViewer({ socket, origin, samples }) {
         try {
           for (let i = 0; i < count; i++)
             viewers.push(await observe(client.access.viewerUrl));
-          const before = await resources();
           let start = performance.now();
           for (let i = 0; i < 50; i++)
             assert((await cdp.call("Browser.getVersion")).product);
           const cdpTime = performance.now() - start;
+          const before = await resources();
           const offsets = viewers.map((viewer) => ({
             frames: viewer.stats.frames,
             bytes: viewer.stats.bytes,
@@ -109,39 +143,73 @@ export async function benchmarkViewer({ socket, origin, samples }) {
           // This is a fixed observation window, not synchronization for a state transition.
           await delay(500);
           const elapsed = performance.now() - start;
+          const endings = viewers.map((viewer, i) => ({
+            frames: viewer.stats.frames - offsets[i].frames,
+            bytes: viewer.stats.bytes - offsets[i].bytes,
+            times: viewer.stats.times.slice(offsets[i].times),
+          }));
           const after = await resources();
-          const frameCounts = viewers.map(
-            (viewer, i) => viewer.stats.frames - offsets[i].frames,
-          );
+          const frameCounts = endings.map((ending) => ending.frames);
           if (count)
             assert(
               frameCounts.every((frames) => frames >= 2),
               "Animated viewers must continue delivering frames",
             );
+          let updateToFrame;
+          if (count) {
+            const expected = [
+              [230, 20, 30],
+              [20, 220, 40],
+              [20, 40, 230],
+            ][(sample + 3) % 3];
+            const updatedAt = performance.now();
+            await cdp.call(
+              "Runtime.evaluate",
+              {
+                expression: `window.benchmarkMarker=${JSON.stringify(expected)};window.benchmarkDraw()`,
+              },
+              sessionId,
+            );
+            // Decode outside the CPU/bandwidth window; latency ends at frame receipt, before decoding.
+            const delivered = await Promise.all(
+              viewers.map(async (viewer) => {
+                let seen = 0;
+                return until(async () => {
+                  const image = viewer.latest();
+                  if (!image || image.receivedAt < updatedAt || image.sequence === seen)
+                    return null;
+                  seen = image.sequence;
+                  const rgb = await decodeFrameRgb(image.data);
+                  return rgb.every(
+                    (value, index) => Math.abs(value - expected[index]) <= 25,
+                  )
+                    ? { latency: image.receivedAt - updatedAt }
+                    : null;
+                }, "Viewer delivered stale renderer frames");
+              }),
+            );
+            updateToFrame = Math.max(...delivered.map((frame) => frame.latency));
+          }
           if (sample < 0) continue;
           measurements.cdpBatch.push(cdpTime);
           sampled.cpuMicros.push(
-            ((after.cpuMicros - before.cpuMicros) * 1000) / elapsed,
+            ((after.cpuMicros - before.cpuMicros) * 1000) /
+              (after.sampledAt - before.sampledAt),
           );
           sampled.memoryBytes.push(after.memoryBytes);
           sampled.runtimeFdCount.push(after.runtimeFdCount);
           sampled.processCount.push(after.processCount);
           sampled.viewerBytes.push(
-            (viewers.reduce(
-              (sum, viewer, i) => sum + viewer.stats.bytes - offsets[i].bytes,
-              0,
-            ) *
-              1000) /
-              elapsed,
+            (endings.reduce((sum, ending) => sum + ending.bytes, 0) * 1000) / elapsed,
           );
           if (count) {
+            measurements.updateToFrame.push(updateToFrame);
             measurements.firstFrame.push(
               Math.max(...viewers.map((viewer) => viewer.firstFrameMs)),
             );
-            const intervals = viewers.flatMap((viewer, i) => {
-              const times = viewer.stats.times.slice(offsets[i].times);
-              return times.slice(1).map((time, index) => time - times[index]);
-            });
+            const intervals = endings.flatMap(({ times }) =>
+              times.slice(1).map((time, index) => time - times[index]),
+            );
             measurements.frameInterval.push(Math.max(...intervals));
             framesPerSecond.push((Math.min(...frameCounts) * 1000) / elapsed);
           }
@@ -154,7 +222,7 @@ export async function benchmarkViewer({ socket, origin, samples }) {
           viewers: count,
           observationWindowMs: 500,
           framesPerSecond,
-          note: "Real authenticated viewer WebSockets with frame acknowledgements and an animated renderer. CPU and wire bytes are normalized per second. Frame intervals/first arrival measure protocol delivery, not image decoding or screen paint in a viewer browser.",
+          note: "Real authenticated viewer WebSockets with frame acknowledgements and an animated renderer. CPU and wire bytes are normalized per second. Correlated color markers measure renderer-update to matching-frame receipt; JPEG decoding is excluded from CPU/wire windows and the latency endpoint. Client UI screen paint is not measured.",
         }),
       );
     }

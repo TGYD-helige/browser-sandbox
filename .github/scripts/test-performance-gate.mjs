@@ -214,3 +214,52 @@ test("the real archive fixture holds GET and PUT body transfer at an observable 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("held transfers report an unexpected disconnect after admission", async () => {
+  const { createServer } = await import("node:http");
+  const { once } = await import("node:events");
+  const { holdTransfer } = await import("./benchmark-files.mjs");
+  let response;
+  const site = createServer((_req, res) => {
+    response = res;
+    res.writeHead(200, { "content-length": 1024 * 1024 });
+    res.write(Buffer.alloc(1024));
+  });
+  site.listen(0, "127.0.0.1");
+  await once(site, "listening");
+  const transfer = holdTransfer(`http://127.0.0.1:${site.address().port}/file`, "GET");
+  try {
+    await transfer.ready;
+    response.destroy();
+    await transfer.closed;
+    await assert.rejects(transfer.close(), /aborted|closed|reset/i);
+  } finally {
+    await transfer.close().catch(() => {});
+    site.closeAllConnections();
+    await new Promise((resolve) => site.close(resolve));
+  }
+});
+
+test("frame correlation decodes the rendered marker rather than trusting frame cadence", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { decodeFrameRgb } = await import("./benchmark-viewer.mjs");
+  const jpeg = execFileSync("ffmpeg", [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-f",
+    "lavfi",
+    "-i",
+    "color=c=0xe6141e:s=64x64",
+    "-frames:v",
+    "1",
+    "-f",
+    "image2pipe",
+    "-vcodec",
+    "mjpeg",
+    "pipe:1",
+  ]);
+  const rgb = await decodeFrameRgb(jpeg.toString("base64"));
+  assert(rgb.every((value, index) => Math.abs(value - [230, 20, 30][index]) < 5));
+  await assert.rejects(decodeFrameRgb(Buffer.from("not a frame").toString("base64")));
+});

@@ -24,7 +24,8 @@ fi
 runtime_args=()
 command_args=()
 if [[ -n "${BENCHMARK_OUTPUT:-}" ]]; then
-  runtime_args=(--entrypoint node -e BROWSER_ACCESS_PORT=8080)
+  # Keep periodic cold Node health probes outside measured CPU/latency; readiness is checked below.
+  runtime_args=(--entrypoint node --no-healthcheck -e BROWSER_ACCESS_PORT=8080)
   command_args=(--import /opt/browser-sandbox/.github/scripts/benchmark-observer.mjs /opt/browser-sandbox/dist/main.js)
 fi
 # Bash 3.2 treats an empty array as unset under nounset.
