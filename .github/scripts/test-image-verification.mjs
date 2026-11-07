@@ -14,7 +14,7 @@ test("only benchmark containers omit periodic healthchecks while keeping explici
   const trace = join(root, "trace");
   await writeFile(
     join(root, "docker"),
-    '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TRACE"\ncase "$1" in create) echo extraction ;; run) echo runtime ;; esac\n',
+    '#!/bin/sh\nprintf "%s\\n" "$*" >> "$TRACE"\ncase "$1" in create) echo extraction ;; run) case "$*" in *benchmark-cpu.mjs*affinity*) echo 2,5 ;; *) echo runtime ;; esac ;; esac\n',
     { mode: 0o700 },
   );
   for (const benchmark of [false, true]) {
@@ -34,8 +34,9 @@ test("only benchmark containers omit periodic healthchecks while keeping explici
       },
     );
     const calls = (await readFile(trace, "utf8")).trim().split("\n");
-    const launch = calls.find((line) => line.startsWith("run "));
+    const launch = calls.find((line) => line.startsWith("run -d "));
     assert.equal(launch.includes("--no-healthcheck"), benchmark);
+    assert.equal(launch.includes("--cpuset-cpus 2,5"), benchmark);
     assert.match(launch, /--security-opt no-new-privileges/);
     assert(
       calls.some(

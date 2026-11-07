@@ -187,7 +187,9 @@ if (process.argv[2] === "worker") {
       if (call) {
         pending.delete(id);
         clearTimeout(call.timer);
-        error ? call.reject(Error(error)) : call.resolve(result);
+        error
+          ? call.reject(Error(`${error} (fixture UID ${uid}, ${call.method})`))
+          : call.resolve(result);
       }
     });
     child.on("exit", () => {
@@ -205,7 +207,7 @@ if (process.argv[2] === "worker") {
           pending.delete(id);
           reject(Error("browser_smoke_timeout"));
         }, 55000);
-        pending.set(id, { resolve, reject, timer });
+        pending.set(id, { resolve, reject, timer, method });
         child.send({ id, method, params, sessionId });
       });
     const ready = call("Browser.getVersion");

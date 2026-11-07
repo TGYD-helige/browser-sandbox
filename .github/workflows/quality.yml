@@ -1,0 +1,145 @@
+name: Functional and performance gates
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      baseline_ref:
+        description: Baseline commit with preparation timing support
+        type: string
+        default: master
+      run_model:
+        description: Run the Pi model-driven session test (requires OPENAI secrets)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: browser-quality-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Sandboxed image (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: docker build -t browser-sandbox:local .
+      - name: Verify mounted Chrome extensions
+        run: VERIFY_EXTENSIONS=1 bash .github/scripts/verify-image.sh browser-sandbox:local
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: bash .github/scripts/benchmark-pair.sh "$BASE_REF" "performance-${{ matrix.runner }}"
+        env:
+          BASE_REF: ${{ inputs.baseline_ref || github.event.pull_request.base.sha || github.event.before }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: browser-performance-${{ matrix.runner }}-attempt-${{ github.run_attempt }}
+          path: performance-${{ matrix.runner }}/*.json
+          if-no-files-found: error
+        if: always()
+
+  viewer:
+    name: Live viewer and authentication E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: pnpm/action-setup@v4
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: docker build -t browser-sandbox:live-viewer .
+      - name: Verify sandboxed viewing and bundled authentication script
+        run: |
+          test -x "$CHROME_EXECUTABLE"
+          bash .github/scripts/verify-live-view.sh
+        env:
+          CHROME_EXECUTABLE: /usr/bin/google-chrome
+          VIEWER_OUTPUT: viewer-artifacts
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-viewer-attempt-${{ github.run_attempt }}
+          path: viewer-artifacts
+          if-no-files-found: warn
+
+  browser-session:
+    name: Pi browser-session E2E
+    env:
+      E2E_SCENARIO: session
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build browser runtime and harness images
+        run: |
+          docker build -t browser-sandbox:local .
+          docker build -f Dockerfile.e2e -t browser-sandbox-e2e:local .
+      - name: Pi scripted agent session handoff
+        run: node .github/scripts/e2e.mjs pi
+      - name: Pi model-driven agent session handoff
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_model) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          E2E_MODE: model
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL_NAME: ${{ vars.OPENAI_MODEL_NAME || secrets.OPENAI_MODEL_NAME }}
+        run: node .github/scripts/e2e.mjs pi
+
+  unused:
+    name: Unused browser overhead
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: docker build -t browser-sandbox:local .
+      - run: docker build -f Dockerfile.e2e -t browser-sandbox-e2e:local .
+      - run: node .github/scripts/e2e.mjs unused
+        env:
+          PERFORMANCE_OUTPUT: unused-harness-performance.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unused-harness-performance-attempt-${{ github.run_attempt }}
+          path: unused-harness-performance.json
+          if-no-files-found: error
+
+  gate:
+    name: Functional and performance gate
+    if: always()
+    needs: [image, viewer, browser-session, unused]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every functional and performance job
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: jq -e 'length == 4 and all(.[]; .result == "success")' <<< "$RESULTS"
