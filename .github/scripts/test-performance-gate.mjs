@@ -385,3 +385,12 @@ test("image verification cleans an acquired extraction container and preserves t
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("benchmark affinity selects two permitted CPUs without assuming CPU zero is available", async () => {
+  const { selectBenchmarkCpus } = await import("./benchmark-cpu.mjs");
+  assert.equal(selectBenchmarkCpus("0-3\n"), "0,1");
+  assert.equal(selectBenchmarkCpus("2,5-7"), "2,5");
+  assert.equal(selectBenchmarkCpus("4-5,8-11"), "4,5");
+  assert.throws(() => selectBenchmarkCpus("3"), /two available CPUs/);
+  assert.throws(() => selectBenchmarkCpus("invalid"), /Invalid effective CPU set/);
+});

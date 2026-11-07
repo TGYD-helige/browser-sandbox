@@ -36,8 +36,10 @@ fi
 runtime_args=()
 command_args=()
 if [[ -n "${BENCHMARK_OUTPUT:-}" ]]; then
+  # Quota alone can burst across every host CPU and then throttle latency-sensitive commands.
+  benchmark_cpus="$(docker run --rm --cap-drop ALL --security-opt no-new-privileges --entrypoint node "$image" /opt/browser-sandbox/.github/scripts/benchmark-cpu.mjs affinity)"
   # Keep periodic cold Node health probes outside measured CPU/latency; readiness is checked below.
-  runtime_args=(--entrypoint node --no-healthcheck -e BROWSER_ACCESS_PORT=8080)
+  runtime_args=(--entrypoint node --cpuset-cpus "$benchmark_cpus" --no-healthcheck -e BROWSER_ACCESS_PORT=8080)
   command_args=(--import /opt/browser-sandbox/.github/scripts/benchmark-observer.mjs /opt/browser-sandbox/dist/main.js)
 fi
 # Bash 3.2 treats an empty array as unset under nounset.

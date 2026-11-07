@@ -104,6 +104,8 @@ Run `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm lint`, and `pnpm t
 
 The **Functional and performance gates** workflow runs on pull requests and master pushes. It checks native AMD64/ARM64 images, extensions, live viewing and authentication, Pi session handoff, and unused-browser overhead. Its final **Functional and performance gate** check succeeds only when all four prerequisite jobs succeed; configure this check as required in branch protection to enforce it at merge time. The separate **Browser integration** workflow retains the harness and model-driven browser tests.
 
+Performance containers use a two-CPU affinity set as well as a two-CPU quota, with 2 GiB of memory. Pinning avoids quota-only bursts across all host cores followed by CFS throttling; reports include the effective CPU set and cgroup throttle counters for diagnosis. Periodic Docker healthcheck processes are excluded from measurements, while explicit startup readiness and renderer checks remain active.
+
 Performance runs use 20 measured samples after three warmups per workload, comparing the same measurement client against the base and proposed runtimes on the same runner. Duration budgets are baseline P95 × 1.25 + 25 ms. Raw samples and comparisons are uploaded as workflow artifacts, including on comparison failure.
 
 | Workload | Measurements and checks |

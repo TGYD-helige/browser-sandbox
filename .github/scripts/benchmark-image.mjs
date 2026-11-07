@@ -12,6 +12,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { connectCdp } from "../../dist/cdp.js";
 import { attachStorage, hostRequest } from "../../dist/host-client.js";
+import { readCpuAccounting } from "./benchmark-cpu.mjs";
 import { benchmarkExtended } from "./benchmark-extended.mjs";
 import { execution } from "./benchmark-fixture.mjs";
 import { benchmarkLoad } from "./benchmark-load.mjs";
@@ -163,6 +164,10 @@ if (process.argv[2] === "worker") {
   const cases = [];
   let browserVersion;
   try {
+    const cpuAccountingBefore = await readCpuAccounting();
+    const cpuSet = (
+      await readFile("/sys/fs/cgroup/cpuset.cpus.effective", "utf8")
+    ).trim();
     if (suite === "standard") {
       for (const [name, bytes] of [
         ["unused", -1],
@@ -370,12 +375,17 @@ if (process.argv[2] === "worker") {
           architecture: arch(),
           kernel: release(),
           cpu: cpus()[0]?.model,
+          cpuSet,
+          cpuAccounting: {
+            before: cpuAccountingBefore,
+            after: await readCpuAccounting(),
+          },
           browserVersion,
           samples,
           suite,
           warmups: 3,
           environment:
-            "Sandboxed image; 2 CPUs, 2 GiB RAM; real CDP renderer and local streaming HTTP archive store",
+            "Sandboxed image; 2 CPU affinity and quota, 2 GiB RAM; real CDP renderer and local streaming HTTP archive store",
           note: "First readiness includes client startup, Profile restore, browser startup, navigation, and screenshot. Finalization includes checkpoint, browser exit, encryption/archive, upload, and commit. HTTP transfer timings are measured at the local storage server. Profile acquisition and source lookup/restore are measured inside the runtime. Browser launch includes Browserless queue wait. Unused executions use a generic Node client without connecting CDP; real harness startup is measured separately. These measurements do not establish production/cloud latency or a comparative performance claim.",
           cases,
         },

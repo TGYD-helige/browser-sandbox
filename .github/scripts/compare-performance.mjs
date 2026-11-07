@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
 export function comparePerformance(baseline, current) {
-  for (const key of ["architecture", "browserVersion", "environment"])
+  for (const key of ["architecture", "browserVersion", "environment", "cpuSet"])
     assert.equal(current[key], baseline[key], `Incompatible benchmark ${key}`);
   assert(
     baseline.samples >= 20 && current.samples === baseline.samples,
