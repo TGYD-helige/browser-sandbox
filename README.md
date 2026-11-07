@@ -110,7 +110,7 @@ Performance runs use 20 measured samples after three warmups per workload, compa
 |---|---|
 | Unused, temporary, local persistent, and remote Profiles | Registration, Profile acquisition/restoration, browser launch, first rendered screenshot, finalization, and archive transfer. Local Profiles alternate execution UIDs; the larger fixture includes 100 persistent Cookies, IndexedDB, and 1,000 synthetic small files. |
 | Four clients competing for two browser slots | Slowest-client readiness/finalization, batch duration, throughput, and retained cgroup memory. |
-| CDP traffic | Small commands, four simultaneous connections, 1 MiB responses, and noisy screenshots larger than 1 MiB; fixed-work batch durations and throughput. |
+| CDP traffic | Small commands, four simultaneous connections, 1 MiB responses, and noisy screenshots larger than 1 MiB; fixed-work batch durations, per-command P95, throughput, normalized CPU, and memory. |
 | Slow archive restore/upload | A controlled first-chunk barrier holds the transfer until an unrelated execution registers, renders, and finalizes. That work must complete before the transfer is released. |
 | Queue cancellation | Cancel and finalize a third starting client behind two live browsers, reject its revoked grant, then release a slot and measure successor readiness. |
 | Files | Streamed 16 MiB transfers, four concurrent 4 MiB transfers, digest verification, slow readers, and cancelled uploads. Fill all sixteen transfer slots, confirm admission rejection, measure CDP responsiveness, then cancel and verify capacity recovery. |

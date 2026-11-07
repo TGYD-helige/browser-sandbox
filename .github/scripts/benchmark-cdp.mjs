@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execution, workload } from "./benchmark-fixture.mjs";
+import { execution, resources, summarize, workload } from "./benchmark-fixture.mjs";
 import { runBatch } from "./benchmark-load.mjs";
 
 export async function benchmarkCdp({ socket, origin, samples }) {
@@ -15,7 +15,8 @@ export async function benchmarkCdp({ socket, origin, samples }) {
       ["cdp-large-response", 4, false],
       ["cdp-screenshot", 1, false],
     ]) {
-      const measurements = { batch: [] };
+      const measurements = { batch: [], commandP95: [] };
+      const sampled = { cpuMicros: [], memoryBytes: [] };
       let transferredBytes = 0;
       if (name === "cdp-screenshot") {
         // Deterministic noisy pixels prevent a tiny blank PNG from hiding large-response costs.
@@ -28,10 +29,13 @@ export async function benchmarkCdp({ socket, origin, samples }) {
         );
       }
       for (let sample = -3; sample < samples; sample++) {
+        const before = await resources();
+        const roundTrips = [];
         const start = performance.now();
         let bytes = 0;
         const run = async () => {
           for (let i = 0; i < count; i++) {
+            const sent = performance.now();
             if (name === "cdp-screenshot") {
               const result = await cdp.call("Page.captureScreenshot", {}, sessionId);
               const size = Buffer.byteLength(result.data, "base64");
@@ -56,35 +60,41 @@ export async function benchmarkCdp({ socket, origin, samples }) {
               );
               if (large) bytes += result.value.length;
             }
+            roundTrips.push(performance.now() - sent);
           }
         };
         if (parallel) {
           await runBatch(async (index) => {
             // Browser.getVersion is valid on every browser-scoped CDP connection.
-            for (let i = 0; i < count; i++)
+            for (let i = 0; i < count; i++) {
+              const sent = performance.now();
               assert((await connections[index].call("Browser.getVersion")).product);
+              roundTrips.push(performance.now() - sent);
+            }
           }, 4);
         } else await run();
         const duration = performance.now() - start;
+        const after = await resources();
         if (sample >= 0) {
+          assert.equal(roundTrips.length, count * (parallel ? 4 : 1));
           measurements.batch.push(duration);
+          measurements.commandP95.push(summarize(roundTrips).p95Ms);
+          sampled.cpuMicros.push(
+            ((after.cpuMicros - before.cpuMicros) * 1000) / duration,
+          );
+          sampled.memoryBytes.push(after.memoryBytes);
           transferredBytes += bytes;
         }
       }
       const operations = count * (parallel ? 4 : 1);
       cases.push(
-        workload(
-          name,
-          measurements,
-          {},
-          {
-            operationsPerSample: operations,
-            operationsPerSecond:
-              (samples * operations * 1000) /
-              measurements.batch.reduce((a, b) => a + b, 0),
-            transferredBytes,
-          },
-        ),
+        workload(name, measurements, sampled, {
+          operationsPerSample: operations,
+          operationsPerSecond:
+            (samples * operations * 1000) /
+            measurements.batch.reduce((a, b) => a + b, 0),
+          transferredBytes,
+        }),
       );
     }
     return cases;
