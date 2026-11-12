@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import fs, { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer, get } from "node:http";
 import { createRequire } from "node:module";
 import { connect as connectSocket } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 import WebSocket, { WebSocketServer } from "ws";
@@ -135,8 +135,12 @@ test("file transfer admission stays occupied for slow clients and finish cancels
     });
     const url = wsEndpoint.replace(/^ws:/, "http:") + "/files/large.bin";
     assert.equal(
-      (await fetch(url, { method: "PUT", body: Buffer.alloc(16 * 1024 * 1024) }))
-        .status,
+      (
+        await fetch(url, {
+          method: "PUT",
+          body: Buffer.alloc(16 * 1024 * 1024),
+        })
+      ).status,
       201,
     );
     for (let i = 0; i < 16; i++) {
@@ -162,7 +166,10 @@ test("file transfer admission stays occupied for slow clients and finish cancels
     await Promise.all(closed);
     for (const response of clients.filter((client) => "statusCode" in client))
       assert.equal(response.complete, false);
-    const next = await f.gateway.command({ op: "register", executionId: ids[1] });
+    const next = await f.gateway.command({
+      op: "register",
+      executionId: ids[1],
+    });
     assert.equal(
       (await fetch(next.wsEndpoint.replace(/^ws:/, "http:") + "/files/missing")).status,
       404,
@@ -357,15 +364,16 @@ for (const cancellation of [true, false])
       },
     );
     const registration = (executionId) => ({
-      op: "register",
       executionId,
       executorUid: 100001,
       profileId: "shared",
-      archive: { seed: null },
     });
+    const storages = [];
+    const register = (executionId) =>
+      registerStored(f, storages, registration(executionId));
     let first, second;
     try {
-      const { wsEndpoint } = await f.gateway.command(registration(ids[0]), true);
+      const { wsEndpoint } = await register(ids[0]);
       first = new WebSocket(wsEndpoint);
       first.on("error", () => {});
       await once(first, "open");
@@ -378,7 +386,7 @@ for (const cancellation of [true, false])
       }
       if (!cancellation) await delay(1100);
       const nextId = cancellation ? ids[1] : ids[0];
-      const next = await f.gateway.command(registration(nextId), true);
+      const next = await register(nextId);
       second = new WebSocket(next.wsEndpoint);
       second.on("error", () => {});
       await once(second, "open");
@@ -407,6 +415,7 @@ for (const cancellation of [true, false])
       allowRelease.resolve();
       first?.terminate();
       second?.terminate();
+      for (const storage of storages) storage.close();
       await f.stop();
     }
   });
@@ -448,18 +457,15 @@ test("failed initialization releases its Profile lease before another execution 
       },
     },
   );
+  const storages = [];
   try {
     for (const executionId of ids) {
-      const { wsEndpoint } = await f.gateway.command(
-        {
-          op: "register",
-          executionId,
-          executorUid: 100001,
-          profileId: "shared-profile",
-          archive: { seed: null },
-        },
-        true,
-      );
+      const registration = {
+        executionId,
+        executorUid: 100001,
+        profileId: "shared-profile",
+      };
+      const { wsEndpoint } = await registerStored(f, storages, registration);
       const socket = new WebSocket(wsEndpoint);
       socket.on("error", () => {});
       const [, reason] = await once(socket, "close");
@@ -470,6 +476,7 @@ test("failed initialization releases its Profile lease before another execution 
     assert.equal(releases, 2);
     assert.equal(held, false);
   } finally {
+    for (const storage of storages) storage.close();
     await f.stop();
   }
 });
@@ -479,6 +486,19 @@ async function waitFor(predicate) {
     assert.ok(Date.now() < until, "timed out");
     await delay(10);
   }
+}
+async function registerStored(f, storages, registration) {
+  storages.push(await attachTestStorage(f, registration));
+  return f.gateway.command({ op: "register", ...registration, storage: true }, true);
+}
+// Remote Profiles are reachable only through an attached host storage adapter.
+function attachTestStorage(f, registration, adapter = {}) {
+  return attachStorage(join(f.root, "control.sock"), registration, {
+    load: async () => ({ seed: null }),
+    save: async () => ({ target: {} }),
+    commit: async (result) => ({ confirmedSha: result.archive.sha256 }),
+    ...adapter,
+  });
 }
 async function storageAdapter(f, request, handler) {
   const socket = connectSocket(join(f.root, "control.sock.auth"));
@@ -1227,6 +1247,88 @@ for (const queuedFirst of [false, true])
     }
   });
 
+test("CDP replies settle in-flight commands in any field order while events pass through", async () => {
+  const f = await fixture(
+    async ({ endpoint }) => ({ endpoint, close: async () => {} }),
+    (socket, data) => {
+      const { id } = JSON.parse(String(data));
+      socket.send(JSON.stringify({ method: "Page.event", params: { id } }));
+      socket.send(id % 2 ? `{"result":{},"id":${id}}` : `{"id":${id},"result":{}}`);
+    },
+  );
+  let client;
+  try {
+    const { wsEndpoint } = await f.gateway.command({
+      op: "register",
+      executionId: ids[0],
+    });
+    client = new WebSocket(wsEndpoint);
+    client.on("error", () => {});
+    await once(client, "open");
+    // Each reply shape alone exceeds the 4096 in-flight bound unless replies settle it.
+    for (let batch = 0; batch < 10; batch++) {
+      let replies = 0;
+      const settled = new Promise((resolve, reject) => {
+        client.once("close", () => reject(Error("proxy closed the connection")));
+        client.on("message", function onReply(data) {
+          if (JSON.parse(String(data)).method) return;
+          if (++replies < 1000) return;
+          client.off("message", onReply);
+          client.removeAllListeners("close");
+          resolve();
+        });
+      });
+      for (let i = 0; i < 1000; i++)
+        client.send(
+          JSON.stringify({ id: batch * 1000 + i, method: "Runtime.evaluate" }),
+        );
+      await settled;
+    }
+    assert.equal(client.readyState, WebSocket.OPEN);
+  } finally {
+    client?.terminate();
+    await f.stop();
+  }
+});
+
+test("finish removes execution data without following a directory swapped for a link", {
+  skip: process.platform !== "linux",
+}, async (t) => {
+  const f = await fixture(async () => {
+    throw Error("must not launch");
+  });
+  const outside = join(f.root, "outside");
+  try {
+    await f.gateway.command({ op: "register", executionId: ids[0] });
+    const files = join(f.root, "data", ids[0], "files");
+    await mkdir(join(files, "sub"));
+    await writeFile(join(files, "sub", "owned"), "remove");
+    await mkdir(outside);
+    await writeFile(join(outside, "keep"), "keep");
+    const open = fs.open.bind(fs);
+    let swapped = false;
+    t.mock.method(fs, "open", async (name, ...args) => {
+      const handle = await open(name, ...args);
+      if (!swapped && basename(String(name)) === "sub") {
+        swapped = true;
+        await fs.rename(join(files, "sub"), join(f.root, "moved"));
+        await fs.symlink(outside, join(files, "sub"));
+      }
+      return handle;
+    });
+    await f.gateway.command({ op: "finish", executionId: ids[0] });
+    t.mock.restoreAll();
+    assert(swapped, "execution cleanup must walk through pinned descriptors");
+    assert.equal(await readFile(join(outside, "keep"), "utf8"), "keep");
+    await assert.rejects(stat(join(f.root, "data", ids[0])), {
+      code: "ENOENT",
+    });
+  } finally {
+    t.mock.restoreAll();
+    await f.stop();
+  }
+});
+
 test("legacy registration reuses its execution browser without storing credentials in the caller workspace", async () => {
   let launched = 0,
     closed = 0;
@@ -1253,7 +1355,7 @@ test("legacy registration reuses its execution browser without storing credentia
       workspace: join(f.root, "project", "1"),
     });
     assert.notEqual(a.wsEndpoint, b.wsEndpoint);
-    assert.equal((await stat(join(f.root, "control.sock"))).mode & 0o777, 0o600);
+    assert.equal((await stat(join(f.root, "control.sock.auth"))).mode & 0o777, 0o600);
     await disconnect(await connect(a.wsEndpoint));
     await disconnect(await connect(a.wsEndpoint));
     assert.equal(launched, 1);
@@ -1576,7 +1678,9 @@ for (const code of [
       assert.equal(status, 1011);
       assert.equal(String(reason), code);
       await f.gateway.command({ op: "finish", executionId: ids[0] });
-      await assert.rejects(verifyTarget(f.gateway, WebSocket), { message: code });
+      await assert.rejects(verifyTarget(f.gateway, WebSocket), {
+        message: code,
+      });
     } finally {
       peer?.terminate();
       await f.stop();
@@ -1846,14 +1950,15 @@ test("remote Profile cleanup requires runtime upload and explicit host publicati
       },
     },
   );
+  let storage;
   try {
-    const request = {
-      op: "register",
+    const registration = {
       executionId: ids[0],
       executorUid: 100001,
       profileId: "generic-profile",
-      archive: { target: {} },
     };
+    storage = await attachTestStorage(f, registration);
+    const request = { op: "register", ...registration, storage: true };
     const { wsEndpoint } = await f.gateway.command(request, true);
     const peer = await connect(wsEndpoint);
     await assert.rejects(
@@ -1891,6 +1996,7 @@ test("remote Profile cleanup requires runtime upload and explicit host publicati
     console.error("profile-contract:", error.message);
     throw error;
   } finally {
+    storage?.close();
     await f.stop();
   }
 });
@@ -1992,15 +2098,17 @@ for (const cancel of [false, true])
       },
     );
     const path = join(f.root, "control.sock"),
-      request = {
-        op: "register",
+      registration = {
         executionId: ids[0],
         executorUid: 100001,
         profileId: "agent-profile",
-        archive,
-      };
-    let raw;
+      },
+      request = { op: "register", ...registration, storage: true };
+    let raw, storage;
     try {
+      storage = await attachTestStorage(f, registration, {
+        save: async () => ({ target: archive.target }),
+      });
       const registered = await hostRequest(path, request);
       const peer = await connect(registered.wsEndpoint);
       let saving;
@@ -2060,6 +2168,7 @@ for (const cancel of [false, true])
     } finally {
       releaseUpload();
       raw?.destroy();
+      storage?.close();
       await f.stop();
       upload.closeAllConnections();
       await new Promise((resolve) => upload.close(resolve));
@@ -2196,7 +2305,11 @@ test("human takeover cancels a pending idle retirement until control is released
         message.method === "Target.getTargets"
           ? {
               targetInfos: [
-                { type: "page", targetId: "page", url: "https://example.com/login" },
+                {
+                  type: "page",
+                  targetId: "page",
+                  url: "https://example.com/login",
+                },
               ],
             }
           : message.method === "Target.attachToTarget"
@@ -2313,7 +2426,11 @@ test("failed readback restores idle retirement after disconnecting automation", 
       if (message.method === "Target.getTargets")
         result = {
           targetInfos: [
-            { type: "page", targetId: "page", url: "https://example.com/login" },
+            {
+              type: "page",
+              targetId: "page",
+              url: "https://example.com/login",
+            },
           ],
         };
       if (message.method === "Target.attachToTarget") result = { sessionId: "session" };
@@ -2346,19 +2463,40 @@ test("failed readback restores idle retirement after disconnecting automation", 
 });
 
 test("application credential binding is unsupported and CDP commands pass through", async () => {
-  const f = await fixture(async ({ endpoint }) => ({
-    endpoint,
-    close: async () => {},
-  }));
+  const f = await fixture(
+    async ({ endpoint }) => ({
+      endpoint,
+      close: async () => {},
+    }),
+    undefined,
+    { resolvePeerUid: () => 100001 },
+  );
   try {
     const path = join(f.root, "control.sock");
     await assert.rejects(
       hostRequest(path, { op: "authenticate", executionId: ids[0] }),
       /browser_request_invalid/,
     );
+    // An endpoint without an execution UID would skip the kernel peer check.
+    await assert.rejects(
+      hostRequest(path, { op: "register", executionId: ids[0] }),
+      /browser_executor_identity_invalid/,
+    );
+    for (const op of ["register", "endpoint", "profile_finalize", "finalize"])
+      await assert.rejects(
+        hostRequest(path, {
+          op,
+          executionId: ids[0],
+          executorUid: 100001,
+          profileId: "inline-archive",
+          archive: { seed: null },
+        }),
+        /browser_profile_binding_invalid/,
+      );
     const { wsEndpoint } = await hostRequest(path, {
       op: "register",
       executionId: ids[0],
+      executorUid: 100001,
     });
     const socket = await connect(wsEndpoint);
     try {
@@ -2381,7 +2519,10 @@ test("revocation capacity fences new identities while existing executions can fi
     throw Error("must not launch");
   });
   try {
-    const live = await f.gateway.command({ op: "register", executionId: ids[0] });
+    const live = await f.gateway.command({
+      op: "register",
+      executionId: ids[0],
+    });
     for (let index = 0; index < 65536; index++)
       await f.gateway.command(
         {
@@ -2563,7 +2704,12 @@ test("Profile preparation is bounded before browser admission and queued work is
       const executionId = randomUUID();
       entries.push(executionId);
       const { wsEndpoint } = await f.gateway.command(
-        { op: "register", executionId, executorUid: 100001, profileId: "bounded/" + i },
+        {
+          op: "register",
+          executionId,
+          executorUid: 100001,
+          profileId: "bounded/" + i,
+        },
         true,
       );
       const client = new WebSocket(wsEndpoint);
@@ -2679,22 +2825,19 @@ test("Profile saves share bounded admission, cancel queued work and keep ordinar
   );
   const entries = [],
     clients = [],
-    saving = [];
+    saving = [],
+    storages = [];
   const abort = new AbortController();
   try {
     for (let i = 0; i < 3; i++) {
       const executionId = randomUUID();
       entries.push(executionId);
-      const { wsEndpoint } = await f.gateway.command(
-        {
-          op: "register",
-          executionId,
-          executorUid: 100001,
-          profileId: `save/${i}`,
-          archive: {},
-        },
-        true,
-      );
+      const registration = {
+        executionId,
+        executorUid: 100001,
+        profileId: `save/${i}`,
+      };
+      const { wsEndpoint } = await registerStored(f, storages, registration);
       clients.push(await connect(wsEndpoint));
     }
     saving.push(
@@ -2719,6 +2862,7 @@ test("Profile saves share bounded admission, cancel queued work and keep ordinar
     await hostRequest(join(f.root, "control.sock"), {
       op: "register",
       executionId: ordinary,
+      executorUid: 100001,
     });
     await hostRequest(join(f.root, "control.sock"), {
       op: "finish",
@@ -2737,6 +2881,7 @@ test("Profile saves share bounded admission, cancel queued work and keep ordinar
     abort.abort();
     await Promise.allSettled(saving);
     for (const client of clients) client.terminate();
+    for (const storage of storages) storage.close();
     await f.stop();
   }
 });
@@ -2789,7 +2934,12 @@ test("Profile releases share admission with preparation even when its ordinary q
       const executionId = randomUUID();
       entries.push(executionId);
       const { wsEndpoint } = await f.gateway.command(
-        { op: "register", executionId, executorUid: 100001, profileId: `release/${i}` },
+        {
+          op: "register",
+          executionId,
+          executorUid: 100001,
+          profileId: `release/${i}`,
+        },
         true,
       );
       clients.push(await connect(wsEndpoint));
@@ -2800,7 +2950,12 @@ test("Profile releases share admission with preparation even when its ordinary q
       const executionId = randomUUID();
       entries.push(executionId);
       const { wsEndpoint } = await f.gateway.command(
-        { op: "register", executionId, executorUid: 100001, profileId: `release/${i}` },
+        {
+          op: "register",
+          executionId,
+          executorUid: 100001,
+          profileId: `release/${i}`,
+        },
         true,
       );
       const client = new WebSocket(wsEndpoint);
@@ -2875,19 +3030,16 @@ test("failed Profile restores retain admission for ownership recovery before lat
     },
   );
   const clients = [],
-    closed = [];
+    closed = [],
+    storages = [];
   try {
     for (let i = 0; i < 3; i++) {
-      const { wsEndpoint } = await f.gateway.command(
-        {
-          op: "register",
-          executionId: randomUUID(),
-          executorUid: 100001,
-          profileId: `failed/${i}`,
-          archive: {},
-        },
-        true,
-      );
+      const registration = {
+        executionId: randomUUID(),
+        executorUid: 100001,
+        profileId: `failed/${i}`,
+      };
+      const { wsEndpoint } = await registerStored(f, storages, registration);
       const client = new WebSocket(wsEndpoint);
       client.on("error", () => {});
       clients.push(client);
@@ -2905,6 +3057,7 @@ test("failed Profile restores retain admission for ownership recovery before lat
   } finally {
     gate.resolve();
     for (const client of clients) client.terminate();
+    for (const storage of storages) storage.close();
     await f.stop();
   }
 });

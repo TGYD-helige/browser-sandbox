@@ -6,7 +6,11 @@ import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { clearWindowState, createLocalProfiles } from "../dist/local-profiles.js";
+import {
+  clearWindowState,
+  createLocalProfiles,
+  removeTree,
+} from "../dist/local-profiles.js";
 
 const linux = process.platform === "linux" && process.getuid?.() === 0;
 const readAs = (uid, file) =>
@@ -15,6 +19,53 @@ const readAs = (uid, file) =>
     ["--reuid=" + uid, "--regid=" + uid, "--clear-groups", "cat", file],
     { stdio: ["ignore", "pipe", "pipe"] },
   ).toString();
+
+test("tree removal never follows a directory swapped for a link after it was opened", {
+  skip: process.platform !== "linux",
+}, async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "remove-swap-"));
+  try {
+    const tree = path.join(root, "tree"),
+      outside = path.join(root, "outside");
+    await fs.mkdir(path.join(tree, "sub"), { recursive: true });
+    await fs.writeFile(path.join(tree, "sub", "owned"), "remove");
+    await fs.mkdir(outside);
+    await fs.writeFile(path.join(outside, "keep"), "keep");
+    const open = fs.open.bind(fs);
+    let swapped = false;
+    t.mock.method(fs, "open", async (name, ...args) => {
+      const handle = await open(name, ...args);
+      if (!swapped && path.basename(String(name)) === "sub") {
+        swapped = true;
+        await fs.rename(path.join(tree, "sub"), path.join(root, "moved"));
+        await fs.symlink(outside, path.join(tree, "sub"));
+      }
+      return handle;
+    });
+    await removeTree(tree);
+    assert(swapped);
+    assert.equal(await fs.readFile(path.join(outside, "keep"), "utf8"), "keep");
+    await assert.rejects(fs.lstat(tree), { code: "ENOENT" });
+  } finally {
+    t.mock.restoreAll();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("tree removal handles nesting deeper than its descriptor bound", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "remove-deep-"));
+  try {
+    const tree = path.join(root, "tree");
+    let leaf = tree;
+    for (let depth = 0; depth < 200; depth++) leaf = path.join(leaf, "d");
+    await fs.mkdir(leaf, { recursive: true });
+    await fs.writeFile(path.join(leaf, "file"), "deep");
+    await removeTree(tree);
+    assert.deepEqual(await fs.readdir(root), []);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 test("cancelled Profile handoff stops traversal, rolls back acquisition and permits retry", {
   skip: !linux,
@@ -120,7 +171,10 @@ test("window cleanup cannot traverse an execution-owned Default symlink", {
     outside = path.join(root, "outside");
   await fs.mkdir(profile, { mode: 0o700 });
   await fs.chown(profile, 100001, 100001);
-  await fs.mkdir(path.join(outside, "Sessions"), { recursive: true, mode: 0o700 });
+  await fs.mkdir(path.join(outside, "Sessions"), {
+    recursive: true,
+    mode: 0o700,
+  });
   await fs.writeFile(path.join(outside, "Sessions", "sentinel"), "keep");
   execFileSync(
     process.execPath,
@@ -180,9 +234,11 @@ test("window cleanup pins nested directories against execution rename races", {
     return entries;
   });
   try {
-    await assert.rejects(clearWindowState(profile));
+    // Cleanup removes the swapped-in link itself and never its target.
+    await clearWindowState(profile);
     assert(replaced);
     assert.equal(await fs.readFile(path.join(outside, "sentinel"), "utf8"), "keep");
+    await assert.rejects(fs.lstat(state), { code: "ENOENT" });
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

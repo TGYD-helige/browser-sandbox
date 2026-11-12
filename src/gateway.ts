@@ -1,4 +1,4 @@
-import { chmod, mkdir, rm } from "node:fs/promises";
+import { chmod, mkdir } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
@@ -73,7 +73,6 @@ export async function createGateway({
   });
   await mkdir(join(socketPath, ".."), { recursive: true, mode: 0o700 });
   await chmod(join(socketPath, ".."), 0o755);
-  await rm(socketPath, { force: true });
   try {
     remote = access
       ? await createAccessServer({

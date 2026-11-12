@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { channel } from "node:diagnostics_channel";
-import { chmod, lstat, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type WebSocket from "ws";
@@ -12,6 +12,7 @@ import {
 import {
   clearWindowState,
   createLocalProfiles,
+  removeTree,
   validProfileId,
 } from "./local-profiles.js";
 import { normalizeAllowedDomains } from "./network-policy.js";
@@ -63,7 +64,6 @@ export interface Execution {
   profileUsed?: boolean;
   profileRestored?: boolean;
   finalizing?: boolean;
-  archive?: any;
   finalized?: any;
   takeover?: Takeover;
   observation?: Observation;
@@ -75,6 +75,8 @@ const preparationTiming = channel("browser-sandbox.preparation");
 
 const MAX_REVOKED_EXECUTIONS = 65536;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+const validExecutorUid = (uid) =>
+  Number.isInteger(uid) && uid >= 100000 && uid < 2000000000;
 const fail = (code) => {
   throw Error(code);
 };
@@ -111,7 +113,6 @@ export async function createExecutions({
     executionId,
     executorUid = undefined,
     profileId = undefined,
-    archive = undefined,
     storage = undefined,
     allowedDomains = undefined,
   }) {
@@ -119,16 +120,13 @@ export async function createExecutions({
     const domains = normalizeAllowedDomains(allowedDomains);
     if (
       (executorUid !== undefined || profileId !== undefined) &&
-      (!Number.isInteger(uid) || uid < 100000 || uid >= 2000000000)
+      !validExecutorUid(uid)
     )
       fail("browser_executor_identity_invalid");
     if (!uuid.test(executionId ?? "")) fail("browser_identity_invalid");
     if (profileId !== undefined && !validProfileId(profileId))
       fail("browser_profile_binding_invalid");
-    if (
-      storage !== undefined &&
-      (storage !== true || !profileId || archive !== undefined)
-    )
+    if (storage !== undefined && (storage !== true || !profileId))
       fail("browser_profile_binding_invalid");
     if (revoked.has(executionId)) fail("browser_execution_revoked");
     let entry = executions.get(executionId);
@@ -141,8 +139,6 @@ export async function createExecutions({
     if (entry && JSON.stringify(entry.allowedDomains) !== JSON.stringify(domains))
       fail("browser_domains_changed");
     if (entry && entry.uid !== uid) fail("browser_identity_mismatch");
-    if (entry && !entry.profileUsed && !entry.starting && archive !== undefined)
-      entry.archive = archive;
     if (entry?.finalizing) fail("browser_profile_finalizing");
     if (entry?.revoked) {
       // Explicit registration can resume a failed quiesce only after retirement.
@@ -196,7 +192,6 @@ export async function createExecutions({
           filesDir: join(root, "files"),
           debugPort,
           profileId,
-          archive,
           storageRequired: storage === true,
           capability: randomBytes(32).toString("hex"),
           peers: new Set(),
@@ -297,11 +292,13 @@ export async function createExecutions({
       if (entry.profileLease)
         await profileWork.cleanup(() => entry.profileLease.release(signal), signal);
       entry.profileLease = null;
-      await rm(entry.root, { recursive: true, force: true });
+      await removeTree(entry.root);
     }
   }
   async function command(request, host = false, fromSocket = false, signal) {
     if (closing) fail("browser_stopping");
+    // Grants travel only through the attached storage channel, so a stale host fails loudly instead of skipping its upload.
+    if (request.archive !== undefined) fail("browser_profile_binding_invalid");
     if (signal?.aborted) fail("browser_request_cancelled");
     if (request.op === "session") {
       if (!host) fail("browser_host_authority_required");
@@ -424,17 +421,20 @@ export async function createExecutions({
         fail("browser_host_authority_required");
       const entry = executions.get(request.executionId);
       if (!entry) return { status: "absent" };
-      if (!entry.profileId || !entry.profileUsed) return { used: false };
+      if (!entry.storageRequired || !entry.profileUsed) return { used: false };
       entry.finalizing = true;
       await close(entry, false);
       if (signal?.aborted) fail("browser_request_cancelled");
       if (!entry.finalized) {
-        entry.finalized = await profileWork.run(async () => {
-          const archive = entry.storageRequired
-            ? await requestArchive(entry, "save", signal)
-            : (request.archive ?? entry.archive);
-          return profileArchive.save(entry, archive, signal);
-        }, signal);
+        entry.finalized = await profileWork.run(
+          async () =>
+            profileArchive.save(
+              entry,
+              await requestArchive(entry, "save", signal),
+              signal,
+            ),
+          signal,
+        );
       }
       return entry.finalized;
     }
@@ -445,8 +445,6 @@ export async function createExecutions({
       if (entry.revoked) fail("browser_execution_revoked");
       if (entry.profileId !== request.profileId)
         fail("browser_profile_binding_changed");
-      if (!entry.profileUsed && !entry.starting && request.archive !== undefined)
-        entry.archive = request.archive;
       return {
         protocol: "browser-sandbox.host/v1",
         executorUid: entry.uid,
@@ -458,13 +456,8 @@ export async function createExecutions({
     if (request.op === "register") {
       if (request.profileId !== undefined && !host)
         fail("browser_host_authority_required");
-      if (
-        fromSocket &&
-        !host &&
-        (!Number.isInteger(request.executorUid) ||
-          request.executorUid < 100000 ||
-          request.executorUid >= 2000000000)
-      )
+      // Without an execution UID the endpoint skips the kernel peer check and becomes a bearer URL.
+      if (fromSocket && !validExecutorUid(request.executorUid))
         fail("browser_executor_identity_invalid");
       return register(request);
     }
@@ -477,7 +470,7 @@ export async function createExecutions({
     if (entry?.profileId && !host) fail("browser_host_authority_required");
     if (
       request.op === "finish" &&
-      (entry?.archive || entry?.storageRequired) &&
+      entry?.storageRequired &&
       entry.profileUsed &&
       (!entry.finalized ||
         typeof request.confirmedSha !== "string" ||
@@ -510,7 +503,11 @@ export async function createExecutions({
     if (!entry.starting) {
       entry.session.starting();
       let hardExpiresAt: number;
-      const phases = { profileAcquireMs: 0, profileRestoreMs: 0, browserLaunchMs: 0 };
+      const phases = {
+        profileAcquireMs: 0,
+        profileRestoreMs: 0,
+        browserLaunchMs: 0,
+      };
       const abort = (entry.abort = new AbortController());
       let acquiredLease: Awaited<ReturnType<typeof profileStore.acquire>>;
       const starting = Promise.resolve(entry.reusable)
@@ -532,11 +529,9 @@ export async function createExecutions({
               }
               entry.profileDir = entry.profileLease.profileDir;
               entry.journalDir = entry.profileLease.journalDir;
-              if ((entry.archive || entry.storageRequired) && !entry.profileRestored) {
+              if (entry.storageRequired && !entry.profileRestored) {
                 const start = performance.now();
-                const archive = entry.storageRequired
-                  ? await requestArchive(entry, "load", abort.signal)
-                  : entry.archive;
+                const archive = await requestArchive(entry, "load", abort.signal);
                 await profileArchive.restore(entry, archive, abort.signal);
                 phases.profileRestoreMs = performance.now() - start;
                 entry.profileRestored = true;
@@ -580,7 +575,10 @@ export async function createExecutions({
           if (entry.starting === starting && !entry.revoked && !abort.signal.aborted) {
             entry.session.ready(hardExpiresAt);
             if (preparationTiming.hasSubscribers)
-              preparationTiming.publish({ executionId: entry.executionId, ...phases });
+              preparationTiming.publish({
+                executionId: entry.executionId,
+                ...phases,
+              });
           }
           // Watch Browserless/Chrome even while no MCP client is attached.
           browser.closed?.then(() => retire(entry, starting)).catch(() => {});
@@ -716,7 +714,7 @@ export async function createExecutions({
       const cleanup = await Promise.allSettled(
         [...executions.values()].map(async (entry) => {
           try {
-            if ((entry.archive || entry.storageRequired) && entry.profileUsed) {
+            if (entry.storageRequired && entry.profileUsed) {
               await close(entry, false);
               fail("browser_profile_save_unconfirmed");
             }

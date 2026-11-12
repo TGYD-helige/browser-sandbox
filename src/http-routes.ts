@@ -14,7 +14,6 @@ export function createHttpHandler({
       : executions.resolve(capability);
     if (
       !entry ||
-      executions.closing ||
       (!resolveAccess &&
         entry.uid >= 100000 &&
         (await resolvePeerUid(socket)) !== entry.uid) ||
