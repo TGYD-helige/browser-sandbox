@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createCipheriv, createHash, randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -194,17 +194,17 @@ test("save cancellation stops filesystem traversal and preserves the recoverable
   await fs.mkdir(entry.profileDir);
   await fs.writeFile(path.join(entry.profileDir, "saved"), "recoverable");
   const readdir = fs.readdir.bind(fs),
-    lstat = fs.lstat.bind(fs);
+    open = fs.open.bind(fs);
   let continued = false;
-  t.mock.method(fs, "readdir", async (name, ...args) => {
-    const result = await readdir(name, ...args);
-    if (name === entry.profileDir) controller.abort();
+  // Linux traverses through /proc/self/fd, so the first listing is the Profile root.
+  t.mock.method(fs, "readdir", async (...args) => {
+    const result = await readdir(...args);
+    controller.abort();
     return result;
   });
-  t.mock.method(fs, "lstat", async (name, ...args) => {
-    if (controller.signal.aborted && name === path.join(entry.profileDir, "saved"))
-      continued = true;
-    return lstat(name, ...args);
+  t.mock.method(fs, "open", async (name, ...args) => {
+    if (controller.signal.aborted && String(name).endsWith("/saved")) continued = true;
+    return open(name, ...args);
   });
   const archive = createProfileArchive({
     fetchImpl: async () => {
@@ -229,6 +229,137 @@ test("save cancellation stops filesystem traversal and preserves the recoverable
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test("save never follows a Profile entry the execution swaps for a link after inspection", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "archive-swap-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const entry = {
+    journalDir: path.join(root, "journal"),
+    profileDir: path.join(root, "journal", "profile"),
+    profileId: "swap",
+    profileVersion: "Google Chrome 146.0.7680.177",
+  };
+  const victim = path.join(entry.profileDir, "a"),
+    secret = path.join(root, "secret");
+  await fs.mkdir(entry.profileDir, { recursive: true });
+  await fs.writeFile(victim, "original");
+  await fs.writeFile(secret, "SECRET!!");
+  let swapped = false;
+  const swap = async () => {
+    if (swapped) return;
+    swapped = true;
+    await fs.unlink(victim);
+    await fs.symlink(secret, victim);
+  };
+  // Swap right after the runtime inspects the entry, whichever call it uses.
+  for (const method of ["open", "lstat"]) {
+    const original = fs[method].bind(fs);
+    t.mock.method(fs, method, async (name, ...args) => {
+      const result = await original(name, ...args);
+      if (path.basename(String(name)) === "a") await swap();
+      return result;
+    });
+  }
+  let uploaded;
+  const archive = createProfileArchive({
+    fetchImpl: async (_url, options) => {
+      const chunks = [];
+      for await (const chunk of options.body) chunks.push(chunk);
+      uploaded = Buffer.concat(chunks);
+      return new Response("", { status: 200 });
+    },
+  });
+  const key = "a".repeat(64);
+  try {
+    const result = await archive
+      .save(entry, { target: { key, url: "object" } })
+      .catch((error) => ({ error }));
+    assert.equal(swapped, true);
+    if (result.error) {
+      assert.match(result.error.message, /browser_profile_entry_unsafe/);
+      return;
+    }
+    const decipher = createDecipheriv(
+      "aes-256-gcm",
+      Buffer.from(key, "hex"),
+      Buffer.from(result.archive.iv, "hex"),
+    );
+    decipher.setAAD(Buffer.from(entry.profileId + "\n" + entry.profileVersion));
+    decipher.setAuthTag(Buffer.from(result.archive.tag, "hex"));
+    const plain = Buffer.concat([decipher.update(uploaded), decipher.final()]);
+    assert(
+      !plain.includes(Buffer.from("SECRET!!")),
+      "archived a file outside the Profile",
+    );
+    assert(plain.includes(Buffer.from("original")));
+  } finally {
+    t.mock.restoreAll();
+  }
+});
+
+test("save rejects Profile nesting beyond the shared descriptor bound", async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "archive-deep-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const entry = {
+    journalDir: root,
+    profileDir: path.join(root, "profile"),
+    profileId: "deep",
+    profileVersion: "Google Chrome 146.0.7680.177",
+  };
+  let leaf = entry.profileDir;
+  for (let depth = 0; depth < 130; depth++) leaf = path.join(leaf, "d");
+  await fs.mkdir(leaf, { recursive: true });
+  const archive = createProfileArchive({
+    fetchImpl: async () => {
+      throw Error("must not upload");
+    },
+  });
+  await assert.rejects(
+    archive.save(entry, { target: { key: "a".repeat(64), url: "unused" } }),
+    /browser_profile_capacity_exceeded/,
+  );
+  assert.deepEqual((await fs.readdir(root)).sort(), ["profile"]);
+});
+
+test("restore clears the old Profile without following a directory swapped for a link", {
+  skip: process.platform !== "linux",
+}, async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "archive-restore-swap-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const entry = {
+    journalDir: path.join(root, "journal"),
+    profileDir: path.join(root, "journal", "profile"),
+    profileId: "restore-swap",
+    uid: process.getuid(),
+    gid: process.getgid(),
+  };
+  const outside = path.join(root, "outside");
+  await fs.mkdir(path.join(entry.profileDir, "sub"), { recursive: true });
+  await fs.writeFile(path.join(entry.profileDir, "sub", "old"), "old");
+  await fs.mkdir(outside);
+  await fs.writeFile(path.join(outside, "keep"), "keep");
+  const open = fs.open.bind(fs);
+  let swapped = false;
+  t.mock.method(fs, "open", async (name, ...args) => {
+    const handle = await open(name, ...args);
+    if (!swapped && path.basename(String(name)) === "sub") {
+      swapped = true;
+      await fs.rename(path.join(entry.profileDir, "sub"), path.join(root, "moved"));
+      await fs.symlink(outside, path.join(entry.profileDir, "sub"));
+    }
+    return handle;
+  });
+  try {
+    await createProfileArchive({
+      browserVersion: async () => "Google Chrome 146.0.7680.177",
+    }).restore(entry, { seed: null });
+  } finally {
+    t.mock.restoreAll();
+  }
+  assert(swapped, "restore must clear the old Profile through pinned descriptors");
+  assert.equal(await fs.readFile(path.join(outside, "keep"), "utf8"), "keep");
+  assert.deepEqual(await fs.readdir(entry.profileDir), []);
 });
 
 test("restore cancellation drains pending writes before reporting failure and never hands off a partial tree", async (t) => {

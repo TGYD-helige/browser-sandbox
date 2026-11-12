@@ -39,7 +39,7 @@ const { wsEndpoint } = await hostRequest(socketPath, {
 await hostRequest(socketPath, { op: 'finalize', executionId });
 ```
 
-Use a fresh UUID for each execution. Execution UIDs are in 100000–1999999999 and must not be recycled while old processes or grants survive. UID 20001 is reserved for the runtime's internal renderer probe and legacy internal test paths; production hosts must explicitly provide an execution UID. These are Linux deployment constraints, not business identities.
+Use a fresh UUID for each execution. Every host-control registration must supply an executorUid in 100000–1999999999; requests without one are rejected with browser_executor_identity_invalid, because the endpoint is bound to the kernel peer UID. Do not recycle a UID while old processes or grants survive. To let several harnesses or sessions share one runtime, give each session its own executionId and executorUid; each then gets an independent browser, endpoint, and Profile lease. UID 20001 is reserved for the runtime's internal renderer probe; in-process createGateway().command registrations without executorUid also use it and skip the peer check, so use them only for trusted local tooling. These are Linux deployment constraints, not business identities.
 
 | Operation | Semantics |
 |---|---|
@@ -73,7 +73,7 @@ Use the full execution-scoped WebSocket endpoint. Check readiness through /healt
 
 ## Keep Profiles in remote storage
 
-Remote storage is optional. Attach a host storage adapter before first CDP connection, keep the channel alive through finalization, and register the Profile with storage: true. Provide these three host operations:
+Remote storage is optional. Attach a host storage adapter before first CDP connection, keep the channel alive through finalization, and register the Profile with storage: true. Control requests that pass an inline archive grant are rejected with browser_profile_binding_invalid. Provide these three host operations:
 
 | Method | Host responsibility |
 |---|---|
@@ -101,7 +101,7 @@ Some CDP clients, including Chrome DevTools MCP, treat loopback endpoints as loc
 
 | Variable | Default / role |
 |---|---|
-| BROWSER_CONTROL_SOCKET | /run/browser-sandbox/control.sock; trusted control uses the .auth suffix |
+| BROWSER_CONTROL_SOCKET | /run/browser-sandbox/control.sock; the runtime listens only on this path with the .auth suffix, mode 0600 |
 | CONCURRENT | 2 Browserless instances |
 | QUEUED | 4 queued requests |
 | TIMEOUT | 1800000 ms total Browserless timeout |

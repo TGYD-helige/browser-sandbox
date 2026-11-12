@@ -1,3 +1,16 @@
+// Chrome serializes command replies with "id" first; events start with "method" and settle nothing.
+function replyId(data) {
+  const head = String(data.subarray?.(0, 32) ?? data);
+  const match = /^\{"id":(\d+)[,}]/.exec(head);
+  if (match) return Number(match[1]);
+  if (head.startsWith('{"method"')) return undefined;
+  try {
+    return JSON.parse(String(data)).id;
+  } catch {
+    return undefined;
+  }
+}
+
 export function attachCdpProxy({
   server,
   WebSocket,
@@ -108,9 +121,7 @@ export function attachCdpProxy({
             pendingBytes = 0;
           });
           upstream.on("message", (data, binary) => {
-            try {
-              pair.inflight.delete(JSON.parse(String(data)).id);
-            } catch {}
+            if (pair.inflight.size) pair.inflight.delete(replyId(data));
             if (client.bufferedAmount + data.length > 32 * 1024 * 1024)
               return cleanup();
             if (isCurrentConnection() && client.readyState === WebSocket.OPEN)
