@@ -39,7 +39,7 @@ COPY --from=build /build/dist ./dist
 COPY --from=build /build/node_modules ./node_modules
 COPY package.json ./
 COPY examples ./examples
-COPY .github/scripts/image-smoke.mjs .github/scripts/image-layout.mjs .github/scripts/benchmark-image.mjs .github/scripts/benchmark-observer.mjs ./.github/scripts/
+COPY .github/scripts/benchmark-*.mjs .github/scripts/image-smoke.mjs .github/scripts/image-layout.mjs ./.github/scripts/
 COPY config/seccomp-source.json ./seccomp-source.json
 RUN chmod -R go-w /opt/browser-sandbox \
   && chmod 0755 /opt/browser-sandbox/dist/chrome.js \

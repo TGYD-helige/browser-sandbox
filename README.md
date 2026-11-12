@@ -98,6 +98,35 @@ Only one execution may use a Profile at a time. Persistent data survives executi
 - **Pay for work when used.** Defer browser startup and storage work until needed; keep slow transfers off unrelated control paths.
 - **Preserve safety and data.** Keep sandboxing, authorization, cancellation, exclusive Profile access, and recoverable failure handling intact.
 
+## Verification
+
+Run `pnpm install --frozen-lockfile`, `pnpm typecheck`, `pnpm lint`, and `pnpm test` locally. Linux isolation checks require the supported Linux environment; use `pnpm test:linux` when running from another operating system.
+
+The **Functional and performance gates** workflow runs on pull requests and master pushes. It checks native AMD64/ARM64 images, extensions, live viewing and authentication, Pi session handoff, and unused-browser overhead. Its final **Functional and performance gate** check succeeds only when all four prerequisite jobs succeed; configure this check as required in branch protection to enforce it at merge time. The separate **Browser integration** workflow retains the harness and model-driven browser tests.
+
+Performance containers use a two-CPU affinity set as well as a two-CPU quota, with 2 GiB of memory. Pinning avoids quota-only bursts across all host cores followed by CFS throttling; reports include the effective CPU set and cgroup throttle counters for diagnosis. Periodic Docker healthcheck processes are excluded from measurements, while explicit startup readiness and renderer checks remain active.
+
+Performance runs use 20 measured samples per workload, comparing the same measurement client against the base and proposed runtimes on the same runner. Each runtime runs in two containers of 10 samples after three warmups, in baseline, proposed, proposed, baseline order, so runner drift does not penalize whichever runtime runs second. A duration check fails only when both the median and the P95 exceed baseline × 1.25 + 25 ms; with 20 samples, P95 is the second-largest value, so a tail alone is treated as runner noise. Raw samples and comparisons are uploaded as workflow artifacts, including on comparison failure.
+
+| Workload | Measurements and checks |
+|---|---|
+| Unused, temporary, local persistent, and remote Profiles | Registration, Profile acquisition/restoration, browser launch, first rendered screenshot, finalization, and archive transfer. Local Profiles alternate execution UIDs; the larger fixture includes 100 persistent Cookies, IndexedDB, and 1,000 synthetic small files. |
+| Four clients competing for two browser slots | Slowest-client readiness/finalization, batch duration, throughput, and retained cgroup memory. |
+| CDP traffic | Small commands, four simultaneous connections, 1 MiB responses, and noisy screenshots larger than 1 MiB; fixed-work batch durations, per-command P95, throughput, normalized CPU, and memory. |
+| Slow archive restore/upload | A controlled first-chunk barrier holds the transfer until an unrelated execution registers, renders, and finalizes. That work must complete before the transfer is released. |
+| Queue cancellation | Cancel and finalize a third starting client behind two live browsers, reject its revoked grant, then release a slot and measure successor readiness. |
+| Files | Streamed 16 MiB transfers, four concurrent 4 MiB transfers, digest verification, slow readers, and cancelled uploads. Fill all sixteen transfer slots, confirm admission rejection, measure CDP responsiveness, then cancel, reacquire sixteen simultaneously held slots, and check memory/FD/process recovery. |
+| Viewer | Zero, one, or four authenticated viewer WebSockets against an animated page; first frame, frame intervals, correlated renderer-update delivery, CDP latency, CPU, memory, runtime file descriptors, process count, frame rate, and wire traffic. |
+| Repeated lifecycles | Real navigation/screenshots and finalization, with execution directory removal checked after every cycle and resource growth checked across batches. |
+
+Resource maxima have separate initial regression budgets: memory uses baseline × 1.25 + 64 MiB, normalized CPU usage uses baseline × 1.25 + 50,000 microseconds per second, viewer traffic uses baseline × 1.25 + 64 KiB per second, runtime file descriptors allow four additional descriptors, and process count allows two additional processes. Temporary disk usage allows baseline × 1.25 + 64 KiB. Repeated-lifecycle runs additionally reject growth beyond 128 MiB of memory, four runtime descriptors, two processes, or 64 KiB of temporary data between the median first and last five batches, even if the baseline also grows.
+
+For manual quality runs, select `baseline_ref` and optionally disable the Pi model-driven session test with `run_model`. The baseline must support preparation timing diagnostics and the access listener; missing required measurements fail the run. Model-driven steps need the configured OpenAI-compatible endpoint, model, and API-key settings and are skipped for fork pull requests.
+
+The separate **Browser performance soak** workflow runs on manual dispatch or on pull requests carrying the `performance-soak` label and defaults to 500 measured lifecycles in each of the two containers per image, plus warmup cycles, on both architectures. Its `cycles` input accepts multiples of 20 from 100 to 2,000. The ordinary PR workflow includes a shorter run of 10 cycles per container. The long workflow is not a required PR check.
+
+These controlled fixtures are regression guards, not production SLAs or proof that all leaks are absent. Profile payload sizes describe injected data rather than total archive size. Viewer timings correlate a renderer color update with received JPEG content; marker decoding runs outside the CPU/bandwidth observation window and is excluded from the latency endpoint. Client screen paint is not measured. The viewer fixture reuses Chrome’s native JPEG decoding through an offscreen canvas. Storage uses a local controlled HTTP server; network/cloud latency and real-site variability require workload-specific measurements.
+
 ## References
 
 - [Browserless](https://github.com/browserless/browserless) — upstream browser infrastructure used for startup, concurrency, queueing, and session timeouts.
