@@ -106,7 +106,7 @@ The **Functional and performance gates** workflow runs on pull requests and mast
 
 Performance containers use a two-CPU affinity set as well as a two-CPU quota, with 2 GiB of memory. Pinning avoids quota-only bursts across all host cores followed by CFS throttling; reports include the effective CPU set and cgroup throttle counters for diagnosis. Periodic Docker healthcheck processes are excluded from measurements, while explicit startup readiness and renderer checks remain active.
 
-Performance runs use 20 measured samples after three warmups per workload, comparing the same measurement client against the base and proposed runtimes on the same runner. Duration budgets are baseline P95 × 1.25 + 25 ms. Raw samples and comparisons are uploaded as workflow artifacts, including on comparison failure.
+Performance runs use 20 measured samples per workload, comparing the same measurement client against the base and proposed runtimes on the same runner. Each runtime runs in two containers of 10 samples after three warmups, in baseline, proposed, proposed, baseline order, so runner drift does not penalize whichever runtime runs second. A duration check fails only when both the median and the P95 exceed baseline × 1.25 + 25 ms; with 20 samples, P95 is the second-largest value, so a tail alone is treated as runner noise. Raw samples and comparisons are uploaded as workflow artifacts, including on comparison failure.
 
 | Workload | Measurements and checks |
 |---|---|
@@ -123,7 +123,7 @@ Resource maxima have separate initial regression budgets: memory uses baseline �
 
 For manual quality runs, select `baseline_ref` and optionally disable the Pi model-driven session test with `run_model`. The baseline must support preparation timing diagnostics and the access listener; missing required measurements fail the run. Model-driven steps need the configured OpenAI-compatible endpoint, model, and API-key settings and are skipped for fork pull requests.
 
-The separate **Browser performance soak** workflow runs on manual dispatch or on pull requests carrying the `performance-soak` label and defaults to 500 measured lifecycles per image, plus warmup cycles, on both architectures. Its `cycles` input accepts multiples of 20 from 100 to 2,000. The ordinary PR workflow includes a shorter 20-cycle run. The long workflow is not a required PR check.
+The separate **Browser performance soak** workflow runs on manual dispatch or on pull requests carrying the `performance-soak` label and defaults to 500 measured lifecycles in each of the two containers per image, plus warmup cycles, on both architectures. Its `cycles` input accepts multiples of 20 from 100 to 2,000. The ordinary PR workflow includes a shorter run of 10 cycles per container. The long workflow is not a required PR check.
 
 These controlled fixtures are regression guards, not production SLAs or proof that all leaks are absent. Profile payload sizes describe injected data rather than total archive size. Viewer timings correlate a renderer color update with received JPEG content; marker decoding runs outside the CPU/bandwidth observation window and is excluded from the latency endpoint. Client screen paint is not measured. The viewer fixture reuses Chrome’s native JPEG decoding through an offscreen canvas. Storage uses a local controlled HTTP server; network/cloud latency and real-site variability require workload-specific measurements.
 

@@ -2,6 +2,32 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
+// Concatenate samples from repeated runs of one runtime, e.g. the two halves of an ABBA schedule.
+export function mergeReports(runs) {
+  assert(runs.length > 0, "No benchmark reports");
+  const merged = structuredClone(runs[0]);
+  for (const run of runs.slice(1)) {
+    for (const key of [
+      "status",
+      "architecture",
+      "browserVersion",
+      "environment",
+      "cpuSet",
+    ])
+      assert.equal(run[key], merged[key], `Inconsistent repeated benchmark ${key}`);
+    merged.samples += run.samples;
+    for (const entry of merged.cases) {
+      const other = run.cases.find((candidate) => candidate.name === entry.name);
+      assert(other, `Missing workload ${entry.name}`);
+      for (const field of ["measurements", "resources"])
+        for (const [key, values] of Object.entries(entry[field] ?? {}))
+          values.push(...(other[field]?.[key] ?? []));
+      entry.retainedMemoryBytes?.push(...(other.retainedMemoryBytes ?? []));
+    }
+  }
+  return merged;
+}
+
 export function comparePerformance(baseline, current) {
   for (const report of [baseline, current])
     assert(
@@ -47,24 +73,26 @@ export function comparePerformance(baseline, current) {
       );
       for (const value of [...oldSamples, ...newSamples])
         assert(Number.isFinite(value) && value >= 0);
-      const deltas = newSamples
-        .map((value, index) => value - oldSamples[index])
-        .sort((a, b) => a - b);
+      const quantile = (values, q) =>
+        [...values].sort((a, b) => a - b)[Math.ceil(values.length * q) - 1];
+      const baselineMedianMs = quantile(oldSamples, 0.5),
+        currentMedianMs = quantile(newSamples, 0.5),
+        baselineP95Ms = quantile(oldSamples, 0.95),
+        currentP95Ms = quantile(newSamples, 0.95);
       // Initial CI regression guard, relative to the same runner's baseline; not a production SLA.
-      const p95 = (values) =>
-        [...values].sort((a, b) => a - b)[Math.ceil(values.length * 0.95) - 1];
-      const baselineP95Ms = p95(oldSamples),
-        currentP95Ms = p95(newSamples);
-      const limitMs = baselineP95Ms * 1.25 + 25;
+      const medianLimitMs = baselineMedianMs * 1.25 + 25,
+        p95LimitMs = baselineP95Ms * 1.25 + 25;
       comparisons.push({
         workload: before.name,
         phase,
+        baselineMedianMs,
+        currentMedianMs,
+        medianLimitMs,
         baselineP95Ms,
         currentP95Ms,
-        limitMs,
-        pairedMedianDeltaMs: deltas[Math.floor(deltas.length / 2)],
-        pairedP95DeltaMs: deltas[Math.ceil(deltas.length * 0.95) - 1],
-        passed: currentP95Ms <= limitMs,
+        p95LimitMs,
+        // With 20 samples P95 is the second-largest value; a tail alone is runner noise, a shifted median too is a regression.
+        passed: currentMedianMs <= medianLimitMs || currentP95Ms <= p95LimitMs,
       });
     }
   }
@@ -135,22 +163,33 @@ export function comparePerformance(baseline, current) {
   }
   return {
     resources,
-    budget: "baseline P95 * 1.25 + 25 ms",
+    budget: "fail when both median and P95 exceed baseline * 1.25 + 25 ms",
     passed: [...comparisons, ...resources].every((entry) => entry.passed),
     comparisons,
   };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const reports = await Promise.all(
-    process.argv.slice(2).map(async (file) => JSON.parse(await readFile(file, "utf8"))),
+  const files = process.argv.slice(2);
+  const split = files.indexOf("--");
+  const sides =
+    split === -1
+      ? files.map((file) => [file])
+      : [files.slice(0, split), files.slice(split + 1)];
+  assert(
+    sides.length === 2 && sides.every((side) => side.length > 0),
+    "Usage: compare-performance.mjs baseline.json... -- current.json...",
   );
-  assert.equal(
-    reports.length,
-    2,
-    "Usage: compare-performance.mjs baseline.json current.json",
+  const [baseline, current] = await Promise.all(
+    sides.map(async (side) =>
+      mergeReports(
+        await Promise.all(
+          side.map(async (file) => JSON.parse(await readFile(file, "utf8"))),
+        ),
+      ),
+    ),
   );
-  const result = comparePerformance(...reports);
+  const result = comparePerformance(baseline, current);
   console.log(JSON.stringify(result, null, 2));
   console.error(
     `Performance comparison: ${result.comparisons.length} duration and ${result.resources.length} resource checks; passed=${result.passed}`,

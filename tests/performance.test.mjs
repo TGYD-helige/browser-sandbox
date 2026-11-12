@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { comparePerformance } from "../.github/scripts/compare-performance.mjs";
+import {
+  comparePerformance,
+  mergeReports,
+} from "../.github/scripts/compare-performance.mjs";
 
 test("performance reports enforce the baseline budget and reject incompatible or missing measurements", () => {
   const report = (p95Ms) => ({
@@ -20,8 +23,8 @@ test("performance reports enforce the baseline budget and reject incompatible or
   assert.equal(comparePerformance(baseline, report(150)).passed, true);
   assert.equal(comparePerformance(baseline, report(151)).passed, false);
   assert.equal(
-    comparePerformance(baseline, report(120)).comparisons[0].pairedMedianDeltaMs,
-    20,
+    comparePerformance(baseline, report(120)).comparisons[0].currentMedianMs,
+    120,
   );
   assert.throws(
     () => comparePerformance(baseline, { ...report(100), architecture: "x64" }),
@@ -34,6 +37,39 @@ test("performance reports enforce the baseline budget and reject incompatible or
   assert.throws(
     () => comparePerformance(baseline, { ...report(100), samples: 10 }),
     /matching runs/,
+  );
+});
+
+test("performance budgets ignore tail-only noise but reject a shifted distribution", () => {
+  const report = (values) => ({
+    architecture: "x64",
+    browserVersion: "Chrome/146",
+    environment: "same runner",
+    samples: values.length,
+    cases: [
+      {
+        name: "temporary",
+        phases: { finalize: {} },
+        measurements: { finalize: values },
+      },
+    ],
+  });
+  const baseline = report(Array(20).fill(50));
+  const tail = [...Array(18).fill(50), 190, 190];
+  assert.equal(comparePerformance(baseline, report(tail)).passed, true);
+  assert.equal(comparePerformance(baseline, report(Array(20).fill(200))).passed, false);
+  const halves = [report(Array(10).fill(50)), report(Array(10).fill(200))];
+  const merged = mergeReports(halves);
+  assert.equal(merged.samples, 20);
+  assert.equal(merged.cases[0].measurements.finalize.length, 20);
+  assert.equal(halves[0].cases[0].measurements.finalize.length, 10);
+  assert.throws(
+    () => mergeReports([halves[0], { ...halves[1], architecture: "arm64" }]),
+    /architecture/,
+  );
+  assert.throws(
+    () => mergeReports([halves[0], { ...halves[1], cases: [] }]),
+    /Missing workload/,
   );
 });
 

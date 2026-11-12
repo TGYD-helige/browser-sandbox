@@ -221,7 +221,7 @@ Image CI publishes `browser-performance-<runner>` JSON artifacts for AMD64 and A
 
 First readiness includes the CDP client, archive restoration, Chrome startup, navigation, and screenshot. Finalization includes checkpoint, browser exit, archive/encryption, upload, and reference commit. Storage runs over local HTTP in the test namespace; these measurements do not establish production storage latency, an optimization speedup, or an agreed production performance threshold. `scripts/benchmark.mjs` remains a separate synthetic gateway diagnostic.
 
-To collect the image benchmark locally, build the image and run `BENCHMARK_OUTPUT=/tmp/browser-performance.json bash .github/scripts/verify-image.sh browser-sandbox:local`. Set `BENCHMARK_SAMPLES` between 10 and 100 to change the measured sample count.
+To collect the image benchmark locally, build the image and run `BENCHMARK_OUTPUT=/tmp/browser-performance.json bash .github/scripts/verify-image.sh browser-sandbox:local`. Set `BENCHMARK_SAMPLES` between 10 and 100 to change the measured sample count. To compare two runtimes, run `.github/scripts/benchmark-pair.sh <baseline-commit> <output-directory>`; it splits an even `BENCHMARK_SAMPLES` of at least 20 across alternating baseline and proposed containers.
 
 ## Runtime admission and cancellation limits
 
