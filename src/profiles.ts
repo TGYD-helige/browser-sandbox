@@ -7,7 +7,13 @@ import path from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
-import { clearWindowState } from "./local-profiles.js";
+import {
+  clearWindowState,
+  MAX_TREE_DEPTH,
+  noFollowFlags,
+  pinnedPath,
+  removeTree,
+} from "./local-profiles.js";
 
 // Resolve the pinned archive dependency only when persistence is used.
 const require = createRequire(import.meta.url);
@@ -137,42 +143,57 @@ async function pack(root, output, signal?: AbortSignal) {
   writing.catch(() => {});
   let bytes = 0,
     count = 0;
-  async function visit(relative) {
+  // The execution UID still owns the Profile here, so read only through descriptors opened without following links.
+  async function visit(relative: string, location: string) {
     signal?.throwIfAborted();
     if (transient(relative)) return;
     if (!safeName(relative)) throw Error("browser_profile_entry_unsafe");
-    const absolute = path.join(root, relative),
-      stat = await fs.lstat(absolute);
-    signal?.throwIfAborted();
-    if (
-      ++count > MAX_FILES ||
-      (!stat.isFile() && !stat.isDirectory()) ||
-      (stat.nlink > 1 && stat.isFile())
-    )
-      throw Error("browser_profile_entry_unsafe");
-    if (stat.isDirectory()) {
-      await new Promise<void>((resolve, reject) =>
-        archive.entry({ name: relative, type: "directory", mode: 0o700 }, (error) =>
-          error ? reject(error) : resolve(),
-        ),
-      );
-      for (const child of (await fs.readdir(absolute)).sort())
-        await visit(relative + "/" + child);
-    } else {
-      if ((bytes += stat.size) > MAX_PROFILE_BYTES)
-        throw Error("browser_profile_capacity_exceeded");
-      const entry = archive.entry({
-        name: relative,
-        size: stat.size,
-        mode: 0o600,
-      });
-      await pipeline(createReadStream(absolute), entry, { signal });
+    // Each level holds a descriptor, so one Profile cannot exhaust descriptors other executions share.
+    if (relative.split("/").length > MAX_TREE_DEPTH)
+      throw Error("browser_profile_capacity_exceeded");
+    const file = await fs.open(location, noFollowFlags).catch((error) => {
+      throw ["ELOOP", "ENXIO"].includes(error.code)
+        ? Error("browser_profile_entry_unsafe")
+        : error;
+    });
+    try {
+      const stat = await file.stat();
+      signal?.throwIfAborted();
+      if (
+        ++count > MAX_FILES ||
+        (!stat.isFile() && !stat.isDirectory()) ||
+        (stat.nlink > 1 && stat.isFile())
+      )
+        throw Error("browser_profile_entry_unsafe");
+      if (stat.isDirectory()) {
+        await new Promise<void>((resolve, reject) =>
+          archive.entry({ name: relative, type: "directory", mode: 0o700 }, (error) =>
+            error ? reject(error) : resolve(),
+          ),
+        );
+        const directory = pinnedPath(file, location);
+        for (const child of (await fs.readdir(directory)).sort())
+          await visit(relative + "/" + child, path.join(directory, child));
+      } else {
+        if ((bytes += stat.size) > MAX_PROFILE_BYTES)
+          throw Error("browser_profile_capacity_exceeded");
+        const entry = archive.entry({
+          name: relative,
+          size: stat.size,
+          mode: 0o600,
+        });
+        await pipeline(file.createReadStream({ autoClose: false, start: 0 }), entry, {
+          signal,
+        });
+      }
+    } finally {
+      await file.close();
     }
   }
   try {
-    await visit("profile");
+    await visit("profile", path.join(root, "profile"));
     if (await fs.stat(path.join(root, "cookies.json")).catch(() => null))
-      await visit("cookies.json");
+      await visit("cookies.json", path.join(root, "cookies.json"));
     archive.finalize();
     await writing;
   } catch (error) {
@@ -254,7 +275,7 @@ export function createProfileArchive({
           );
         }
         signal?.throwIfAborted();
-        await fs.rm(entry.profileDir, { recursive: true, force: true });
+        await removeTree(entry.profileDir, signal);
         await fs.rm(path.join(root, "cookies.json"), { force: true });
         if (seed) await extract(plain, root, entry.uid, entry.gid, signal);
         else {

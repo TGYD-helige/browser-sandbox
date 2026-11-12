@@ -1,58 +1,114 @@
 import { spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
 export const validProfileId = (value) =>
   typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(value);
+/** Every recursive walk holds a descriptor per level, so all walks share one depth bound. */
+export const MAX_TREE_DEPTH = 128;
+export const noFollowFlags =
+  constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+const directoryFlags = noFollowFlags | constants.O_DIRECTORY;
+/** Linux resolves children through an open descriptor, so a swapped ancestor is never followed. */
+export const pinnedPath = (handle: { fd: number }, name: string) =>
+  process.platform === "linux" ? "/proc/self/fd/" + handle.fd : name;
+const unlinkEntry = (name: string) =>
+  fs.unlink(name).then(
+    () => true,
+    (error) => {
+      if (error.code === "ENOENT") return true;
+      if (error.code !== "EISDIR" && error.code !== "EPERM") throw error;
+      return false;
+    },
+  );
+/** Remove a tree whose contents an execution UID may still rename or replace with links. */
+export async function removeTree(
+  name: string,
+  signal?: AbortSignal,
+  maxEntries = Infinity,
+) {
+  let count = 0,
+    root: string;
+  const spilled: string[] = [];
+  const admit = (entries: number) => {
+    signal?.throwIfAborted();
+    if ((count += entries) > maxEntries)
+      throw Error("browser_profile_capacity_exceeded");
+  };
+  const remove = async (target: string, depth = 0) => {
+    admit(1);
+    const directory = await fs.open(target, directoryFlags).catch(async (error) => {
+      if (error.code === "ENOENT") return null;
+      if (error.code !== "ENOTDIR" && error.code !== "ELOOP") throw error;
+      await fs.unlink(target);
+      return null;
+    });
+    if (!directory) return;
+    try {
+      const pinned = pinnedPath(directory, target),
+        directories: string[] = [],
+        files: string[] = [];
+      if (depth === 0) root = pinned;
+      for (const item of await fs.readdir(pinned, { withFileTypes: true }))
+        (item.isDirectory() ? directories : files).push(path.join(pinned, item.name));
+      // unlink never follows links; a listed file since swapped for a directory takes the pinned walk.
+      for (let i = 0; i < files.length; i += 32) {
+        const batch = files.slice(i, i + 32);
+        admit(batch.length);
+        const removed = await Promise.all(batch.map(unlinkEntry));
+        directories.push(...batch.filter((_file, j) => !removed[j]));
+      }
+      for (const child of directories) {
+        if (depth < 63) {
+          await remove(child, depth + 1);
+          continue;
+        }
+        // Hold at most 64 descriptors: move deeper subtrees under the pinned root and remove them from there.
+        const spill = path.join(root, ".removing-" + randomBytes(8).toString("hex"));
+        await fs.rename(child, spill).then(
+          () => spilled.push(spill),
+          (error) => {
+            if (error.code !== "ENOENT") throw error;
+          },
+        );
+      }
+      while (depth === 0 && spilled.length) await remove(spilled.pop(), 1);
+    } finally {
+      await directory.close();
+    }
+    signal?.throwIfAborted();
+    // The name may now be a link the execution swapped in; remove the link, never its target.
+    await fs.rmdir(target).catch(async (error) => {
+      if (error.code === "ENOENT") return;
+      if (error.code !== "ENOTDIR") throw error;
+      await fs.unlink(target);
+    });
+  };
+  await remove(name);
+}
 export async function clearWindowState(profileDir, signal?: AbortSignal) {
   signal?.throwIfAborted();
-  const flags =
-    constants.O_RDONLY |
-    constants.O_NOFOLLOW |
-    constants.O_NONBLOCK |
-    constants.O_DIRECTORY;
-  const profile = await fs.open(profileDir, flags).catch((error) => {
+  const profile = await fs.open(profileDir, directoryFlags).catch((error) => {
     if (error.code !== "ENOENT") throw error;
     return null;
   });
   if (!profile) return;
   let defaults: Awaited<ReturnType<typeof fs.open>>;
-  let count = 0;
-  const pinned = (fd, name) =>
-    process.platform === "linux" ? "/proc/self/fd/" + fd.fd : name;
-  const remove = async (name, depth = 0) => {
-    signal?.throwIfAborted();
-    if (++count > 100_000 || depth > 128)
-      throw Error("browser_profile_capacity_exceeded");
-    const directory = await fs.open(name, flags).catch(async (error) => {
-      if (error.code === "ENOENT") return null;
-      if (error.code !== "ENOTDIR" && error.code !== "ELOOP") throw error;
-      await fs.unlink(name);
-      return null;
-    });
-    if (!directory) return;
-    try {
-      for (const item of await fs.readdir(pinned(directory, name)))
-        await remove(path.join(pinned(directory, name), item), depth + 1);
-    } finally {
-      await directory.close();
-    }
-    signal?.throwIfAborted();
-    await fs.rmdir(name);
-  };
   try {
     // Linux isolation pins both ancestors across concurrent execution renames.
-    const root = pinned(profile, profileDir);
-    defaults = await fs.open(path.join(root, "Default"), flags).catch((error) => {
-      if (error.code !== "ENOENT") throw error;
-      return null;
-    });
+    const root = pinnedPath(profile, profileDir);
+    defaults = await fs
+      .open(path.join(root, "Default"), directoryFlags)
+      .catch((error) => {
+        if (error.code !== "ENOENT") throw error;
+        return null;
+      });
     if (!defaults) return;
-    const directory = pinned(defaults, path.join(root, "Default"));
+    const directory = pinnedPath(defaults, path.join(root, "Default"));
     for (const name of ["Sessions", "Session Storage"])
-      await remove(path.join(directory, name));
+      await removeTree(path.join(directory, name), signal, 100_000);
   } finally {
     await defaults?.close();
     await profile.close();
@@ -64,12 +120,9 @@ async function ownTree(directory, uid, signal?: AbortSignal) {
   let count = 0;
   const visit = async (name, depth = 0, parallel = true) => {
     signal?.throwIfAborted();
-    if (++count > 100_000 || depth > 128)
+    if (++count > 100_000 || depth > MAX_TREE_DEPTH)
       throw Error("browser_profile_capacity_exceeded");
-    const fd = await fs.open(
-      name,
-      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-    );
+    const fd = await fs.open(name, noFollowFlags);
     try {
       const stat = await fd.stat();
       if (
