@@ -24,6 +24,7 @@ let stage = "cluster setup";
 let installed = false;
 let clusterAttempted = false;
 let cordoned;
+let heldFinalizer;
 let extraction;
 const run = (binary, args, { input, timeout = 180000, env = {} } = {}) =>
   new Promise((resolve, reject) => {
@@ -226,7 +227,10 @@ try {
     "client",
     `--image=${clientImage}`,
     "--restart=Never",
-    "--overrides=" + JSON.stringify({ spec: { automountServiceAccountToken: false } }),
+    "--overrides=" +
+      JSON.stringify({
+        spec: { automountServiceAccountToken: false, nodeName: server },
+      }),
     "--command",
     "--",
     "node",
@@ -263,6 +267,16 @@ try {
     "worker.disruptionBudget.enabled=true",
     "--wait",
   ]);
+  await wait("Worker PDB status was not observed", async () => {
+    const budget = JSON.parse(
+      await kubectl("get", "pdb", `${deployment}-workers`, "-o", "json"),
+    );
+    return (
+      budget.status?.observedGeneration === budget.metadata.generation &&
+      budget.status.currentHealthy >= 1 &&
+      budget.status.desiredHealthy === 1
+    );
+  });
   cordoned = workerNode;
   await assert.rejects(
     run(
@@ -276,6 +290,7 @@ try {
       ],
       { timeout: 20000 },
     ),
+    /disruption budget/i,
   );
   assert(
     (await pods()).some(
@@ -314,16 +329,45 @@ try {
   assert.equal((await pods()).length, 0, "Drain silently replaced a lost worker");
   await run("kubectl", ["uncordon", workerNode]);
   cordoned = undefined;
+  stage = "safe uninstall";
   await client("hold");
-  await run("helm", [
-    "uninstall",
-    release,
-    "-n",
-    namespace,
-    "--wait",
-    "--timeout",
-    "90s",
-  ]);
+  const finalWorker = (await pods())[0];
+  heldFinalizer = finalWorker.metadata.name;
+  await kubectl(
+    "patch",
+    "pod",
+    heldFinalizer,
+    "--type=merge",
+    "-p",
+    JSON.stringify({ metadata: { finalizers: ["browser-sandbox.io/test-hold"] } }),
+  );
+  const uninstalling = run(
+    "helm",
+    ["uninstall", release, "-n", namespace, "--wait", "--timeout", "300s"],
+    { timeout: 330000 },
+  );
+  uninstalling.catch(() => {});
+  await wait("Uninstall did not begin worker deletion", async () =>
+    (await pods()).some(
+      (pod) => pod.metadata.name === heldFinalizer && pod.metadata.deletionTimestamp,
+    ),
+  );
+  assert(
+    JSON.parse(
+      await kubectl("get", "networkpolicy", `${deployment}-workers`, "-o", "json"),
+    ).spec.ingress.length > 0,
+    "Policy disappeared before worker deletion was confirmed",
+  );
+  await kubectl(
+    "patch",
+    "pod",
+    heldFinalizer,
+    "--type=merge",
+    "-p",
+    JSON.stringify({ metadata: { finalizers: [] } }),
+  );
+  heldFinalizer = undefined;
+  await uninstalling;
   installed = false;
   await wait(
     "Helm uninstall left worker Pods",
@@ -384,6 +428,15 @@ try {
   );
   process.exitCode = 1;
 } finally {
+  if (heldFinalizer)
+    await kubectl(
+      "patch",
+      "pod",
+      heldFinalizer,
+      "--type=merge",
+      "-p",
+      JSON.stringify({ metadata: { finalizers: [] } }),
+    ).catch(() => {});
   if (cordoned) await run("kubectl", ["uncordon", cordoned]).catch(() => {});
   if (installed)
     await run("helm", [

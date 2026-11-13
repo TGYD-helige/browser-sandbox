@@ -80,7 +80,7 @@ try {
     assert(Buffer.from(screenshot.data, "base64").length > 100);
     await sessionRequest(wsEndpoint, "retain", 60000);
     const before = await sessionRequest(wsEndpoint);
-    const renewed = await sessionRequest(wsEndpoint, "renew", 1800000);
+    const renewed = await sessionRequest(wsEndpoint, "renew", 180000);
     assert(renewed.expiresAt >= before.expiresAt);
     assert(renewed.expiresAt <= renewed.hardExpiresAt);
     await closeCdp();

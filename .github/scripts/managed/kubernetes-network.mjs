@@ -91,7 +91,7 @@ try {
             command: [
               "node",
               "-e",
-              "require('node:http').createServer((q,s)=>s.end('ok')).listen(8080,'0.0.0.0');require('node:http').createServer((q,s)=>s.end('management')).listen(8081,'0.0.0.0')",
+              "require('node:http').createServer((q,s)=>s.end('ok')).listen(8080,'0.0.0.0')",
             ],
             readinessProbe: { tcpSocket: { port: 8080 }, periodSeconds: 1 },
             securityContext: {
@@ -108,12 +108,19 @@ try {
   const controller = address("controller");
   const other = address("other-worker");
   await expectConnection("agent", worker, 8080, true);
-  await expectConnection("worker", controller, 8081, true);
+  await expectConnection("worker", controller, 8080, true);
   await expectConnection("worker", other, 8080, true);
   const api = JSON.parse(
     kubectl("get", "service", "kubernetes", "-n", "default", "-o", "json"),
   ).spec.clusterIP;
+  const apiNode = nodes
+    .find(
+      (node) =>
+        node.metadata.labels["node-role.kubernetes.io/control-plane"] !== undefined,
+    )
+    .status.addresses.find((address) => address.type === "InternalIP").address;
   await expectConnection("worker", api, 443, true);
+  await expectConnection("worker", apiNode, 6443, true);
   const policy = execFileSync(
     "helm",
     [
@@ -134,9 +141,10 @@ try {
   apply(policy);
   await expectConnection("agent", worker, 8080, false);
   await expectConnection("controller", worker, 8080, true);
-  await expectConnection("worker", controller, 8081, false);
+  await expectConnection("worker", controller, 8080, false);
   await expectConnection("worker", other, 8080, false);
   await expectConnection("worker", api, 443, false);
+  await expectConnection("worker", apiNode, 6443, false);
   await expectConnection("worker", "169.254.169.254", 80, false);
   console.log(
     "NetworkPolicy enforced across nodes: agent ingress, management, peer workers, API, metadata denied; controller ingress allowed",
