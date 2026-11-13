@@ -111,6 +111,7 @@ async function fixture(t, { pending = false, deleteRace = false, createStatus } 
     podReads: 0,
     listOwner: "release-uid",
     listFailure: false,
+    statusOverride: undefined,
   };
   const server = createServer(async (request, response) => {
     const chunks = [];
@@ -175,13 +176,15 @@ async function fixture(t, { pending = false, deleteRace = false, createStatus } 
             ...state.pod.metadata,
             uid: state.replacement ? "replacement" : "original",
           },
-          status: pending
-            ? { phase: "Pending" }
-            : {
-                phase: "Running",
-                podIP: "10.42.1.4",
-                conditions: [{ type: "Ready", status: "True" }],
-              },
+          status:
+            state.statusOverride ??
+            (pending
+              ? { phase: "Pending" }
+              : {
+                  phase: "Running",
+                  podIP: "10.42.1.4",
+                  conditions: [{ type: "Ready", status: "True" }],
+                }),
         }),
       );
       state.observed?.();
@@ -399,4 +402,33 @@ test("Kubernetes discovery recovers exact UID and rejects foreign release owners
     /browser_kubernetes_operation_failed/,
   );
   assert.equal(state.deleted, false);
+});
+
+test("unschedulable and image-pull failures return explicit errors after owned cleanup", async (t) => {
+  for (const [status, code] of [
+    [
+      {
+        phase: "Pending",
+        conditions: [
+          { type: "PodScheduled", status: "False", reason: "Unschedulable" },
+        ],
+      },
+      /browser_worker_unschedulable/,
+    ],
+    [
+      {
+        phase: "Pending",
+        containerStatuses: [{ state: { waiting: { reason: "ImagePullBackOff" } } }],
+      },
+      /browser_worker_image_unavailable/,
+    ],
+  ]) {
+    const { backend, state } = await fixture(t, { pending: true });
+    state.statusOverride = status;
+    await assert.rejects(
+      backend.create({ executionId, incarnation }, AbortSignal.timeout(5000)),
+      code,
+    );
+    assert.equal(state.deleted, true);
+  }
 });

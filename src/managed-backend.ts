@@ -18,7 +18,10 @@ export interface ManagedWorker {
   incarnation: string;
   origin: string;
   profileId?: string;
-  runtime: BrowserRuntime & { close?(): void };
+  runtime: BrowserRuntime & {
+    close?(): void;
+    setAutomation?(automation: AutomationCoordinator): void;
+  };
 }
 
 /** Optional platform adapter; create cleans partial resources or throws WorkerCleanupFailure when cleanup is unconfirmed. */

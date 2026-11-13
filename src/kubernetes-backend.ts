@@ -309,6 +309,15 @@ export function createKubernetesBackend(
           )
             throw Error("browser_worker_lost");
           if (
+            state.status?.conditions?.some(
+              (condition) =>
+                condition.type === "PodScheduled" &&
+                condition.status === "False" &&
+                condition.reason === "Unschedulable",
+            )
+          )
+            throw Error("browser_worker_unschedulable");
+          if (
             state.status?.containerStatuses?.some((container) =>
               [
                 "ErrImagePull",
@@ -318,7 +327,15 @@ export function createKubernetesBackend(
               ].includes(container.state?.waiting?.reason),
             )
           )
-            throw Error("browser_worker_start_failed");
+            throw Error(
+              state.status.containerStatuses.some((container) =>
+                ["ErrImagePull", "ImagePullBackOff", "InvalidImageName"].includes(
+                  container.state?.waiting?.reason,
+                ),
+              )
+                ? "browser_worker_image_unavailable"
+                : "browser_worker_configuration_invalid",
+            );
           if (
             state.status?.phase === "Running" &&
             state.status.conditions?.some(

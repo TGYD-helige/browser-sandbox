@@ -272,3 +272,28 @@ test("storage attachment cancellation reaches an in-flight worker handshake", {
   await rejected;
   await cancelled.promise;
 });
+
+test("a recovered worker connection can attach the new controller's automation callbacks", async (t) => {
+  const server = createServer();
+  const control = createNetworkHostControl({
+    server,
+    dispatch: (request, peer, signal) =>
+      peer.callback("pause", { executionId: request.executionId }, signal),
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    control.close();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const runtime = createControllerRuntime(`http://127.0.0.1:${server.address().port}`);
+  t.after(() => runtime.close());
+  let paused;
+  runtime.setAutomation({
+    pause: async (executionId) => {
+      paused = executionId;
+    },
+    resume: async () => {},
+  });
+  await runtime.request({ op: "status", executionId: "recovered" });
+  assert.equal(paused, "recovered");
+});

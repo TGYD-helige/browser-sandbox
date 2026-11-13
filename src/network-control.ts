@@ -189,13 +189,15 @@ export function createNetworkHostControl({
 export interface ControllerRuntime extends BrowserRuntime {
   identity: "managed";
   close(): void;
+  setAutomation(automation: AutomationCoordinator): void;
 }
 
 /** Internal trusted networks only; host authentication is reserved at /host. */
 export function createControllerRuntime(
   origin: string,
-  { automation }: { automation?: AutomationCoordinator } = {},
+  { automation: initialAutomation }: { automation?: AutomationCoordinator } = {},
 ): ControllerRuntime {
+  let automation = initialAutomation;
   const storage = new Map<string, StorageAdapter>();
   const url = new URL("/host", origin);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -236,6 +238,9 @@ export function createControllerRuntime(
   };
   return {
     identity: "managed",
+    setAutomation(value) {
+      automation = value;
+    },
     request,
     async attachStorage(
       registration: Registration,
