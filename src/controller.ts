@@ -22,6 +22,12 @@ export interface ExecutionBinding {
   finishing?: Promise<any>;
   host?: ControlPeer;
 }
+interface StorageAttachment {
+  registration: Registration;
+  peer: ControlPeer;
+  channel?: { close(): void };
+  cleanup(): void;
+}
 interface Access {
   token: string;
   binding: ExecutionBinding;
@@ -60,15 +66,7 @@ export async function createController(options: ControllerOptions) {
   const bindings = new Map<string, ExecutionBinding>();
   const grants = new Map<string, Access>();
   const finished = new Set<string>();
-  const storage = new Map<
-    string,
-    {
-      registration: Registration;
-      peer: ControlPeer;
-      channel?: { close(): void };
-      cleanup(): void;
-    }
-  >();
+  const storage = new Map<string, StorageAttachment>();
   let closing = false;
   let origin = options.publicOrigin;
   if (
@@ -276,6 +274,23 @@ export async function createController(options: ControllerOptions) {
       });
     } catch {}
   };
+  async function attachWorkerStorage(
+    worker: ManagedWorker,
+    attachment: StorageAttachment,
+  ) {
+    const executionId = attachment.registration.executionId;
+    const channel = await worker.runtime.attachStorage(attachment.registration, {
+      load: (signal) => attachment.peer.callback("load", { executionId }, signal),
+      save: (signal) => attachment.peer.callback("save", { executionId }, signal),
+      commit: (payload, signal) =>
+        attachment.peer.callback("commit", { executionId, payload }, signal),
+    });
+    if (attachment.peer.signal.aborted || storage.get(executionId) !== attachment) {
+      channel.close();
+      throw Error("browser_storage_disconnected");
+    }
+    attachment.channel = channel;
+  }
   async function ensureWorker(binding: ExecutionBinding, signal: AbortSignal) {
     signal.throwIfAborted();
     if (binding.revoked) throw Error("browser_execution_revoked");
@@ -323,31 +338,7 @@ export async function createController(options: ControllerOptions) {
           );
           creationSignal.throwIfAborted();
           const attachment = storage.get(binding.executionId);
-          if (attachment) {
-            attachment.channel = await worker.runtime.attachStorage(
-              attachment.registration,
-              {
-                load: (callbackSignal) =>
-                  attachment.peer.callback(
-                    "load",
-                    { executionId: binding.executionId },
-                    callbackSignal,
-                  ),
-                save: (callbackSignal) =>
-                  attachment.peer.callback(
-                    "save",
-                    { executionId: binding.executionId },
-                    callbackSignal,
-                  ),
-                commit: (payload, callbackSignal) =>
-                  attachment.peer.callback(
-                    "commit",
-                    { executionId: binding.executionId, payload },
-                    callbackSignal,
-                  ),
-              },
-            );
-          }
+          if (attachment) await attachWorkerStorage(worker, attachment);
           creationSignal.throwIfAborted();
           binding.endpoint = result;
           event(binding, "ready", { elapsedMs: performance.now() - startedAt });
@@ -408,7 +399,17 @@ export async function createController(options: ControllerOptions) {
       };
       storage.set(id, attachment);
       peer.signal.addEventListener("abort", attachment.cleanup, { once: true });
-      return { attached: true };
+      try {
+        if (binding?.starting) {
+          const worker = await binding.starting;
+          signal.throwIfAborted();
+          if (!attachment.channel) await attachWorkerStorage(worker, attachment);
+        }
+        return { attached: true };
+      } catch (error) {
+        attachment.cleanup();
+        throw error;
+      }
     }
     if (request.op === "storage_detach") {
       const attachment = storage.get(id);

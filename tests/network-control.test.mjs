@@ -166,6 +166,22 @@ test("controller routes attached storage callbacks between the real host and wor
     "fixture",
   );
   assert.deepEqual(callbacks, { absent: true });
+  attachment.close();
+  await runtime.request({ op: "storage_detach", executionId });
+  const lateAttachment = await runtime.attachStorage(
+    { executionId },
+    {
+      load: async () => ({ absent: false }),
+      save: async () => ({}),
+      commit: async () => ({ confirmedSha: "unused" }),
+    },
+  );
+  assert.deepEqual(
+    callbacks,
+    { absent: false },
+    "Attachment after worker readiness was silently ignored",
+  );
+  lateAttachment.close();
   await runtime.request({ op: "finalize", executionId });
   attachment.close();
 });
