@@ -75,8 +75,9 @@ const pods = async () =>
       "json",
     ),
   ).items;
-const client = async (action = "functional", executionId) =>
-  JSON.parse(
+const client = async (action = "functional", executionId) => {
+  await controllerReady();
+  return JSON.parse(
     await run(
       "kubectl",
       [
@@ -99,6 +100,7 @@ const client = async (action = "functional", executionId) =>
       },
     ),
   );
+};
 const profileClient = async (phase = "roundtrip", executionId) => {
   stage = `persistent Profiles: ${phase}`;
   await controllerReady();
@@ -127,8 +129,9 @@ const profileClient = async (phase = "roundtrip", executionId) => {
     ),
   );
 };
-const recoveryCases = async (phase) =>
-  JSON.parse(
+const recoveryCases = async (phase) => {
+  await controllerReady();
+  return JSON.parse(
     await run(
       "kubectl",
       [
@@ -151,6 +154,8 @@ const recoveryCases = async (phase) =>
       },
     ),
   );
+};
+
 const wait = async (description, predicate, timeout = 90000) => {
   const deadline = Date.now() + timeout;
   while (!(await predicate())) {
