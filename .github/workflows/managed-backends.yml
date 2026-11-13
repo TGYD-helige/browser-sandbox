@@ -33,7 +33,8 @@ jobs:
       - run: docker build -t browser-sandbox:managed .
       - run: docker build -f Dockerfile.e2e --build-arg BROWSER_IMAGE=browser-sandbox:managed -t browser-sandbox-managed-harness:local .
       - run: node .github/scripts/managed/docker.mjs
-      - run: node .github/scripts/managed/recovery-docker.mjs
+      - if: ${{ !cancelled() }}
+        run: node .github/scripts/managed/recovery-docker.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

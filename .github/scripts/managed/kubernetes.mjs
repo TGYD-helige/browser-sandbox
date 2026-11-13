@@ -542,14 +542,6 @@ try {
     ) + "\n",
   );
   await controllerReady();
-  stage = "functional client";
-  const functional = await client();
-  assert.equal(
-    functional.architecture,
-    process.arch,
-    "Client image must match the native runner architecture",
-  );
-  assert.equal((await pods()).length, 0, "Temporary worker was not removed");
   stage = "recovery scenarios";
   await run("helm", [
     "upgrade",
@@ -807,6 +799,10 @@ try {
   await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
   await client("lost", deadlineHeld.executionId);
   await client("finish", deadlineHeld.executionId);
+  stage = "functional client";
+  const functional = await client();
+  assert.equal(functional.architecture, process.arch, "Client image must match the native runner architecture");
+  assert.equal((await pods()).length, 0, "Temporary worker was not removed");
   stage = "safe uninstall";
   await client("hold");
   const finalWorker = (await pods())[0];
