@@ -20,7 +20,7 @@ def render(*arguments):
 class ChartTest(unittest.TestCase):
     def test_only_controller_is_a_workload(self):
         resources = render()
-        workloads = [item for item in resources if item["kind"] in
+        workloads = [item for item in resources if not item["metadata"].get("annotations", {}).get("helm.sh/hook") and item["kind"] in
                      ["Pod", "Deployment", "StatefulSet", "DaemonSet", "Job", "ReplicaSet"]]
         self.assertEqual([item["kind"] for item in workloads], ["Deployment"])
         deployment = workloads[0]
@@ -62,6 +62,15 @@ class ChartTest(unittest.TestCase):
         budget = next(item for item in render("--set", "worker.disruptionBudget.enabled=true") if item["kind"] == "PodDisruptionBudget")
         self.assertEqual(budget["spec"]["minAvailable"], 1)
         self.assertNotIn("maxUnavailable", budget["spec"])
+
+    def test_uninstall_hook_drains_before_network_policy_can_be_deleted(self):
+        hook = next(item for item in render() if item["kind"] == "Job")
+        self.assertEqual(hook["metadata"]["annotations"]["helm.sh/hook"], "pre-delete")
+        self.assertEqual(hook["spec"]["backoffLimit"], 0)
+        container = hook["spec"]["template"]["spec"]["containers"][0]
+        self.assertEqual(container["command"], ["node", "/opt/browser-sandbox/dist/kubernetes-drain-main.js"])
+        self.assertEqual(container["securityContext"]["capabilities"]["drop"], ["ALL"])
+        self.assertGreater(hook["spec"]["activeDeadlineSeconds"], 180)
 
 
 if __name__ == "__main__":

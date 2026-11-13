@@ -1,0 +1,55 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-drain
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+  labels:
+    {{- include "browser-sandbox.labels" . | nindent 4 }}
+    app.kubernetes.io/component: maintenance
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ add (mul .Values.worker.terminationGracePeriodSeconds 2) 150 }}
+  ttlSecondsAfterFinished: 300
+  template:
+    metadata:
+      labels:
+        {{- include "browser-sandbox.labels" . | nindent 8 }}
+        app.kubernetes.io/component: maintenance
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "browser-sandbox.name" . }}
+      imagePullSecrets: {{ .Values.imagePullSecrets | toJson }}
+      nodeSelector: {{ .Values.controller.nodeSelector | toJson }}
+      tolerations: {{ .Values.controller.tolerations | toJson }}
+      affinity: {{ .Values.controller.affinity | toJson }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 20000
+        runAsGroup: 20000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: drain
+          image: {{ include "browser-sandbox.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: [node, /opt/browser-sandbox/dist/kubernetes-drain-main.js]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources: {{ .Values.controller.resources | toJson }}
+          env:
+            - name: BROWSER_INSTALLATION
+              value: {{ .Release.Name | quote }}
+            - name: BROWSER_KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: BROWSER_KUBERNETES_CONTROLLER
+              value: {{ include "browser-sandbox.name" . }}
+            - name: BROWSER_KUBERNETES_OWNER
+              value: {{ include "browser-sandbox.name" . }}-workers
+            - name: BROWSER_DRAIN_TIMEOUT_MS
+              value: {{ mul (add (mul .Values.worker.terminationGracePeriodSeconds 2) 120) 1000 | quote }}

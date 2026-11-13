@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { request as httpRequest } from "node:http";
-import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
+import {
+  createKubernetesClient,
+  type KubernetesAccess,
+  KubernetesError,
+} from "./kubernetes-api.js";
 import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
 import { WORKER_ENVIRONMENT } from "./managed-backend.js";
 import { createControllerRuntime } from "./network-control.js";
@@ -27,30 +29,18 @@ export interface KubernetesWorkerTemplate {
     persistentVolumeClaim?: { claimName: string };
   };
 }
-export interface KubernetesBackendOptions {
-  namespace: string;
+export interface KubernetesBackendOptions extends KubernetesAccess {
   installation: string;
   ownerName: string;
   image: string;
   environment?: Record<string, string>;
   template: KubernetesWorkerTemplate;
-  apiServer?: string;
-  ca?: Buffer;
-  tokenFile?: string;
   creationTimeoutMs?: number;
 }
 
 const identity = (value: string) => /^[a-f0-9-]{36}$/.test(value);
 const dnsName = (value: string) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(value);
 const prefix = "browser-sandbox.io/";
-class KubernetesError extends Error {
-  constructor(public status: number) {
-    super(
-      status === 404 ? "browser_worker_lost" : "browser_kubernetes_operation_failed",
-    );
-  }
-}
-
 /** Optional adapter: no Kubernetes dependency or credentials enter the local runtime. */
 export function createKubernetesBackend(
   options: KubernetesBackendOptions,
@@ -137,7 +127,9 @@ export function createKubernetesBackend(
         propagationPolicy: "Background",
       },
       signal,
-    );
+    ).catch((error) => {
+      if (!(error instanceof KubernetesError && error.status === 404)) throw error;
+    });
     while (true) {
       const remaining = await getPod(name, signal);
       if (!remaining || remaining.metadata.uid !== pod.metadata.uid) return;
@@ -382,76 +374,5 @@ export function createKubernetesBackend(
         uid,
       );
     },
-  };
-}
-
-function createKubernetesClient(options: KubernetesBackendOptions) {
-  const server = new URL(
-    options.apiServer ??
-      `https://${process.env.KUBERNETES_SERVICE_HOST}:${process.env.KUBERNETES_SERVICE_PORT_HTTPS ?? 443}`,
-  );
-  if (
-    server.username ||
-    server.password ||
-    (server.protocol !== "https:" &&
-      !(
-        server.protocol === "http:" && ["127.0.0.1", "[::1]"].includes(server.hostname)
-      ))
-  )
-    throw Error("browser_kubernetes_configuration_invalid");
-  return async (
-    path: string,
-    method: string,
-    body: unknown,
-    callerSignal: AbortSignal,
-  ): Promise<any> => {
-    const signal = AbortSignal.any([callerSignal, AbortSignal.timeout(15000)]);
-    signal.throwIfAborted();
-    const token = options.tokenFile
-      ? (await readFile(options.tokenFile, "utf8")).trim()
-      : undefined;
-    signal.throwIfAborted();
-    const payload = body === undefined ? undefined : JSON.stringify(body);
-    return new Promise((resolve, reject) => {
-      const request = (server.protocol === "https:" ? httpsRequest : httpRequest)(
-        new URL(path, server),
-        {
-          method,
-          ca: options.ca,
-          signal,
-          headers: {
-            "content-type": "application/json",
-            ...(payload
-              ? { "content-length": String(Buffer.byteLength(payload)) }
-              : {}),
-            ...(token ? { authorization: `Bearer ${token}` } : {}),
-          },
-        },
-        (response) => {
-          const chunks: Buffer[] = [];
-          let size = 0;
-          response.on("data", (chunk) => {
-            size += chunk.length;
-            if (size > 1048576)
-              request.destroy(Error("browser_kubernetes_response_too_large"));
-            else chunks.push(chunk);
-          });
-          response.on("error", () => reject(Error("browser_kubernetes_unavailable")));
-          response.on("end", () => {
-            if (response.statusCode < 200 || response.statusCode >= 300) {
-              reject(new KubernetesError(response.statusCode));
-              return;
-            }
-            try {
-              resolve(size ? JSON.parse(Buffer.concat(chunks).toString()) : {});
-            } catch {
-              reject(Error("browser_kubernetes_response_invalid"));
-            }
-          });
-        },
-      );
-      request.on("error", () => reject(Error("browser_kubernetes_unavailable")));
-      request.end(payload);
-    });
   };
 }
