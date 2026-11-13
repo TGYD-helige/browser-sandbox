@@ -22,5 +22,17 @@ export {
 } from "./lifecycle-errors.js";
 export { createLocalProfiles, validProfileId } from "./local-profiles.js";
 export { createProfileArchive } from "./profiles.js";
+export type {
+  BrowserRuntime,
+  BrowserSessionHandle,
+  BrowserSessionOptions,
+  Placement,
+  RuntimeProvider,
+} from "./runtime-provider.js";
+export {
+  createBrowserSessions,
+  createLocalRuntimeProvider,
+  createSocketRuntime,
+} from "./runtime-provider.js";
 export type { SessionAction, SessionState, SessionStatus } from "./session.js";
 export { sessionRequest } from "./session.js";

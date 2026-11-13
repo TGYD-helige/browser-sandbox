@@ -39,7 +39,7 @@ const { wsEndpoint } = await hostRequest(socketPath, {
 await hostRequest(socketPath, { op: 'finalize', executionId });
 ```
 
-Use a fresh UUID for each execution. Every host-control registration must supply an executorUid in 100000–1999999999; requests without one are rejected with browser_executor_identity_invalid, because the endpoint is bound to the kernel peer UID. Do not recycle a UID while old processes or grants survive. To let several harnesses or sessions share one runtime, give each session its own executionId and executorUid; each then gets an independent browser, endpoint, and Profile lease. UID 20001 is reserved for the runtime's internal renderer probe; in-process createGateway().command registrations without executorUid also use it and skip the peer check, so use them only for trusted local tooling. These are Linux deployment constraints, not business identities.
+Use a fresh UUID for each execution. Every host-control registration must supply an executorUid in 100000–1999999999; requests without one are rejected with browser_executor_identity_invalid, because the endpoint is bound to the kernel peer UID. Two live executions cannot share an executorUid: registering a new execution with a UID held by an unfinished one fails with browser_executor_uid_in_use, because any process under that UID could read the other execution's endpoint; reuse a UID only after its execution finishes. Do not recycle a UID while old processes or grants survive. To let several harnesses or sessions share one runtime, give each session its own executionId and executorUid; each then gets an independent browser, endpoint, and Profile lease. See [share one runtime](#share-one-runtime-across-harnesses-and-sessions) for capacity and the host session helper. UID 20001 is reserved for the runtime's internal renderer probe; in-process createGateway().command registrations without executorUid also use it and skip the peer check, so use them only for trusted local tooling. These are Linux deployment constraints, not business identities.
 
 | Operation | Semantics |
 |---|---|
@@ -50,11 +50,37 @@ Use a fresh UUID for each execution. Every host-control registration must supply
 | finish | Low-level cleanup; rejects unconfirmed remote saves |
 | takeover | Request a human control operation through the trusted host |
 
-Control requests have a 30-second budget, or 180 seconds for finalization. Browser preparation has a 45-second deadline; clients should allow at least 60 seconds for first use. The runtime allows a roughly one-second transport reconnection grace after the last client disconnects. A client maintaining its connection retains the live browser until Browserless's total timeout. Explicit live-session retention is described below.
+Control requests have a 30-second budget, or 180 seconds for finalization. Browser preparation has a BROWSER_STARTUP_TIMEOUT deadline, 45 seconds by default; clients should allow at least that plus 15 seconds for first use. The runtime allows a roughly one-second transport reconnection grace after the last client disconnects. A client maintaining its connection retains the live browser until Browserless's total timeout. Explicit live-session retention is described below.
 
 Cookie checkpoints preserve persistent Cookies and deletion/expiry behavior. Cold restore excludes Session Cookies, old task windows, and sessionStorage. A normal close flushes native Profile databases. Forced termination and crashes cannot guarantee the last writes were saved.
 
 Finish revokes execution access and deletes temporary data. Its credentialsScrubbed field is false for persistent Profiles: keeping login data is intentional. A previous owner receipt after a runtime restart is reported as browser_execution_recovery_required; an orphan Profile receipt is browser_profile_stop_unconfirmed. Investigate and confirm process exit before recovery. The runtime never automatically steals a Profile from an uncertain owner.
+
+## Share one runtime across harnesses and sessions
+
+Each harness session is one execution with its own executionId, executorUid, browser, endpoint, and Profile lease. Clients that connect to the same endpoint share that execution's browser and pages, so register a separate execution for each independent session. Two executions cannot use one profileId at the same time; the second fails with browser_profile_busy.
+
+CONCURRENT bounds live browsers. A browser keeps its slot while a client stays connected, its session is retained, or a human holds control, up to the TIMEOUT hard limit. Browsers without connected clients are reclaimed first when another execution needs a slot. Further launches wait in the QUEUED Browserless queue, and a launch still waiting when BROWSER_STARTUP_TIMEOUT expires fails with browser_profile_startup_timeout. Size CONCURRENT for the sessions that hold connections at the same time, raise the container memory with it, and let harnesses disconnect while a session is idle.
+
+The host SDK assigns session identities and places executions through a runtime provider:
+
+```js
+import { createBrowserSessions, createLocalRuntimeProvider } from '@amaster.ai/browser-sandbox';
+
+const sessions = createBrowserSessions({
+  provider: createLocalRuntimeProvider(socketPath),
+  firstUid: 100001, // UID range reserved for this host process.
+  uidCount: 1000,
+});
+const session = await sessions.open({ profileId: 'authorized-tenant/browser-profile' });
+// Run the harness as session.executorUid with BROWSER_WS_ENDPOINT=session.wsEndpoint.
+// Stop that harness's processes, then:
+await session.finalize();
+```
+
+open generates a fresh executionId, takes the lowest free UID in the range, attaches the optional storage adapter, and registers the execution. The UID returns to the pool only after the runtime confirms finalization; a failed finalize keeps it reserved for a retry, and finalize is idempotent after success. The pool belongs to one host process, so concurrent host processes sharing a runtime need disjoint UID ranges. If the runtime reports browser_executor_uid_in_use, open rethrows it and keeps that UID out of the pool for the life of the helper, so the next open takes another UID. If registration fails and the cleanup finalize also fails, open throws an AggregateError named browser_session_cleanup_unconfirmed holding both errors, with executionId and executorUid properties; the UID stays out of the pool, and the host retries { op: 'finalize', executionId } on the runtime that the provider returns for that executionId, then calls the provider's release for it. If release fails after browser_executor_uid_in_use, open throws an AggregateError with that message and the same properties.
+
+A RuntimeProvider decides which runtime owns an execution. acquire({executionId, tenantId, profileId}) returns a BrowserRuntime, which exposes request for host-control operations and attachStorage. Repeated calls for one execution must return the same runtime, and release runs after confirmed finalization or after the runtime refuses the registration with browser_executor_uid_in_use; a release alone does not prove a finalization. A harness outside the runtime's network namespace cannot use wsEndpoint; the host requests a remote cdpUrl with session.runtime.request({ op: 'access_create', executionId: session.executionId, durationMs }), described in [live viewing and deployment](./live-view.md). Grants last at most 30 minutes and expiry closes their connections, so a longer session renews the grant and reconnects the harness. createSocketRuntime(socketPath) builds a runtime for a reachable control socket. createLocalRuntimeProvider places every execution in one runtime that shares a container and kernel, so it rejects tenantId with browser_tenant_isolation_unavailable rather than implying isolation. Multi-instance routing and per-tenant containers are provider implementations outside this package; such a provider must keep each execution bound to its runtime and never place different tenantIds in one runtime.
 
 ## Connect your client
 
@@ -102,15 +128,16 @@ Some CDP clients, including Chrome DevTools MCP, treat loopback endpoints as loc
 | Variable | Default / role |
 |---|---|
 | BROWSER_CONTROL_SOCKET | /run/browser-sandbox/control.sock; the runtime listens only on this path with the .auth suffix, mode 0600 |
-| CONCURRENT | 2 Browserless instances |
-| QUEUED | 4 queued requests |
+| CONCURRENT | 2 simultaneous live browsers; Browserless and the runtime both read it |
+| QUEUED | 4 Browserless launches waiting for a slot |
+| BROWSER_STARTUP_TIMEOUT | 45000 ms for Profile preparation, queue wait, and browser launch on first use; 1–600000 |
 | TIMEOUT | 1800000 ms total Browserless timeout |
 | BROWSER_EXTENSIONS_DIR | Optional absolute directory containing unpacked extension subdirectories |
 | HOST / PORT | Fixed internal Browserless binding 127.0.0.1:3001 |
 
 Profile preparation (including acquisition and restore), archive saves, and ownership release share a separate work limit of CONCURRENT active operations. Preparation and saves admit twice CONCURRENT waiting operations; ownership cleanup has a reserved queue bounded by the 1,000 live execution slots and runs before waiting preparation. This keeps failure recovery and shutdown available when the ordinary queue is full. QUEUED still controls Browserless browser admission. A full Profile work queue returns browser_profile_work_queue_full; it does not call storage or start a browser for the rejected attempt. Cancellation removes queued work, and failed saves retain the Profile for an explicit lifecycle retry. Registration and unused finalization do not enter this queue.
 
-The gateway accepts the execution WebSocket before cold startup completes. The bundled CDP client allows 60 seconds for commands sent before the first reply, covering the default 45-second startup budget plus the ordinary 15-second command budget. Commands sent after that reply keep the 15-second timeout. Other CDP clients must allow for preparation in their initial command deadline; a successful WebSocket handshake alone does not mean Chrome is ready.
+The gateway accepts the execution WebSocket before cold startup completes. The bundled CDP client allows 60 seconds for commands sent before the first reply, covering the default 45-second startup budget plus the ordinary 15-second command budget. Commands sent after that reply keep the 15-second timeout. If you raise BROWSER_STARTUP_TIMEOUT, raise the first-command deadline of every client to match; the bundled client covers only the default. Other CDP clients must allow for preparation in their initial command deadline; a successful WebSocket handshake alone does not mean Chrome is ready.
 
 The browser runtime targets the supported Linux topology. Optional authenticated remote access and a lightweight live viewer are described in [live viewing and deployment](./live-view.md). The private host-control socket remains local; native Windows/macOS runtime mode and a general browser-management UI are outside this implementation.
 
@@ -204,7 +231,10 @@ node .github/scripts/e2e.mjs pi
 node .github/scripts/e2e.mjs dsh
 node .github/scripts/e2e.mjs opencode
 node .github/scripts/e2e.mjs agent-browser
+node .github/scripts/e2e.mjs pi,dsh,opencode,agent-browser
 ```
+
+A comma-separated list runs those harnesses at the same time against one runtime, each as its own execution and executor UID, with CONCURRENT and container memory raised to cover every browser. CI runs the combined list in tools mode.
 
 OpenCode runs its actual CLI and MCP tool loop in both modes. The secret-free tools check uses scripted OpenAI-compatible responses; the model check uses the configured provider. Both verify a zero-client handoff, renewal of the original browser generation, and form submission. Its test-only session MCP server exposes the same runtime session API used by the other harnesses.
 

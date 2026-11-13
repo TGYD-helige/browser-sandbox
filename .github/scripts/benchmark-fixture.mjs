@@ -72,10 +72,13 @@ export function barrier() {
   };
 }
 
+// Live executions need distinct UIDs; this range avoids the 100091–100095 benchmark workers.
+let nextUid = 0;
 // These clients use host-issued access grants, not Browserless's private port/token.
 export async function execution(socket, registration = {}) {
   const executionId = randomUUID();
-  const request = { executionId, executorUid: 100096, ...registration };
+  const executorUid = 100100 + (nextUid++ % 800);
+  const request = { executionId, executorUid, ...registration };
   const connections = new Set();
   let finished = false;
   const closeConnections = async () => {

@@ -1,5 +1,9 @@
 import fs from "node:fs/promises";
 
+/** Execution UIDs the runtime's network policy fences from internal ports. */
+export const validExecutorUid = (uid) =>
+  Number.isInteger(uid) && uid >= 100000 && uid < 2000000000;
+
 /** Socket ownership comes from the kernel, never HTTP headers or a claimed Run ID. */
 export async function peerUid(socket) {
   if (process.platform !== "linux") throw Error("browser_peer_identity_unavailable");

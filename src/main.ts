@@ -77,6 +77,7 @@ const gateway = await createGateway({
   launch,
   maxBrowsers: Number(process.env.CONCURRENT ?? 2),
   maxSessionMs: Number(process.env.TIMEOUT ?? 1800000),
+  startupTimeoutMs: Number(process.env.BROWSER_STARTUP_TIMEOUT ?? 45000),
   access: process.env.BROWSER_ACCESS_PORT
     ? {
         port: Number(process.env.BROWSER_ACCESS_PORT),
