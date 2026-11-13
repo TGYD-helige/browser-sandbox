@@ -4,7 +4,7 @@ kind: PodDisruptionBudget
 metadata:
   name: {{ include "browser-sandbox.name" . }}-workers
 spec:
-  maxUnavailable: {{ .Values.worker.disruptionBudget.maxUnavailable }}
+  minAvailable: {{ .Values.worker.disruptionBudget.minAvailable }}
   selector:
     matchLabels:
       {{- include "browser-sandbox.labels" . | nindent 6 }}
