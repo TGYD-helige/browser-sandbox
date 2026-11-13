@@ -1,0 +1,457 @@
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { isIP } from "node:net";
+import { setTimeout as delay } from "node:timers/promises";
+import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
+import { WORKER_ENVIRONMENT } from "./managed-backend.js";
+import { createControllerRuntime } from "./network-control.js";
+
+export interface KubernetesWorkerTemplate {
+  resources?: object;
+  securityContext: {
+    runAsUser?: number;
+    allowPrivilegeEscalation?: boolean;
+    capabilities?: { drop?: string[]; add?: string[] };
+    seccompProfile: { type: "Localhost"; localhostProfile: string };
+  };
+  shmSize?: string;
+  terminationGracePeriodSeconds?: number;
+  nodeSelector?: Record<string, string>;
+  tolerations?: object[];
+  affinity?: object;
+  imagePullSecrets?: { name: string }[];
+  extensions?: {
+    configMap?: { name: string };
+    persistentVolumeClaim?: { claimName: string };
+  };
+}
+export interface KubernetesBackendOptions {
+  namespace: string;
+  installation: string;
+  ownerName: string;
+  image: string;
+  environment?: Record<string, string>;
+  template: KubernetesWorkerTemplate;
+  apiServer?: string;
+  ca?: Buffer;
+  tokenFile?: string;
+  creationTimeoutMs?: number;
+}
+
+const identity = (value: string) => /^[a-f0-9-]{36}$/.test(value);
+const dnsName = (value: string) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(value);
+const prefix = "browser-sandbox.io/";
+class KubernetesError extends Error {
+  constructor(public status: number) {
+    super(
+      status === 404 ? "browser_worker_lost" : "browser_kubernetes_operation_failed",
+    );
+  }
+}
+
+/** Optional adapter: no Kubernetes dependency or credentials enter the local runtime. */
+export function createKubernetesBackend(
+  options: KubernetesBackendOptions,
+): ManagedBackend {
+  const template = options.template;
+  const grace = template.terminationGracePeriodSeconds ?? 60;
+  const creationTimeoutMs = options.creationTimeoutMs ?? 120000;
+  const hardTimeoutMs = Number(options.environment?.TIMEOUT ?? 1800000);
+  if (
+    !dnsName(options.namespace) ||
+    !dnsName(options.installation) ||
+    !dnsName(options.ownerName) ||
+    !/^[^\s]+@sha256:[a-f0-9]{64}$/.test(options.image) ||
+    !Number.isSafeInteger(hardTimeoutMs) ||
+    hardTimeoutMs < 1 ||
+    hardTimeoutMs > 2147483647 ||
+    !Number.isSafeInteger(creationTimeoutMs) ||
+    creationTimeoutMs < 1 ||
+    creationTimeoutMs > 600000 ||
+    !Number.isSafeInteger(grace) ||
+    grace < 1 ||
+    grace > 600 ||
+    template.securityContext?.seccompProfile?.type !== "Localhost" ||
+    !template.securityContext.seccompProfile.localhostProfile ||
+    (template.extensions &&
+      Number(Boolean(template.extensions.configMap)) +
+        Number(Boolean(template.extensions.persistentVolumeClaim)) !==
+        1)
+  )
+    throw Error("browser_kubernetes_configuration_invalid");
+  const api = createKubernetesClient(options);
+  const base = `/api/v1/namespaces/${options.namespace}`;
+  const labels = (executionId: string, incarnation: string) => ({
+    "app.kubernetes.io/name": "browser-sandbox",
+    "app.kubernetes.io/instance": options.installation,
+    "app.kubernetes.io/component": "worker",
+    [prefix + "installation"]: options.installation,
+    [prefix + "execution"]: executionId,
+    [prefix + "incarnation"]: incarnation,
+  });
+  const owned = (pod: any, expected: Record<string, string>, uid?: string) => {
+    if (
+      (uid && pod.metadata.uid !== uid) ||
+      !Object.entries(expected).every(
+        ([key, value]) => pod.metadata.labels?.[key] === value,
+      ) ||
+      !pod.metadata.ownerReferences?.some(
+        (owner) =>
+          owner.kind === "ConfigMap" &&
+          owner.name === options.ownerName &&
+          owner.controller === true,
+      )
+    )
+      throw Error("browser_worker_ownership_mismatch");
+  };
+  async function getPod(name: string, signal: AbortSignal) {
+    try {
+      return await api(`${base}/pods/${name}`, "GET", undefined, signal);
+    } catch (error) {
+      if (error instanceof KubernetesError && error.status === 404) return undefined;
+      throw error;
+    }
+  }
+  async function removeOwned(
+    name: string,
+    expected: Record<string, string>,
+    signal: AbortSignal,
+    uid?: string,
+    requirePresent = false,
+  ) {
+    const pod = await getPod(name, signal);
+    if (!pod) {
+      if (requirePresent) throw Error("browser_worker_cleanup_unconfirmed");
+      return;
+    }
+    owned(pod, expected, uid);
+    await api(
+      `${base}/pods/${name}`,
+      "DELETE",
+      {
+        apiVersion: "v1",
+        kind: "DeleteOptions",
+        preconditions: { uid: pod.metadata.uid },
+        propagationPolicy: "Background",
+      },
+      signal,
+    );
+    while (true) {
+      const remaining = await getPod(name, signal);
+      if (!remaining || remaining.metadata.uid !== pod.metadata.uid) return;
+      await delay(100, undefined, { signal });
+    }
+  }
+  return {
+    async create(placement, callerSignal) {
+      if (!identity(placement.executionId) || !identity(placement.incarnation))
+        throw Error("browser_identity_invalid");
+      const signal = AbortSignal.any([
+        callerSignal,
+        AbortSignal.timeout(creationTimeoutMs),
+      ]);
+      const expected = labels(placement.executionId, placement.incarnation);
+      const name = `bs-${options.installation.slice(0, 30)}-${createHash("sha256").update(placement.incarnation).digest("hex").slice(0, 20)}`;
+      const owner = await api(
+        `${base}/configmaps/${options.ownerName}`,
+        "GET",
+        undefined,
+        signal,
+      );
+      if (
+        owner.metadata?.labels?.["app.kubernetes.io/instance"] !==
+          options.installation ||
+        owner.metadata.labels["app.kubernetes.io/name"] !== "browser-sandbox" ||
+        !owner.metadata.uid
+      )
+        throw Error("browser_worker_ownership_mismatch");
+      let attempted = false;
+      let uid: string;
+      try {
+        const environment: { name: string; value: string }[] =
+          WORKER_ENVIRONMENT.filter(
+            (key) => options.environment?.[key] !== undefined,
+          ).map((key) => ({ name: key, value: options.environment[key] }));
+        environment.push(
+          { name: "CONCURRENT", value: "1" },
+          { name: "QUEUED", value: "0" },
+          { name: "BROWSER_EXECUTION_ID", value: placement.executionId },
+          { name: "BROWSER_WORKER_ORIGIN", value: "http://$(BROWSER_POD_IP):8081" },
+        );
+        if (template.extensions)
+          environment.push({
+            name: "BROWSER_EXTENSIONS_DIR",
+            value: "/opt/browser-extensions",
+          });
+        attempted = true;
+        const pod = await api(
+          `${base}/pods`,
+          "POST",
+          {
+            apiVersion: "v1",
+            kind: "Pod",
+            metadata: {
+              name,
+              labels: {
+                ...expected,
+                ...(placement.profileId
+                  ? {
+                      [prefix + "profile"]: createHash("sha256")
+                        .update(placement.profileId)
+                        .digest("hex")
+                        .slice(0, 63),
+                    }
+                  : {}),
+              },
+              ownerReferences: [
+                {
+                  apiVersion: "v1",
+                  kind: "ConfigMap",
+                  name: options.ownerName,
+                  uid: owner.metadata.uid,
+                  controller: true,
+                  blockOwnerDeletion: false,
+                },
+              ],
+            },
+            spec: {
+              restartPolicy: "Never",
+              automountServiceAccountToken: false,
+              enableServiceLinks: false,
+              activeDeadlineSeconds:
+                Math.ceil((hardTimeoutMs + creationTimeoutMs) / 1000) + grace,
+              terminationGracePeriodSeconds: grace,
+              imagePullSecrets: template.imagePullSecrets ?? [],
+              nodeSelector: template.nodeSelector ?? {},
+              tolerations: template.tolerations ?? [],
+              affinity: template.affinity ?? {},
+              containers: [
+                {
+                  name: "worker",
+                  image: options.image,
+                  args: ["worker"],
+                  env: [
+                    {
+                      name: "BROWSER_POD_IP",
+                      valueFrom: { fieldRef: { fieldPath: "status.podIP" } },
+                    },
+                    ...environment,
+                  ],
+                  securityContext: {
+                    ...template.securityContext,
+                    privileged: false,
+                    allowPrivilegeEscalation: false,
+                  },
+                  resources: template.resources ?? {},
+                  readinessProbe: {
+                    httpGet: { path: "/health", port: 8081 },
+                    periodSeconds: 1,
+                    timeoutSeconds: 2,
+                  },
+                  volumeMounts: [
+                    { name: "shm", mountPath: "/dev/shm" },
+                    ...(template.extensions
+                      ? [
+                          {
+                            name: "extensions",
+                            mountPath: "/opt/browser-extensions",
+                            readOnly: true,
+                          },
+                        ]
+                      : []),
+                  ],
+                },
+              ],
+              volumes: [
+                {
+                  name: "shm",
+                  emptyDir: {
+                    medium: "Memory",
+                    sizeLimit: template.shmSize ?? "512Mi",
+                  },
+                },
+                ...(template.extensions
+                  ? [
+                      {
+                        name: "extensions",
+                        ...(template.extensions.configMap
+                          ? { configMap: template.extensions.configMap }
+                          : {
+                              persistentVolumeClaim: {
+                                ...template.extensions.persistentVolumeClaim,
+                                readOnly: true,
+                              },
+                            }),
+                      },
+                    ]
+                  : []),
+              ],
+            },
+          },
+          signal,
+        );
+        uid = pod.metadata.uid;
+        if (!uid) throw Error("browser_kubernetes_response_invalid");
+        while (true) {
+          const state = await getPod(name, signal);
+          if (!state) throw Error("browser_worker_lost");
+          owned(state, expected, uid);
+          if (
+            state.metadata.deletionTimestamp ||
+            ["Failed", "Succeeded"].includes(state.status?.phase)
+          )
+            throw Error("browser_worker_lost");
+          if (
+            state.status?.containerStatuses?.some((container) =>
+              [
+                "ErrImagePull",
+                "ImagePullBackOff",
+                "InvalidImageName",
+                "CreateContainerConfigError",
+              ].includes(container.state?.waiting?.reason),
+            )
+          )
+            throw Error("browser_worker_start_failed");
+          if (
+            state.status?.phase === "Running" &&
+            state.status.conditions?.some(
+              (condition) => condition.type === "Ready" && condition.status === "True",
+            )
+          ) {
+            if (!isIP(state.status.podIP))
+              throw Error("browser_kubernetes_response_invalid");
+            const host =
+              isIP(state.status.podIP) === 6
+                ? `[${state.status.podIP}]`
+                : state.status.podIP;
+            const origin = `http://${host}:8081`;
+            return {
+              id: `${name}/${uid}`,
+              executionId: placement.executionId,
+              incarnation: placement.incarnation,
+              origin,
+              runtime: createControllerRuntime(origin, {
+                automation: placement.automation,
+              }),
+            };
+          }
+          await delay(100, undefined, { signal });
+        }
+      } catch (error) {
+        if (
+          attempted &&
+          !(error instanceof KubernetesError && error.status === 409 && !uid)
+        ) {
+          try {
+            await removeOwned(
+              name,
+              expected,
+              AbortSignal.timeout((grace + 10) * 1000),
+              uid,
+              !uid,
+            );
+          } catch {
+            throw Error("browser_worker_cleanup_unconfirmed");
+          }
+        }
+        if (signal.aborted)
+          throw Error(
+            callerSignal.aborted
+              ? "browser_worker_creation_cancelled"
+              : "browser_worker_creation_timeout",
+          );
+        throw error;
+      }
+    },
+    async remove(worker: ManagedWorker, callerSignal) {
+      const [name, uid, extra] = worker.id.split("/");
+      if (
+        !dnsName(name) ||
+        !uid ||
+        extra ||
+        !identity(worker.executionId) ||
+        !identity(worker.incarnation)
+      )
+        throw Error("browser_worker_ownership_mismatch");
+      await removeOwned(
+        name,
+        labels(worker.executionId, worker.incarnation),
+        AbortSignal.any([callerSignal, AbortSignal.timeout((grace + 10) * 1000)]),
+        uid,
+      );
+    },
+  };
+}
+
+function createKubernetesClient(options: KubernetesBackendOptions) {
+  const server = new URL(
+    options.apiServer ??
+      `https://${process.env.KUBERNETES_SERVICE_HOST}:${process.env.KUBERNETES_SERVICE_PORT_HTTPS ?? 443}`,
+  );
+  if (
+    server.username ||
+    server.password ||
+    (server.protocol !== "https:" &&
+      !(
+        server.protocol === "http:" && ["127.0.0.1", "[::1]"].includes(server.hostname)
+      ))
+  )
+    throw Error("browser_kubernetes_configuration_invalid");
+  return async (
+    path: string,
+    method: string,
+    body: unknown,
+    callerSignal: AbortSignal,
+  ): Promise<any> => {
+    const signal = AbortSignal.any([callerSignal, AbortSignal.timeout(15000)]);
+    signal.throwIfAborted();
+    const token = options.tokenFile
+      ? (await readFile(options.tokenFile, "utf8")).trim()
+      : undefined;
+    signal.throwIfAborted();
+    const payload = body === undefined ? undefined : JSON.stringify(body);
+    return new Promise((resolve, reject) => {
+      const request = (server.protocol === "https:" ? httpsRequest : httpRequest)(
+        new URL(path, server),
+        {
+          method,
+          ca: options.ca,
+          signal,
+          headers: {
+            "content-type": "application/json",
+            ...(payload
+              ? { "content-length": String(Buffer.byteLength(payload)) }
+              : {}),
+            ...(token ? { authorization: `Bearer ${token}` } : {}),
+          },
+        },
+        (response) => {
+          const chunks: Buffer[] = [];
+          let size = 0;
+          response.on("data", (chunk) => {
+            size += chunk.length;
+            if (size > 1048576)
+              request.destroy(Error("browser_kubernetes_response_too_large"));
+            else chunks.push(chunk);
+          });
+          response.on("error", () => reject(Error("browser_kubernetes_unavailable")));
+          response.on("end", () => {
+            if (response.statusCode < 200 || response.statusCode >= 300) {
+              reject(new KubernetesError(response.statusCode));
+              return;
+            }
+            try {
+              resolve(size ? JSON.parse(Buffer.concat(chunks).toString()) : {});
+            } catch {
+              reject(Error("browser_kubernetes_response_invalid"));
+            }
+          });
+        },
+      );
+      request.on("error", () => reject(Error("browser_kubernetes_unavailable")));
+      request.end(payload);
+    });
+  };
+}

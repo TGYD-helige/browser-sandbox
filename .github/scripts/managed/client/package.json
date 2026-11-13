@@ -1,0 +1,7 @@
+{
+  "name": "browser-sandbox-managed-ci",
+  "private": true,
+  "dependencies": {
+    "agent-browser": "0.41.1"
+  }
+}

@@ -1,6 +1,13 @@
 import type { AutomationCoordinator } from "./automation-control.js";
 import type { BrowserRuntime, Placement } from "./runtime-provider.js";
 
+export const WORKER_ENVIRONMENT = [
+  "TIMEOUT",
+  "TZ",
+  "BROWSER_STARTUP_TIMEOUT",
+  "LANG",
+] as const;
+
 /** Exact backend incarnation. Private addresses never leave the controller. */
 export interface ManagedWorker {
   id: string;
