@@ -481,3 +481,31 @@ test("slow worker creation refreshes idle activity before the first CDP connecti
   await controller.reconcile();
   assert.equal(f.resources.size, 1);
 });
+
+test("restart cleans a network-only remainder of unconfirmed partial creation", async (t) => {
+  const f = await fixture(t);
+  f.backend.create = async (placement) => {
+    const worker = {
+      ...placement,
+      id: "network/partial",
+      origin: "",
+      infrastructureOnly: true,
+      runtime: {
+        request: async () => {
+          throw Error("must not connect");
+        },
+      },
+    };
+    f.resources.set(worker.id, worker);
+    throw Error("browser_worker_cleanup_unconfirmed");
+  };
+  const first = await f.start();
+  const endpoint = await first.command({ op: "register", executionId: randomUUID() });
+  assert.equal((await fetch(fileUrl(first, endpoint))).status, 502);
+  await assert.rejects(first.stop(), /browser_worker_cleanup_unconfirmed/);
+  const second = await f.start();
+  assert.equal(second.capacity().workers, 1);
+  await second.reconcile();
+  assert.equal(f.resources.size, 0);
+  assert.equal(second.capacity().workers, 0);
+});
