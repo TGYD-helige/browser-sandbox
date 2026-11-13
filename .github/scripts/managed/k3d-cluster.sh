@@ -12,6 +12,10 @@ case "$action" in
       --k3s-arg '--disable=traefik,servicelb,metrics-server@server:*' --wait --timeout 180s
     umask 077
     k3d kubeconfig get "$cluster" > "$config"
+    # k3d records literal port zero; Docker chooses the actual published port.
+    address=$(docker port "k3d-$cluster-server-0" 6443/tcp)
+    [[ "$address" =~ ^127\.0\.0\.1:[1-9][0-9]*$ ]]
+    kubectl --kubeconfig "$config" config set-cluster "k3d-$cluster" --server="https://$address"
     kubectl --kubeconfig "$config" wait --for=condition=Ready nodes --all --timeout=120s
     ;;
   delete) k3d cluster delete "$cluster" ;;

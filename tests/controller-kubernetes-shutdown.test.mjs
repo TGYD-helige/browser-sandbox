@@ -46,35 +46,36 @@ test("Kubernetes rollout disconnects clients while preserving an allocated worke
   assert.equal(closed, true);
 });
 
-test("rollout shutdown reports unconfirmed cleanup of a cancelled creation", async () => {
-  let acquired;
-  const started = new Promise((resolve) => {
-    acquired = resolve;
-  });
-  const controller = await createController({
-    port: 0,
-    backend: {
-      async create(_placement, signal) {
-        acquired();
-        await new Promise((resolve) =>
-          signal.addEventListener("abort", resolve, { once: true }),
-        );
-        throw Error("browser_worker_cleanup_unconfirmed");
+for (const code of [
+  "browser_worker_cleanup_unconfirmed",
+  "browser_kubernetes_unavailable",
+])
+  test(`rollout shutdown reports failed creation cleanup: ${code}`, async () => {
+    let acquired;
+    const started = new Promise((resolve) => {
+      acquired = resolve;
+    });
+    const controller = await createController({
+      port: 0,
+      backend: {
+        async create(_placement, signal) {
+          acquired();
+          await new Promise((resolve) =>
+            signal.addEventListener("abort", resolve, { once: true }),
+          );
+          throw Error(code);
+        },
+        async remove() {},
       },
-      async remove() {},
-    },
+    });
+    const { wsEndpoint } = await controller.command({
+      op: "register",
+      executionId: randomUUID(),
+    });
+    const request = fetch(`${wsEndpoint.replace("ws:", "http:")}/files/test`).catch(
+      () => {},
+    );
+    await started;
+    await assert.rejects(controller.stop({ preserveWorkers: true }), new RegExp(code));
+    await request;
   });
-  const { wsEndpoint } = await controller.command({
-    op: "register",
-    executionId: randomUUID(),
-  });
-  const request = fetch(`${wsEndpoint.replace("ws:", "http:")}/files/test`).catch(
-    () => {},
-  );
-  await started;
-  await assert.rejects(
-    controller.stop({ preserveWorkers: true }),
-    /browser_worker_cleanup_unconfirmed/,
-  );
-  await request;
-});
