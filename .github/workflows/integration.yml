@@ -25,7 +25,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        harness: [pi, dsh, opencode, agent-browser]
+        # The comma-separated entry runs every harness concurrently against one runtime.
+        harness:
+          [pi, dsh, opencode, agent-browser, "pi,dsh,opencode,agent-browser"]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -43,7 +45,7 @@ jobs:
       - run: node .github/scripts/e2e.mjs ${{ matrix.harness }}
 
       - name: Model-driven browser handoff
-        if: matrix.harness != 'agent-browser' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_model) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+        if: matrix.harness != 'agent-browser' && !contains(matrix.harness, ',') && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_model) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           E2E_MODE: model
           OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}

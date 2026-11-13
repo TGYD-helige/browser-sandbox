@@ -17,6 +17,7 @@ import {
 } from "./local-profiles.js";
 import { normalizeAllowedDomains } from "./network-policy.js";
 import { Observation } from "./observation.js";
+import { validExecutorUid } from "./peer-identity.js";
 import { createProfileWork } from "./profile-work.js";
 import { createProfileArchive } from "./profiles.js";
 import { BrowserSession } from "./session.js";
@@ -75,8 +76,6 @@ const preparationTiming = channel("browser-sandbox.preparation");
 
 const MAX_REVOKED_EXECUTIONS = 65536;
 const uuid = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
-const validExecutorUid = (uid) =>
-  Number.isInteger(uid) && uid >= 100000 && uid < 2000000000;
 const fail = (code) => {
   throw Error(code);
 };
@@ -94,13 +93,20 @@ export async function createExecutions({
 }) {
   if (!Number.isSafeInteger(maxBrowsers) || maxBrowsers < 1)
     fail("browser_capacity_invalid");
+  if (
+    !Number.isSafeInteger(startupTimeoutMs) ||
+    startupTimeoutMs < 1 ||
+    startupTimeoutMs > 600_000
+  )
+    fail("browser_startup_timeout_invalid");
   // The fixed debug-port pool bounds live executions and their cleanup waiters.
   const profileWork = createProfileWork(maxBrowsers, 43000 - 42000);
   await mkdir(dataRoot, { recursive: true, mode: 0o755 });
   await chmod(dataRoot, 0o755);
   const executions = new Map<string, Execution>(),
     revoked = new Set(),
-    reservedPorts = new Set();
+    reservedPorts = new Set(),
+    reservedUids = new Set();
   const mutations = new Map<string, Promise<void>>();
   let closing = false;
   if (
@@ -163,6 +169,14 @@ export async function createExecutions({
         })
       )
         fail("browser_execution_recovery_required");
+      // The kernel peer UID is the endpoint's authority, so two live executions must never share one.
+      const exclusiveUid = executorUid !== undefined;
+      if (
+        exclusiveUid &&
+        (reservedUids.has(uid) ||
+          [...executions.values()].some((item) => item.uid === uid))
+      )
+        fail("browser_executor_uid_in_use");
       let debugPort: number;
       for (let port = 42000; port < 43000; port++)
         if (
@@ -174,6 +188,7 @@ export async function createExecutions({
         }
       if (!debugPort) fail("browser_capacity_invalid");
       reservedPorts.add(debugPort);
+      if (exclusiveUid) reservedUids.add(uid);
       try {
         await mkdir(root, { recursive: true, mode: 0o711 });
         const profileDir = join(root, "profile");
@@ -209,6 +224,7 @@ export async function createExecutions({
         executions.set(executionId, entry);
       } finally {
         reservedPorts.delete(debugPort);
+        reservedUids.delete(uid);
       }
     }
     return {

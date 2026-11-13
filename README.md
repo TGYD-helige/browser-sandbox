@@ -48,6 +48,7 @@ flowchart LR
 | **Standard CDP** | A separate authorized WebSocket endpoint for each execution |
 | **Lazy startup** | Start Chrome and prepare Profile data on first connection; unused browsers skip storage work |
 | **Resource control** | Bounded concurrency and queues, cancellation, timeouts, and idle reclamation |
+| **Shared sessions** | Host helper gives each harness session its own execution and UID; a runtime provider interface places executions for future multi-instance or per-tenant deployments |
 | **Profile reuse** | Temporary Profiles by default; optional stable profileId for persistent login state |
 | **Reliable shutdown** | Confirm process exit before Profile reuse; preserve recoverable data when saving fails |
 | **Persistent site data** | Native Profile data and persistent Cookie checkpoints, including deletion and expiry semantics |

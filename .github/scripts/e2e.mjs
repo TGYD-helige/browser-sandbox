@@ -13,11 +13,18 @@ const run = (args, input) => {
   work.child.stdin.end(input);
   return work;
 };
-const harness = process.argv[2];
+// A comma-separated list runs each harness as its own execution and UID against one runtime.
+const harnesses = (process.argv[2] ?? "").split(",");
 assert(
-  ["pi", "dsh", "opencode", "agent-browser", "unused"].includes(harness),
-  "Choose pi, dsh, opencode, agent-browser, or unused",
+  harnesses.every((name) =>
+    ["pi", "dsh", "opencode", "agent-browser"].includes(name),
+  ) ||
+    (harnesses.length === 1 && harnesses[0] === "unused"),
+  "Choose pi, dsh, opencode, agent-browser, a comma-separated list of them, or unused",
 );
+assert.equal(new Set(harnesses).size, harnesses.length, "List each harness once");
+// About 1 GiB per browser, matching the default two browsers in 2 GiB.
+const browsers = Math.max(2, harnesses.length);
 const mode = process.env.E2E_MODE ?? "tools";
 assert(["tools", "model"].includes(mode), "Choose tools or model");
 if (mode === "model")
@@ -26,8 +33,6 @@ if (mode === "model")
 const root = await mkdtemp(join(tmpdir(), "browser-e2e-"));
 const image = process.env.BROWSER_IMAGE ?? "browser-sandbox:local";
 let container, extraction, filesVolume;
-const executionId = randomUUID();
-const executionFiles = `/tmp/browser-data/${executionId}/files`;
 const control = async (request) =>
   JSON.parse(
     (
@@ -78,7 +83,9 @@ try {
       "--shm-size",
       "512m",
       "--memory",
-      "2g",
+      `${browsers}g`,
+      "-e",
+      `CONCURRENT=${browsers}`,
       "--mount",
       `type=volume,src=${filesVolume},dst=/browser-data`,
       "--mount",
@@ -102,53 +109,83 @@ try {
     }
   }
   assert(healthy, "Browser renderer probe failed");
-  const { wsEndpoint } = await control({
-    op: "register",
-    executionId,
-    executorUid: 100001,
-  });
-  const args = [
-    "run",
-    "--rm",
-    "--init",
-    "--network",
-    `container:${container}`,
-    "--cap-drop",
-    "ALL",
-    "--security-opt",
-    "no-new-privileges",
-    "--memory",
-    "2g",
-    "--mount",
-    `type=volume,src=${filesVolume},volume-subpath=${executionId}/files,dst=${executionFiles},readonly`,
-    "--tmpfs",
-    "/tmp:rw,size=256m,mode=1777",
-    "-e",
-    `BROWSER_WS_ENDPOINT=${wsEndpoint}`,
-    "-e",
-    `E2E_MODE=${mode}`,
-    "-e",
-    "E2E_SCENARIO",
-    "-e",
-    `BROWSER_FILES_DIRECTORY=${executionFiles}`,
-  ];
-  if (mode === "model")
-    for (const key of ["OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL_NAME"])
-      args.push("-e", key);
-  const result = await run([
-    ...args,
-    "browser-sandbox-e2e:local",
-    `/project/.github/scripts/e2e/${harness}.mjs`,
-  ]);
-  if (harness === "unused" && process.env.PERFORMANCE_OUTPUT)
-    await writeFile(
-      process.env.PERFORMANCE_OUTPUT,
-      JSON.stringify(JSON.parse(result.stdout), null, 2),
-    );
-  else process.stdout.write(result.stdout);
-  await control({ op: "finalize", executionId });
-  console.log(`${harness} ${mode}: host finalization passed`);
-} catch (error) {
+  // Quality and image workflows run this without a dist build, so allocate identities inline.
+  const runHarness = async (harness, index) => {
+    const executionId = randomUUID();
+    const executorUid = 100001 + index;
+    const executionFiles = `/tmp/browser-data/${executionId}/files`;
+    try {
+      const { wsEndpoint } = await control({
+        op: "register",
+        executionId,
+        executorUid,
+      });
+      const args = [
+        "run",
+        "--rm",
+        "--init",
+        "--network",
+        `container:${container}`,
+        "--user",
+        `${executorUid}:${executorUid}`,
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--memory",
+        "2g",
+        "--mount",
+        `type=volume,src=${filesVolume},volume-subpath=${executionId}/files,dst=${executionFiles},readonly`,
+        "--tmpfs",
+        "/tmp:rw,size=256m,mode=1777",
+        "-e",
+        `BROWSER_WS_ENDPOINT=${wsEndpoint}`,
+        "-e",
+        `E2E_MODE=${mode}`,
+        "-e",
+        "E2E_SCENARIO",
+        "-e",
+        `BROWSER_FILES_DIRECTORY=${executionFiles}`,
+      ];
+      if (mode === "model")
+        for (const key of ["OPENAI_BASE_URL", "OPENAI_API_KEY", "OPENAI_MODEL_NAME"])
+          args.push("-e", key);
+      const result = await run([
+        ...args,
+        "browser-sandbox-e2e:local",
+        `/project/.github/scripts/e2e/${harness}.mjs`,
+      ]);
+      if (harness === "unused" && process.env.PERFORMANCE_OUTPUT)
+        await writeFile(
+          process.env.PERFORMANCE_OUTPUT,
+          JSON.stringify(JSON.parse(result.stdout), null, 2),
+        );
+      else process.stdout.write(result.stdout);
+      await control({ op: "finalize", executionId });
+      console.log(`${harness} ${mode}: host finalization passed`);
+    } catch (error) {
+      error.harness = harness;
+      throw error;
+    }
+  };
+  const failures = (await Promise.allSettled(harnesses.map(runHarness)))
+    .filter((outcome) => outcome.status === "rejected")
+    .map((outcome) => outcome.reason);
+  if (failures.length) throw new AggregateError(failures);
+  if (harnesses.length > 1)
+    console.log(`${harnesses.join(",")} ${mode}: concurrent executions passed`);
+} catch (outcome) {
+  for (const error of outcome instanceof AggregateError ? outcome.errors : [outcome])
+    await report(error, error.harness ?? harnesses.join(","));
+  process.exitCode = 1;
+} finally {
+  if (container) await run(["rm", "-f", container]);
+  if (extraction) await run(["rm", "-f", extraction]);
+  if (filesVolume) await run(["volume", "rm", filesVolume]);
+  await rm(root, { recursive: true, force: true });
+}
+
+async function report(error, harness) {
   if (harness === "unused" && process.env.PERFORMANCE_OUTPUT && error.stdout) {
     try {
       await writeFile(
@@ -180,10 +217,4 @@ try {
   console.error(
     `${harness} ${mode} E2E failed (exit ${error.code ?? "unknown"}); raw subprocess output withheld`,
   );
-  process.exitCode = 1;
-} finally {
-  if (container) await run(["rm", "-f", container]);
-  if (extraction) await run(["rm", "-f", extraction]);
-  if (filesVolume) await run(["volume", "rm", filesVolume]);
-  await rm(root, { recursive: true, force: true });
 }

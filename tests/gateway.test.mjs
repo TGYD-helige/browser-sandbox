@@ -95,6 +95,10 @@ async function fixture(
     socketPath: join(root, "control.sock"),
     healthy: async () => true,
     launch: (args) => launch({ ...args, endpoint }),
+  }).catch(async (error) => {
+    await new Promise((resolve) => upstream.close(resolve));
+    await rm(root, { recursive: true, force: true });
+    throw error;
   });
   return {
     root,
@@ -298,6 +302,46 @@ test("execution registration rejects invalid UIDs and bounds parallel CDP peers"
   }
 });
 
+test("live executions cannot share an executor UID until the holder finishes", async () => {
+  const f = await fixture(async () => {
+    throw Error("registration must not launch Chrome");
+  });
+  const register = (executionId) =>
+    f.gateway.command({ op: "register", executionId, executorUid: 100001 }, true);
+  try {
+    // Concurrent registrations race through the same awaits before either entry exists.
+    const results = await Promise.allSettled(ids.map(register));
+    const rejected = results.filter((result) => result.status === "rejected");
+    assert.equal(rejected.length, 1);
+    assert.match(rejected[0].reason.message, /browser_executor_uid_in_use/);
+    const holder = ids[results.findIndex((result) => result.status === "fulfilled")];
+    const waiting = ids.find((id) => id !== holder);
+    await register(holder);
+    await f.gateway.command({ op: "finish", executionId: holder }, true);
+    assert.equal((await register(waiting)).executorUid, 100001);
+  } finally {
+    await f.stop();
+  }
+});
+
+test("invalid browser startup timeouts stop the gateway before it starts", async () => {
+  for (const startupTimeoutMs of [0, Number.NaN, 600_001]) {
+    const started = await fixture(
+      async () => assert.fail("must not launch"),
+      undefined,
+      {
+        startupTimeoutMs,
+      },
+    ).catch((error) => {
+      assert.match(error.message, /browser_startup_timeout_invalid/);
+    });
+    if (started) {
+      await started.stop();
+      assert.fail(`startupTimeoutMs ${startupTimeoutMs} was accepted`);
+    }
+  }
+});
+
 async function disconnect(socket) {
   const closed = once(socket, "close");
   socket.close();
@@ -312,7 +356,8 @@ for (const cancellation of [true, false])
     let held = false,
       restores = 0,
       releases = 0,
-      launches = 0;
+      launches = 0,
+      peerUid = 100001;
     const f = await fixture(
       async ({ endpoint }) => {
         launches++;
@@ -320,7 +365,7 @@ for (const cancellation of [true, false])
       },
       undefined,
       {
-        resolvePeerUid: () => 100001,
+        resolvePeerUid: () => peerUid,
         profileStore: {
           async acquire() {
             if (held) throw Error("browser_profile_busy");
@@ -365,7 +410,7 @@ for (const cancellation of [true, false])
     );
     const registration = (executionId) => ({
       executionId,
-      executorUid: 100001,
+      executorUid: 100001 + ids.indexOf(executionId),
       profileId: "shared",
     });
     const storages = [];
@@ -387,6 +432,7 @@ for (const cancellation of [true, false])
       if (!cancellation) await delay(1100);
       const nextId = cancellation ? ids[1] : ids[0];
       const next = await register(nextId);
+      peerUid = next.executorUid;
       second = new WebSocket(next.wsEndpoint);
       second.on("error", () => {});
       await once(second, "open");
@@ -424,7 +470,8 @@ test("failed initialization releases its Profile lease before another execution 
   let held = false,
     releases = 0,
     restores = 0,
-    launches = 0;
+    launches = 0,
+    peerUid = 100001;
   const f = await fixture(
     async () => {
       launches++;
@@ -432,7 +479,7 @@ test("failed initialization releases its Profile lease before another execution 
     },
     undefined,
     {
-      resolvePeerUid: () => 100001,
+      resolvePeerUid: () => peerUid,
       profileStore: {
         async acquire() {
           if (held) throw Error("browser_profile_busy");
@@ -462,10 +509,11 @@ test("failed initialization releases its Profile lease before another execution 
     for (const executionId of ids) {
       const registration = {
         executionId,
-        executorUid: 100001,
+        executorUid: 100001 + ids.indexOf(executionId),
         profileId: "shared-profile",
       };
       const { wsEndpoint } = await registerStored(f, storages, registration);
+      peerUid = registration.executorUid;
       const socket = new WebSocket(wsEndpoint);
       socket.on("error", () => {});
       const [, reason] = await once(socket, "close");
@@ -2673,6 +2721,7 @@ test("a quiesce already closing cannot reopen access after a concurrent finish f
 });
 
 test("Profile preparation is bounded before browser admission and queued work is cancellable", async () => {
+  let peerUid = 100001;
   const gate = Promise.withResolvers();
   let acquisitions = 0;
   const f = await fixture(
@@ -2680,7 +2729,7 @@ test("Profile preparation is bounded before browser admission and queued work is
     undefined,
     {
       maxBrowsers: 1,
-      resolvePeerUid: () => 100001,
+      resolvePeerUid: () => peerUid,
       profileStore: {
         async acquire(_profile, executionId) {
           acquisitions++;
@@ -2707,11 +2756,12 @@ test("Profile preparation is bounded before browser admission and queued work is
         {
           op: "register",
           executionId,
-          executorUid: 100001,
+          executorUid: 100001 + i,
           profileId: "bounded/" + i,
         },
         true,
       );
+      peerUid = 100001 + i;
       const client = new WebSocket(wsEndpoint);
       client.on("error", () => {});
       clients.push(client);
@@ -2792,6 +2842,7 @@ test("the first CDP reply can wait for cold startup while later calls retain the
 });
 
 test("Profile saves share bounded admission, cancel queued work and keep ordinary control responsive", async () => {
+  let peerUid = 100001;
   const gate = Promise.withResolvers();
   let saves = 0;
   const sha = "a".repeat(64);
@@ -2800,7 +2851,7 @@ test("Profile saves share bounded admission, cancel queued work and keep ordinar
     undefined,
     {
       maxBrowsers: 1,
-      resolvePeerUid: () => 100001,
+      resolvePeerUid: () => peerUid,
       profileStore: {
         async acquire(_profile, executionId) {
           const profileDir = join(f.root, "data", executionId, "profile");
@@ -2834,10 +2885,11 @@ test("Profile saves share bounded admission, cancel queued work and keep ordinar
       entries.push(executionId);
       const registration = {
         executionId,
-        executorUid: 100001,
+        executorUid: 100001 + i,
         profileId: `save/${i}`,
       };
       const { wsEndpoint } = await registerStored(f, storages, registration);
+      peerUid = 100001 + i;
       clients.push(await connect(wsEndpoint));
     }
     saving.push(
@@ -2862,7 +2914,7 @@ test("Profile saves share bounded admission, cancel queued work and keep ordinar
     await hostRequest(join(f.root, "control.sock"), {
       op: "register",
       executionId: ordinary,
-      executorUid: 100001,
+      executorUid: 100009,
     });
     await hostRequest(join(f.root, "control.sock"), {
       op: "finish",
@@ -2887,6 +2939,7 @@ test("Profile saves share bounded admission, cancel queued work and keep ordinar
 });
 
 test("Profile releases share admission with preparation even when its ordinary queue is full", async () => {
+  let peerUid = 100001;
   const gate = Promise.withResolvers();
   let releases = 0,
     active = 0,
@@ -2896,7 +2949,7 @@ test("Profile releases share admission with preparation even when its ordinary q
     undefined,
     {
       maxBrowsers: 1,
-      resolvePeerUid: () => 100001,
+      resolvePeerUid: () => peerUid,
       profileStore: {
         async acquire(_profile, executionId) {
           active++;
@@ -2937,11 +2990,12 @@ test("Profile releases share admission with preparation even when its ordinary q
         {
           op: "register",
           executionId,
-          executorUid: 100001,
+          executorUid: 100001 + i,
           profileId: `release/${i}`,
         },
         true,
       );
+      peerUid = 100001 + i;
       clients.push(await connect(wsEndpoint));
     }
     finishing.push(f.gateway.command({ op: "finish", executionId: entries[0] }, true));
@@ -2953,11 +3007,12 @@ test("Profile releases share admission with preparation even when its ordinary q
         {
           op: "register",
           executionId,
-          executorUid: 100001,
+          executorUid: 100001 + i,
           profileId: `release/${i}`,
         },
         true,
       );
+      peerUid = 100001 + i;
       const client = new WebSocket(wsEndpoint);
       client.on("error", () => {});
       clients.push(client);
@@ -2980,6 +3035,7 @@ test("Profile releases share admission with preparation even when its ordinary q
 });
 
 test("failed Profile restores retain admission for ownership recovery before later preparation", async () => {
+  let peerUid = 100001;
   const gate = Promise.withResolvers();
   let active = 0,
     peak = 0,
@@ -3001,7 +3057,7 @@ test("failed Profile restores retain admission for ownership recovery before lat
     undefined,
     {
       maxBrowsers: 1,
-      resolvePeerUid: () => 100001,
+      resolvePeerUid: () => peerUid,
       profileStore: {
         acquire(_profile, executionId) {
           return track(async () => {
@@ -3036,10 +3092,11 @@ test("failed Profile restores retain admission for ownership recovery before lat
     for (let i = 0; i < 3; i++) {
       const registration = {
         executionId: randomUUID(),
-        executorUid: 100001,
+        executorUid: 100001 + i,
         profileId: `failed/${i}`,
       };
       const { wsEndpoint } = await registerStored(f, storages, registration);
+      peerUid = 100001 + i;
       const client = new WebSocket(wsEndpoint);
       client.on("error", () => {});
       clients.push(client);
