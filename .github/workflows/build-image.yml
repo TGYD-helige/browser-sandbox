@@ -1,18 +1,7 @@
-name: Build browser images
+name: Publish verified browser image aliases
 
 on:
-  push:
-    tags: ["v[0-9]*.[0-9]*.[0-9]*"]
   workflow_dispatch:
-    inputs:
-      image_tag:
-        description: Existing Git version tag reachable from master (for example v0.1.1)
-        type: string
-        required: true
-      publish_latest:
-        description: Also publish this version as latest
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -21,195 +10,52 @@ concurrency:
   group: browser-image-build
   cancel-in-progress: false
 
-env:
-  REGISTRY: ${{ vars.BAIDU_CCR_REGISTRY }}
-  NAMESPACE: ${{ vars.BAIDU_CCR_NAMESPACE }}
-  IMAGE_NAMES: ${{ vars.BROWSER_IMAGE_NAMES }}
-  IMAGE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.image_tag }}
-  PUBLISH_LATEST: ${{ inputs.publish_latest }}
-
 jobs:
-  prepare:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      image: ${{ steps.validate.outputs.image }}
-      source_sha: ${{ steps.validate.outputs.source_sha }}
+  publish:
+    runs-on: ${{ vars.BROWSER_IMAGE_PUBLISH_RUNNER || 'arc-simple' }}
+    timeout-minutes: 20
+    env:
+      DOCKER_CONFIG: ${{ runner.temp }}/browser-image-auth
+      REGISTRY: ${{ vars.BAIDU_CCR_REGISTRY }}
+      NAMESPACE: ${{ vars.BAIDU_CCR_NAMESPACE }}
+      VERIFIED_DIGEST: sha256:de2f7cf91e6eb5b9d791157ec9b7c6e6c50dfbc7e07318159e55f77950ab2d4e
     steps:
-      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
         with:
-          persist-credentials: false
-          fetch-depth: 0
-      - name: Validate publication configuration
-        id: validate
+          registry: ${{ env.REGISTRY }}
+          username: ${{ vars.BAIDU_CCR_USERNAME }}
+          password: ${{ secrets.BAIDU_CCR_PASSWORD }}
+      - name: Copy verified version and publish generic latest
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
-            [[ "$GITHUB_REF" == "refs/tags/$IMAGE_TAG" ]] || exit 1
-            [[ "$IMAGE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
-            master_ref=refs/remotes/origin/master
-          else
-            [[ "$GITHUB_REF" == refs/heads/master ]] || exit 1
-            master_ref="$GITHUB_SHA"
-          fi
-          [[ "$REGISTRY" =~ ^[a-z0-9][a-z0-9.-]*(:[0-9]+)?$ ]] || exit 1
-          [[ "$NAMESPACE" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || exit 1
-          [[ "$IMAGE_TAG" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]{0,127}$ ]] || exit 1
-          if [[ "$IMAGE_TAG" == latest || "$IMAGE_TAG" == sha-* ]]; then
-            echo "Use a version tag; latest and sha-* are reserved image tags." >&2
-            exit 1
-          fi
-          if ! source_sha="$(git rev-parse --verify "refs/tags/$IMAGE_TAG^{commit}")"; then
-            echo "Create and push the Git version tag before publishing." >&2
-            exit 1
-          fi
-          if ! git merge-base --is-ancestor "$source_sha" "$master_ref"; then
-            echo "The Git version tag must be reachable from master." >&2
-            exit 1
-          fi
-          read -ra names <<< "$IMAGE_NAMES"
-          ((${#names[@]} > 0))
-          for name in "${names[@]}"; do
-            [[ "$name" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]] || exit 1
+          base="$REGISTRY/$NAMESPACE"
+          source="$base/mirrorx-browser-use-runtime"
+          target="$base/browser-sandbox"
+          [[ "$(crane digest "$source:v0.1.2")" == "$VERIFIED_DIGEST" ]]
+          crane manifest "$source@$VERIFIED_DIGEST" | jq -e '[.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]'
+          declare -A old_latest
+          for name in mirrorx-browser-use-runtime chrome-sidecar; do
+            [[ "$(crane digest "$base/$name:v0.1.2")" == "$VERIFIED_DIGEST" ]]
+            tags="$(crane ls "$base/$name")"
+            case $'\n'"$tags"$'\n' in
+              *$'\nlatest\n'*) old_latest[$name]="$(crane digest "$base/$name:latest")" ;;
+              *) old_latest[$name]=absent ;;
+            esac
           done
-          echo "image=$REGISTRY/$NAMESPACE/${names[0]}" >> "$GITHUB_OUTPUT"
-          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
-
-  image:
-    needs: prepare
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: ubuntu-24.04
-            architecture: amd64
-          - runner: ubuntu-24.04-arm
-            architecture: arm64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.prepare.outputs.source_sha }}
-          persist-credentials: false
-      - name: Build and verify native image
-        run: |
-          docker build -t browser-sandbox:local .
-          bash .github/scripts/verify-image.sh browser-sandbox:local
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - name: Verify Pi agent browser-session tools
-        run: |
-          docker build -f Dockerfile.e2e -t browser-sandbox-e2e:local .
-          node .github/scripts/e2e.mjs pi
-      - name: Export verified image
-        run: |
-          docker save --output image.tar browser-sandbox:local
-          sha256sum image.tar > image.tar.sha256
-      - uses: actions/upload-artifact@v4
-        with:
-          name: browser-image-archive-${{ matrix.architecture }}
-          path: |
-            image.tar
-            image.tar.sha256
-          compression-level: 1
-          retention-days: 1
-          if-no-files-found: error
-
-  transfer:
-    needs: [prepare, image]
-    runs-on: ${{ vars.BROWSER_IMAGE_PUBLISH_RUNNER || 'arc-simple' }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        architecture: [amd64, arm64]
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          name: browser-image-archive-${{ matrix.architecture }}
-      - uses: docker/login-action@v3
-        env:
-          DOCKER_CONFIG: ${{ runner.temp }}/browser-image-auth
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ vars.BAIDU_CCR_USERNAME }}
-          password: ${{ secrets.BAIDU_CCR_PASSWORD }}
-      - name: Push verified architecture image
-        env:
-          DOCKER_CONFIG: ${{ runner.temp }}/browser-image-auth
-          IMAGE: ${{ needs.prepare.outputs.image }}
-          ARCH: ${{ matrix.architecture }}
-        run: bash .github/scripts/push-image-archive.sh
-      - uses: actions/upload-artifact@v4
-        with:
-          name: browser-build-digest-${{ matrix.architecture }}
-          path: ${{ matrix.architecture }}.txt
-          if-no-files-found: error
-      - name: Remove downloaded image archive
-        if: always()
-        run: rm -f image.tar image.tar.sha256 config.json "${{ matrix.architecture }}.digest"
-
-  publish:
-    needs: [prepare, transfer]
-    runs-on: ${{ vars.BROWSER_IMAGE_PUBLISH_RUNNER || 'arc-simple' }}
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: browser-build-digest-*
-          merge-multiple: true
-      - uses: docker/login-action@v3
-        env:
-          DOCKER_CONFIG: ${{ runner.temp }}/browser-image-auth
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ vars.BAIDU_CCR_USERNAME }}
-          password: ${{ secrets.BAIDU_CCR_PASSWORD }}
-      - name: Publish verified multi-architecture images
-        timeout-minutes: 20
-        env:
-          DOCKER_CONFIG: ${{ runner.temp }}/browser-image-auth
-          SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
-        run: bash .github/scripts/publish-image-index.sh
-
-  release-notes:
-    needs: publish
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - name: Publish release with model summary
-        env:
-          GH_TOKEN: ${{ github.token }}
-          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL_NAME: ${{ vars.OPENAI_MODEL_NAME || secrets.OPENAI_MODEL_NAME }}
-        run: |
-          set -euo pipefail
-          release_state="$(gh release list --limit 1000 --json tagName,isDraft --jq '.[] | select(.tagName == env.IMAGE_TAG) | .isDraft')"
-          if [[ "$release_state" == true ]]; then
-            gh release edit "$IMAGE_TAG" --draft=false
-            exit 0
-          fi
-          if [[ "$release_state" == false ]]; then
-            echo 'Release already published; preserving its notes.'
-            exit 0
-          fi
-          node .github/scripts/generate-release-summary.mjs "$IMAGE_TAG" release-notes.md
-          gh release create "$IMAGE_TAG" --verify-tag --title "$IMAGE_TAG" --notes-file release-notes.md
+          crane copy "$source@$VERIFIED_DIGEST" "$target:v0.1.2"
+          [[ "$(crane digest "$target:v0.1.2")" == "$VERIFIED_DIGEST" ]]
+          crane tag "$target@$VERIFIED_DIGEST" latest
+          [[ "$(crane digest "$target:latest")" == "$VERIFIED_DIGEST" ]]
+          for name in mirrorx-browser-use-runtime chrome-sidecar; do
+            [[ "$(crane digest "$base/$name:v0.1.2")" == "$VERIFIED_DIGEST" ]]
+            tags="$(crane ls "$base/$name")"
+            case $'\n'"$tags"$'\n' in
+              *$'\nlatest\n'*) current="$(crane digest "$base/$name:latest")" ;;
+              *) current=absent ;;
+            esac
+            [[ "$current" == "${old_latest[$name]}" ]]
+            printf 'Verified unchanged: %s (v0.1.2 and latest).\n' "$base/$name" >> "$GITHUB_STEP_SUMMARY"
+          done
+          printf 'Published %s:v0.1.2 and %s:latest at %s (Linux AMD64/ARM64).\n' "$target" "$target" "$VERIFIED_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          echo "Verified generic version and latest; both legacy image names are unchanged."
