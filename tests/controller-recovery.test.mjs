@@ -59,9 +59,13 @@ async function fixture(t) {
     },
   };
   t.after(async () => {
-    for (const controller of controllers) await controller.stop({ finalize: true });
+    const results = await Promise.allSettled(
+      [...controllers].map((controller) => controller.stop({ finalize: true })),
+    );
     await new Promise((resolve) => worker.close(resolve));
     await rm(directory, { recursive: true, force: true });
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure) throw failure.reason;
   });
   return {
     directory,
