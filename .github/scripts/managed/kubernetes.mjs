@@ -296,6 +296,7 @@ try {
     "--wait",
   ]);
   const losing = await client("hold");
+  assert.equal((await client("status", losing.executionId)).state, "retained");
   cordoned = workerNode;
   await run(
     "kubectl",

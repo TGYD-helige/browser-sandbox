@@ -29,8 +29,17 @@ async function connect(endpoint) {
   return cdp;
 }
 try {
-  if (action === "lost") {
-    await assert.rejects(runtime.request({ op: "session", executionId }), /browser_/);
+  if (action === "status") {
+    console.log(
+      JSON.stringify(
+        await runtime.request({ op: "session", executionId, action: "status" }),
+      ),
+    );
+  } else if (action === "lost") {
+    await assert.rejects(
+      runtime.request({ op: "session", executionId, action: "status" }),
+      /browser_(?:control_|worker_|session_lost)/,
+    );
     console.log(JSON.stringify({ workerLossReported: true }));
   } else {
     const { wsEndpoint } = await runtime.request({ op: "register", executionId });
@@ -238,6 +247,39 @@ try {
         await call("close");
         await rm(home, { recursive: true, force: true });
       }
+      const expiringGrant = await runtime.request({
+        op: "access_create",
+        executionId,
+        durationMs: 1,
+      });
+      while (Date.now() <= expiringGrant.expiresAt) await delay(1);
+      await assert.rejects(connectCdp(expiringGrant.cdpUrl), /browser_cdp_/);
+      await runtime.request({
+        op: "session",
+        executionId,
+        action: "renew",
+        durationMs: 100,
+      });
+      const expiryDeadline = Date.now() + 10000;
+      while (
+        (await runtime.request({ op: "session", executionId, action: "status" }))
+          .state !== "expired"
+      ) {
+        assert(
+          Date.now() < expiryDeadline,
+          "retention expiry did not retire the browser",
+        );
+        await delay(25);
+      }
+      await assert.rejects(
+        runtime.request({
+          op: "session",
+          executionId,
+          action: "renew",
+          durationMs: 1000,
+        }),
+        /browser_session_/,
+      );
       const finalStarted = performance.now();
       await runtime.request({ op: "finalize", executionId });
       finalized = true;
