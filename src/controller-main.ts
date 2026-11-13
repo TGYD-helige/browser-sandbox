@@ -12,6 +12,7 @@ const image =
   process.env.BROWSER_IMAGE ??
   (await createDockerClient(socketPath)(`/containers/${container}/json`)).Image;
 const controller = await createController({
+  onWorkerEvent: (event) => console.log(JSON.stringify(event)),
   backend: createDockerBackend({
     installation: process.env.BROWSER_INSTALLATION ?? "default",
     controllerContainer: container,
@@ -19,6 +20,7 @@ const controller = await createController({
     socketPath,
     seccomp: await readDockerSeccomp(),
     environment: process.env,
+    extensionsSource: process.env.BROWSER_EXTENSIONS_SOURCE,
   }),
   port: Number(process.env.BROWSER_CONTROLLER_PORT ?? 8080),
   host: process.env.BROWSER_CONTROLLER_HOST ?? "0.0.0.0",

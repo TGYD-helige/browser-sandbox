@@ -324,6 +324,11 @@ export async function createAccessServer({
               Number.MAX_SAFE_INTEGER,
               auth.resize === true,
             );
+            grant.token = auth.token;
+            if (grant.resize) {
+              if (viewportOwners.has(workerEntry)) throw Error("browser_viewport_busy");
+              viewportOwners.set(workerEntry, grant);
+            }
             client.once("close", grant.cleanup);
           }
           if (

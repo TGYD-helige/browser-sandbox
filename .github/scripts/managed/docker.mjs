@@ -69,6 +69,65 @@ try {
   );
   await writeFile("managed-results/docker.json", output + "\n");
   console.log(output);
+  const state = JSON.parse(
+    await docker("exec", controller, "cat", "/tmp/managed-state.json"),
+  );
+  const controllerProcesses = await docker("top", controller, "-eo", "pid,args");
+  assert(
+    !controllerProcesses.includes("/opt/google/chrome/chrome"),
+    "Controller started Chrome",
+  );
+  const worker = JSON.parse(await docker("inspect", state.workerId))[0];
+  assert(
+    Object.keys(worker.HostConfig.PortBindings ?? {}).length === 0,
+    "Worker published ports",
+  );
+  assert(
+    !worker.Mounts.some((mount) => mount.Destination.includes("docker.sock")),
+    "Worker received Docker credentials",
+  );
+  const agent = await docker(
+    "create",
+    "--network",
+    network,
+    "--cap-drop",
+    "ALL",
+    "--security-opt",
+    "no-new-privileges",
+    "-e",
+    `BROWSER_WS_ENDPOINT=${state.endpoint}`,
+    "-e",
+    `BROWSER_WORKER_ORIGIN=${state.workerOrigin}`,
+    "browser-sandbox-managed-harness:local",
+    "/project/managed-harness.mjs",
+  );
+  try {
+    await docker(
+      "cp",
+      ".github/scripts/managed/harness.mjs",
+      `${agent}:/project/managed-harness.mjs`,
+    );
+    const output = await docker("start", "-a", agent);
+    assert.equal(
+      JSON.parse(await docker("inspect", agent))[0].State.ExitCode,
+      0,
+      "Harness failed",
+    );
+    console.log(output);
+  } finally {
+    await docker("rm", "-f", agent);
+  }
+  await docker(
+    "exec",
+    controller,
+    "node",
+    "/opt/browser-sandbox/managed-client.mjs",
+    "cleanup",
+  );
+  await writeFile(
+    "managed-results/docker.json",
+    JSON.stringify(state.report, null, 2) + "\n",
+  );
   assert.equal(
     await docker(
       "ps",

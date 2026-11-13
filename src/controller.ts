@@ -18,6 +18,7 @@ export interface ExecutionBinding {
   endpoint?: { cdpUrl: string; viewerToken: string };
   life: AbortController;
   revoked: boolean;
+  finishing?: Promise<any>;
   host?: ControlPeer;
 }
 interface Access {
@@ -38,6 +39,13 @@ export interface ControllerOptions {
   publicOrigin?: string;
   viewerOrigins?: string[];
   creationTimeoutMs?: number;
+  onWorkerEvent?: (event: {
+    type: "creating" | "ready" | "failed" | "removed";
+    executionId: string;
+    incarnation: string;
+    elapsedMs?: number;
+    error?: string;
+  }) => void;
   authenticateHost?: Parameters<typeof createNetworkHostControl>[0]["authenticateHost"];
   /** Reserved for future agent identity validation; every protected route crosses this seam. */
   authorizeAccess?: (
@@ -104,6 +112,35 @@ export async function createController(options: ControllerOptions) {
         grant.life.signal,
         AbortSignal.timeout(match[2] === "/auth" ? 620000 : 180000),
       ]);
+      if (match[2] === "/session") {
+        if (!["GET", "POST"].includes(req.method)) {
+          res.writeHead(405).end();
+          return;
+        }
+        let input = "";
+        for await (const chunk of req) {
+          input += chunk;
+          if (Buffer.byteLength(input) > 8192) {
+            res.writeHead(413).end();
+            return;
+          }
+        }
+        const action = req.method === "POST" ? JSON.parse(input) : { action: "status" };
+        const result = await command(
+          {
+            op: "session",
+            executionId: grant.binding.executionId,
+            action: action.action,
+            durationMs: action.durationMs,
+          },
+          undefined,
+          signal,
+        );
+        res
+          .writeHead(200, { "content-type": "application/json" })
+          .end(JSON.stringify(result));
+        return;
+      }
       const worker = await ensureWorker(grant.binding, signal);
       signal.throwIfAborted();
       const target = new URL(grant.binding.endpoint.cdpUrl);
@@ -202,6 +239,20 @@ export async function createController(options: ControllerOptions) {
       wsEndpoint: `${origin.replace(/^http/, "ws")}/execution/${grant.token}`,
     };
   };
+  const event = (
+    binding: ExecutionBinding,
+    type: "creating" | "ready" | "failed" | "removed",
+    extra = {},
+  ) => {
+    try {
+      options.onWorkerEvent?.({
+        type,
+        executionId: binding.executionId,
+        incarnation: binding.incarnation,
+        ...extra,
+      });
+    } catch {}
+  };
   async function ensureWorker(binding: ExecutionBinding, signal: AbortSignal) {
     signal.throwIfAborted();
     if (binding.revoked) throw Error("browser_execution_revoked");
@@ -212,6 +263,8 @@ export async function createController(options: ControllerOptions) {
         signal,
         AbortSignal.timeout(options.creationTimeoutMs ?? 90000),
       ]);
+      const startedAt = performance.now();
+      event(binding, "creating");
       binding.starting = (async () => {
         const worker = await options.backend.create(
           {
@@ -247,6 +300,7 @@ export async function createController(options: ControllerOptions) {
           );
           creationSignal.throwIfAborted();
           binding.endpoint = result;
+          event(binding, "ready", { elapsedMs: performance.now() - startedAt });
           return worker;
         } catch (error) {
           await options.backend.remove(worker, AbortSignal.timeout(30000));
@@ -256,7 +310,12 @@ export async function createController(options: ControllerOptions) {
         }
       })();
       // Keep a failed creation fenced; retry/replacement is an explicit recovery operation.
-      binding.starting.catch(() => {});
+      binding.starting.catch((error) =>
+        event(binding, "failed", {
+          elapsedMs: performance.now() - startedAt,
+          error: errorCode(error),
+        }),
+      );
     }
     return binding.starting;
   }
@@ -301,23 +360,32 @@ export async function createController(options: ControllerOptions) {
     }
     if (["finalize", "finish"].includes(request.op)) {
       if (!binding) return { status: "absent" };
-      binding.revoked = true;
-      binding.life.abort();
-      for (const grant of [...grants.values()])
-        if (grant.binding === binding) revoke(grant);
-      await binding.starting?.catch(() => {});
-      let result = { used: false, stopped: true };
-      if (binding.worker) {
-        result = await binding.worker.runtime.request(
-          { op: "finalize", executionId: id },
-          { signal },
-        );
-        await options.backend.remove(binding.worker, signal);
-        binding.worker.runtime.close?.();
-      }
-      bindings.delete(id);
-      finished.add(id);
-      return result;
+      if (binding.finishing) return binding.finishing;
+      const current = binding;
+      current.finishing = (async () => {
+        current.revoked = true;
+        current.life.abort();
+        for (const grant of [...grants.values()])
+          if (grant.binding === current) revoke(grant);
+        await current.starting?.catch(() => {});
+        let result = { used: false, stopped: true };
+        if (current.worker) {
+          result = await current.worker.runtime.request(
+            { op: "finalize", executionId: id },
+            { signal },
+          );
+          await options.backend.remove(current.worker, signal);
+          current.worker.runtime.close?.();
+        }
+        bindings.delete(id);
+        finished.add(id);
+        event(current, "removed");
+        return result;
+      })().catch((error) => {
+        current.finishing = undefined;
+        throw error;
+      });
+      return current.finishing;
     }
     if (!binding || binding.revoked || closing)
       throw Error("browser_execution_revoked");

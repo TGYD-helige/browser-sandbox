@@ -1,6 +1,6 @@
 import type { Server } from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
-import type { AutomationCoordinator } from "./automation-control.js";
+import { type AutomationCoordinator, waitForControl } from "./automation-control.js";
 import type { Registration, StorageAdapter } from "./host-client.js";
 import type { BrowserRuntime } from "./runtime-provider.js";
 
@@ -28,7 +28,11 @@ function connectPeer(
     const body = JSON.stringify(frame);
     if (life.signal.aborted || socket.readyState !== WebSocket.OPEN)
       throw Error("browser_control_disconnected");
-    if (Buffer.byteLength(body) > 262144 || socket.bufferedAmount > 1048576)
+    if (
+      Buffer.byteLength(body) >
+        (frame.type === "request" ? 262144 : 32 * 1024 * 1024) ||
+      socket.bufferedAmount > 32 * 1024 * 1024
+    )
       throw Error("browser_control_overloaded");
     socket.send(body);
   };
@@ -44,7 +48,14 @@ function connectPeer(
   socket.on("error", close);
   socket.on("message", async (raw) => {
     try {
+      const size = Buffer.byteLength(raw as Buffer);
+      if (
+        size > 262144 &&
+        !String((raw as Buffer).subarray(0, 32)).startsWith('{"type":"result"')
+      )
+        throw Error();
       const frame = JSON.parse(String(raw));
+      if (frame.type === "request" && size > 262144) throw Error();
       if (!Number.isSafeInteger(frame.id) || frame.id < 1) throw Error();
       if (frame.type === "result") {
         const entry = pending.get(frame.id);
@@ -146,7 +157,7 @@ export function createNetworkHostControl({
   dispatch(request: any, peer: ControlPeer, signal: AbortSignal): Promise<any>;
   authenticateHost?: (request: import("node:http").IncomingMessage) => Promise<void>;
 }) {
-  const sockets = new WebSocketServer({ noServer: true, maxPayload: 262144 });
+  const sockets = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
   const upgrade = async (request, socket, head) => {
     if (request.url !== "/host") return;
     try {
@@ -188,7 +199,10 @@ export function createControllerRuntime(
   const storage = new Map<string, StorageAdapter>();
   const url = new URL("/host", origin);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(url, { maxPayload: 262144, handshakeTimeout: 30000 });
+  const socket = new WebSocket(url, {
+    maxPayload: 32 * 1024 * 1024,
+    handshakeTimeout: 30000,
+  });
   const rpc = connectPeer(socket, async (request, signal) => {
     if (["pause", "resume"].includes(request.op) && automation) {
       await automation[request.op](request.executionId, signal);
@@ -211,8 +225,13 @@ export function createControllerRuntime(
     input: Record<string, unknown>,
     options?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<T> => {
-    await ready;
-    return rpc.call<T>({ ...input, automation: !!automation }, options);
+    if (rpc.signal.aborted) throw Error("browser_control_disconnected");
+    const signal = AbortSignal.any([
+      ...(options?.signal ? [options.signal] : []),
+      AbortSignal.timeout(options?.timeoutMs ?? 180000),
+    ]);
+    await waitForControl(ready, signal);
+    return rpc.call<T>({ ...input, automation: !!automation }, { ...options, signal });
   };
   return {
     identity: "managed",

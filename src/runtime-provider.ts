@@ -138,7 +138,14 @@ export function createBrowserSessions({
         if (options.storage)
           storage = await runtime.attachStorage(registration, options.storage);
         const { wsEndpoint } = await runtime.request<{ wsEndpoint: string }>(
-          { op: "register", ...registration, storage: storage ? true : undefined },
+          {
+            op: "register",
+            ...registration,
+            ...(runtime.identity === "managed" && tenantId !== undefined
+              ? { tenantId }
+              : {}),
+            storage: storage ? true : undefined,
+          },
           { signal },
         );
         return {

@@ -49,3 +49,60 @@ test("network host control transports operations and rejects pending callbacks o
       context.signal.addEventListener("abort", resolve, { once: true }),
     );
 });
+
+test("storage callbacks cross the host connection without serializing archive bytes", async (t) => {
+  const server = createServer();
+  const control = createNetworkHostControl({
+    server,
+    dispatch: async (request, peer, signal) => {
+      if (request.op === "storage_attach") return { attached: true };
+      const seed = await peer.callback(
+        "load",
+        { executionId: request.executionId },
+        signal,
+      );
+      const target = await peer.callback(
+        "save",
+        { executionId: request.executionId },
+        signal,
+      );
+      const committed = await peer.callback(
+        "commit",
+        {
+          executionId: request.executionId,
+          payload: { archive: { sha256: "fixture-sha" } },
+        },
+        signal,
+      );
+      return { seed, target, committed };
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    control.close();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const runtime = createControllerRuntime(`http://127.0.0.1:${server.address().port}`);
+  t.after(() => runtime.close());
+  const attached = await runtime.attachStorage(
+    { executionId: "storage" },
+    {
+      load: async () => ({ absent: true }),
+      save: async () => ({ url: "https://storage.example.test/archive" }),
+      commit: async (payload) => {
+        assert.equal(payload.archive.sha256, "fixture-sha");
+        return { confirmedSha: "fixture-sha" };
+      },
+    },
+  );
+  assert.deepEqual(await runtime.request({ op: "roundtrip", executionId: "storage" }), {
+    seed: { absent: true },
+    target: { url: "https://storage.example.test/archive" },
+    committed: { confirmedSha: "fixture-sha" },
+  });
+  attached.close();
+  await assert.rejects(
+    runtime.request({ op: "roundtrip", executionId: "storage" }),
+    /browser_storage_disconnected/,
+  );
+});

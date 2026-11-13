@@ -60,3 +60,72 @@ test("managed sessions register without a UID, allocate lazily, proxy files, and
   assert.equal(removed, 1);
   assert.equal((await fetch(fileUrl)).status, 403);
 });
+
+test("revocation during first use fences readiness and deletes the late worker", async (t) => {
+  let created;
+  const started = new Promise((resolve) => {
+    created = resolve;
+  });
+  let release;
+  const barrier = new Promise((resolve) => {
+    release = resolve;
+  });
+  let removed = 0;
+  const controller = await createController({
+    port: 0,
+    backend: {
+      async create(placement) {
+        created();
+        await barrier;
+        return {
+          ...placement,
+          id: "late",
+          origin: "http://127.0.0.1:1",
+          runtime: { request: async () => assert.fail("cancelled registration") },
+        };
+      },
+      async remove() {
+        removed++;
+      },
+    },
+  });
+  t.after(() => controller.stop());
+  const executionId = randomUUID();
+  const { wsEndpoint } = await controller.command({ op: "register", executionId });
+  const request = fetch(wsEndpoint.replace("ws:", "http:") + "/files/late.txt");
+  await started;
+  const finishing = controller.command({ op: "finalize", executionId });
+  release();
+  await finishing;
+  assert.equal((await request).status, 502);
+  assert.equal(removed, 1);
+  assert.equal(controller.bindings.size, 0);
+});
+
+test("managed sessions reject tenant placement and persistent profiles before worker creation", async (t) => {
+  const controller = await createController({
+    port: 0,
+    backend: {
+      create: async () => assert.fail("unsupported placement allocated worker"),
+      remove: async () => {},
+    },
+  });
+  t.after(() => controller.stop());
+  const runtime = createControllerRuntime(controller.origin);
+  t.after(() => runtime.close());
+  const sessions = createBrowserSessions({
+    provider: {
+      identity: "managed",
+      acquire: async () => runtime,
+      release: async () => {},
+    },
+  });
+  await assert.rejects(
+    sessions.open({ tenantId: "tenant" }),
+    /browser_tenant_isolation_unavailable/,
+  );
+  await assert.rejects(
+    sessions.open({ profileId: "profile" }),
+    /browser_profile_storage_unavailable/,
+  );
+});

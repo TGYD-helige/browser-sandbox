@@ -20,6 +20,8 @@ export interface DockerBackendOptions {
   environment?: Record<string, string>;
   memoryBytes?: number;
   shmBytes?: number;
+  /** Docker-host absolute directory containing trusted unpacked extensions. */
+  extensionsSource?: string;
 }
 
 /** Docker management credentials and the socket are confined to the controller. */
@@ -30,6 +32,11 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
   )
     throw Error("browser_docker_configuration_invalid");
   const api = createDockerClient(options.socketPath);
+  const networks = new Map<string, string>();
+  const absent = (error: any) => {
+    if (error.statusCode === 404) return undefined;
+    throw error;
+  };
   const labels = (executionId: string, incarnation: string) => ({
     [prefix + "installation"]: options.installation,
     [prefix + "execution"]: executionId,
@@ -85,9 +92,24 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
                 "QUEUED=0",
                 `BROWSER_EXECUTION_ID=${placement.executionId}`,
                 `BROWSER_WORKER_ORIGIN=http://${name}:8081`,
+                ...(options.extensionsSource
+                  ? ["BROWSER_EXTENSIONS_DIR=/browser-extensions"]
+                  : []),
               ],
               Labels: { ...expected, [prefix + "network"]: network },
               HostConfig: {
+                ...(options.extensionsSource
+                  ? {
+                      Mounts: [
+                        {
+                          Type: "bind",
+                          Source: options.extensionsSource,
+                          Target: "/browser-extensions",
+                          ReadOnly: true,
+                        },
+                      ],
+                    }
+                  : {}),
                 NetworkMode: network,
                 CapDrop: ["ALL"],
                 CapAdd: [
@@ -128,6 +150,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
           }
           await delay(100, undefined, { signal });
         }
+        networks.set(id, network);
         return {
           id,
           executionId: placement.executionId,
@@ -163,24 +186,51 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         "GET",
         undefined,
         signal,
-      );
-      const network = state.Config.Labels?.[prefix + "network"];
-      if (!network) throw Error("browser_worker_ownership_mismatch");
-      const networkState = await api(`/networks/${network}`, "GET", undefined, signal);
+      ).catch(absent);
       if (
+        state &&
+        !Object.entries(expected).every(
+          ([key, value]) => state.Config.Labels?.[key] === value,
+        )
+      )
+        throw Error("browser_worker_ownership_mismatch");
+      const network =
+        state?.Config.Labels?.[prefix + "network"] ?? networks.get(worker.id);
+      if (!network) {
+        if (state) throw Error("browser_worker_ownership_mismatch");
+        return;
+      }
+      networks.set(worker.id, network);
+      const networkState = await api(
+        `/networks/${network}`,
+        "GET",
+        undefined,
+        signal,
+      ).catch(absent);
+      if (
+        networkState &&
         !Object.entries(expected).every(
           ([key, value]) => networkState.Labels?.[key] === value,
         )
       )
         throw Error("browser_worker_ownership_mismatch");
-      await removeOwned(worker.id, expected, signal);
-      await api(
-        `/networks/${network}/disconnect`,
-        "POST",
-        { Container: options.controllerContainer, Force: true },
-        signal,
-      );
-      await api(`/networks/${network}`, "DELETE", undefined, signal);
+      if (state) await removeOwned(worker.id, expected, signal);
+      if (networkState) {
+        const connected = Object.entries(networkState.Containers ?? {}).some(
+          ([id, value]: [string, any]) =>
+            id.startsWith(options.controllerContainer) ||
+            value.Name === options.controllerContainer,
+        );
+        if (connected)
+          await api(
+            `/networks/${network}/disconnect`,
+            "POST",
+            { Container: options.controllerContainer, Force: true },
+            signal,
+          );
+        await api(`/networks/${network}`, "DELETE", undefined, signal).catch(absent);
+      }
+      networks.delete(worker.id);
     },
   };
 }
@@ -212,7 +262,11 @@ export function createDockerClient(socketPath = "/var/run/docker.sock") {
           response.on("error", () => reject(Error("browser_docker_unavailable")));
           response.on("end", () => {
             if (response.statusCode < 200 || response.statusCode >= 300) {
-              reject(Error("browser_docker_operation_failed"));
+              reject(
+                Object.assign(Error("browser_docker_operation_failed"), {
+                  statusCode: response.statusCode,
+                }),
+              );
               return;
             }
             try {

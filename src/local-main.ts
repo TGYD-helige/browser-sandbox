@@ -126,9 +126,8 @@ const networkControl = workerExecutionId
   ? createNetworkHostControl({
       server: gateway.workerServer,
       dispatch: async (request, peer, signal) => {
-        if (controllerPeer && controllerPeer !== peer)
-          throw Error("browser_worker_already_bound");
-        controllerPeer = peer;
+        if (!controllerPeer || controllerPeer.signal.aborted || request.automation)
+          controllerPeer = peer;
         return gateway.workerCommand(request, signal);
       },
     })

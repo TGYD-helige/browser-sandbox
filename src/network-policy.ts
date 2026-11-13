@@ -57,6 +57,32 @@ export function normalizeAllowedDomains(value: unknown): string[] {
 
 /** Managed workers serve one controller; untrusted pages cannot initiate private-network connections. */
 export function installWorkerNetworkPolicy(run = execFileSync) {
+  for (const [binary, destination] of [
+    ["iptables", "127.0.0.0/8"],
+    ["ip6tables", "::1/128"],
+  ]) {
+    run(
+      binary,
+      [
+        "-w",
+        "-I",
+        "OUTPUT",
+        "-d",
+        destination,
+        "-p",
+        "tcp",
+        "--dport",
+        "8081",
+        "-m",
+        "owner",
+        "--uid-owner",
+        "20001",
+        "-j",
+        "REJECT",
+      ],
+      { stdio: "ignore" },
+    );
+  }
   for (const [binary, destinations] of [
     [
       "iptables",
