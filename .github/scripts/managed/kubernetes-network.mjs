@@ -52,7 +52,8 @@ try {
   const nodes = JSON.parse(kubectl("get", "nodes", "-o", "json")).items;
   assert(nodes.length >= 3, "NetworkPolicy tests require at least three nodes");
   const agents = nodes.filter(
-    (node) => !node.metadata.labels["node-role.kubernetes.io/control-plane"],
+    (node) =>
+      node.metadata.labels["node-role.kubernetes.io/control-plane"] === undefined,
   );
   assert(agents.length >= 2, "NetworkPolicy tests require two worker nodes");
   // create, rather than apply, refuses to adopt somebody else's namespace.

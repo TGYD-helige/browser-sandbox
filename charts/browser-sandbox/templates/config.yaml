@@ -13,4 +13,4 @@ metadata:
   name: {{ include "browser-sandbox.name" . }}-config
 data:
   worker-template.json: |
-    {{- merge (dict "imagePullSecrets" .Values.imagePullSecrets) .Values.worker | toPrettyJson | nindent 4 }}
+    {{- include "browser-sandbox.worker-template" . | nindent 4 }}
