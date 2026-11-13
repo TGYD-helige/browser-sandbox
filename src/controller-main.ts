@@ -25,6 +25,7 @@ if (backendName === "kubernetes") {
       ),
     ),
     environment: process.env,
+    creationTimeoutMs: Number(process.env.BROWSER_WORKER_CREATION_TIMEOUT ?? 90000),
   });
 } else if (backendName === "docker") {
   const { createDockerBackend, createDockerClient, readDockerSeccomp } = await import(

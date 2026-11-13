@@ -36,6 +36,26 @@ class ChartTest(unittest.TestCase):
         self.assertEqual(len(owners), 1)
         self.assertNotIn("ownerReferences", owners[0]["metadata"])
 
+    def test_controller_state_and_optional_profiles_share_a_retained_private_volume(self):
+        resources = render("--set", "profileStore.enabled=true")
+        claims = [item for item in resources if item["kind"] == "PersistentVolumeClaim"]
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0]["metadata"]["annotations"]["helm.sh/resource-policy"], "keep")
+        self.assertEqual(claims[0]["spec"]["accessModes"], ["ReadWriteOnce"])
+        deployment = next(item for item in resources if item["kind"] == "Deployment")
+        self.assertEqual(deployment["spec"]["strategy"]["type"], "Recreate")
+        pod = deployment["spec"]["template"]["spec"]
+        self.assertEqual(pod["securityContext"]["fsGroup"], 20000)
+        env = {item["name"]: item.get("value") for item in pod["containers"][0]["env"]}
+        self.assertEqual(env["BROWSER_CONTROLLER_STATE"], "/controller-data/executions")
+        self.assertEqual(env["BROWSER_PROFILE_STORE_ROOT"], "/controller-data/profiles")
+        self.assertIn("-storage.browser-test.svc:8082", env["BROWSER_PROFILE_STORE_ORIGIN"])
+        storage = next(item for item in resources if item["kind"] == "Service" and item["metadata"]["name"].endswith("-storage"))
+        self.assertEqual(storage["spec"]["ports"][0]["port"], 8082)
+        policy = next(item for item in resources if item["kind"] == "NetworkPolicy" and item["metadata"]["name"].endswith("-controller-storage"))
+        self.assertEqual(policy["spec"]["ingress"][1]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"], "worker")
+        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in render("--set", "controllerData.existingClaim=retained")))
+
     def test_worker_network_is_private_and_internet_excludes_internal_ranges(self):
         policies = [item for item in render() if item["kind"] == "NetworkPolicy" and item["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "worker"]
         self.assertEqual(len(policies), 1)

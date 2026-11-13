@@ -35,10 +35,8 @@ spec:
         runAsNonRoot: true
         runAsUser: 20000
         runAsGroup: 20000
-        {{- if .Values.profileStore.enabled }}
         fsGroup: 20000
         fsGroupChangePolicy: OnRootMismatch
-        {{- end }}
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -67,6 +65,12 @@ spec:
               value: {{ .Values.hostControl.port | quote }}
             - name: BROWSER_CONTROLLER_ORIGIN
               value: {{ default (printf "http://%s.%s.svc:%v" (include "browser-sandbox.name" .) .Release.Namespace .Values.service.port) .Values.controller.publicOrigin | quote }}
+            - name: BROWSER_CONTROLLER_STATE
+              value: /controller-data/executions
+            {{- range $name, $value := dict "BROWSER_MAX_WORKERS" .Values.capacity.maxWorkers "BROWSER_MAX_PENDING" .Values.capacity.maxPending "BROWSER_MAX_QUEUED" .Values.capacity.maxQueued "BROWSER_WORKER_CREATION_TIMEOUT" .Values.capacity.creationTimeoutMs "BROWSER_MAX_EXECUTION_MS" .Values.capacity.maxExecutionMs "BROWSER_IDLE_REGISTRATION_MS" .Values.capacity.idleRegistrationMs }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
             - name: BROWSER_STORAGE_EGRESS
               value: {{ .Values.networkPolicy.storageEgress | toJson | quote }}
             {{- if .Values.profileStore.enabled }}
@@ -112,6 +116,8 @@ spec:
             tcpSocket:
               port: access
           volumeMounts:
+            - name: controller-data
+              mountPath: /controller-data
             - name: configuration
               mountPath: /etc/browser-sandbox
               readOnly: true
@@ -120,6 +126,9 @@ spec:
               mountPath: /var/lib/browser-sandbox
             {{- end }}
       volumes:
+        - name: controller-data
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-data" (include "browser-sandbox.name" .)) .Values.controllerData.existingClaim }}
         - name: configuration
           configMap:
             name: {{ include "browser-sandbox.name" . }}-config

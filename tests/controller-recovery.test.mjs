@@ -347,3 +347,28 @@ test("owned orphans use normal finalization and preserve resources when save is 
   assert.equal(f.resources.size, 0);
   assert.equal(controller.capacity().workers, 0);
 });
+
+test("unconfirmed partial creation retains capacity until successful discovery proves absence", async (t) => {
+  const f = await fixture(t);
+  const controller = await f.start({ maxWorkers: 1 });
+  const executionId = randomUUID();
+  const endpoint = await controller.command({ op: "register", executionId });
+  f.backend.create = async () => {
+    throw Error("browser_worker_cleanup_unconfirmed");
+  };
+  const response = await fetch(fileUrl(controller, endpoint));
+  assert.equal(response.status, 502);
+  assert.equal(controller.capacity().workers, 1);
+  const list = f.backend.list;
+  f.backend.list = async () => {
+    throw Error("browser_worker_discovery_failed");
+  };
+  await assert.rejects(
+    controller.command({ op: "finalize", executionId }),
+    /browser_worker_discovery_failed/,
+  );
+  assert.equal(controller.capacity().workers, 1);
+  f.backend.list = list;
+  await controller.command({ op: "finalize", executionId });
+  assert.equal(controller.capacity().workers, 0);
+});

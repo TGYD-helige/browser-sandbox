@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { link, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
+import { chmod, link, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -24,6 +24,7 @@ export async function createExecutionJournal({
   if (!installationId || !Number.isSafeInteger(maxRecords) || maxRecords < 1)
     throw Error("browser_execution_journal_invalid");
   await mkdir(directory, { recursive: true, mode: 0o700 });
+  await chmod(directory, 0o700);
   const ids = new Set<string>();
   const mutations = new Map<string, Promise<unknown>>();
   const filename = (id: string) => {

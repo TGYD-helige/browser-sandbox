@@ -109,6 +109,8 @@ async function fixture(t, { pending = false, deleteRace = false, createStatus } 
     replacement: false,
     observed: undefined,
     podReads: 0,
+    listOwner: "release-uid",
+    listFailure: false,
   };
   const server = createServer(async (request, response) => {
     const chunks = [];
@@ -127,6 +129,27 @@ async function fixture(t, { pending = false, deleteRace = false, createStatus } 
           },
         }),
       );
+    } else if (request.url.includes("/pods?")) {
+      if (state.listFailure) response.writeHead(503).end("{}");
+      else
+        response.end(
+          JSON.stringify({
+            metadata: {},
+            items: [
+              {
+                ...state.pod,
+                metadata: {
+                  ...state.pod.metadata,
+                  ownerReferences: state.pod.metadata.ownerReferences.map((owner) => ({
+                    ...owner,
+                    uid: state.listOwner,
+                  })),
+                },
+                status: { phase: "Running", podIP: "10.42.1.4" },
+              },
+            ],
+          }),
+        );
     } else if (request.method === "POST") {
       if (createStatus) {
         response
@@ -351,4 +374,29 @@ test("Kubernetes discovery retains Profile ownership from labels and annotations
     backend.list(AbortSignal.timeout(5000)),
     /browser_worker_discovery_failed/,
   );
+});
+test("Kubernetes discovery recovers exact UID and rejects foreign release ownership or failed reads", async (t) => {
+  const { backend, state } = await fixture(t);
+  const original = await backend.create(
+    { executionId, incarnation },
+    AbortSignal.timeout(5000),
+  );
+  t.after(() => original.runtime.close());
+  const workers = await backend.list(AbortSignal.timeout(5000));
+  t.after(() => {
+    for (const worker of workers) worker.runtime.close();
+  });
+  assert.equal(workers[0].id, original.id);
+  assert.equal(workers[0].incarnation, incarnation);
+  state.listOwner = "foreign-release";
+  await assert.rejects(
+    backend.list(AbortSignal.timeout(5000)),
+    /browser_worker_ownership_mismatch/,
+  );
+  state.listFailure = true;
+  await assert.rejects(
+    backend.list(AbortSignal.timeout(5000)),
+    /browser_kubernetes_operation_failed/,
+  );
+  assert.equal(state.deleted, false);
 });
