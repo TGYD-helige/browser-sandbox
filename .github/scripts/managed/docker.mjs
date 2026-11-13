@@ -97,7 +97,7 @@ try {
     "-e",
     `BROWSER_WS_ENDPOINT=${state.endpoint}`,
     "-e",
-    `BROWSER_WORKER_ORIGIN=${state.workerOrigin}`,
+    `BROWSER_WORKER_ORIGIN=http://${Object.values(worker.NetworkSettings.Networks)[0].IPAddress}:8081`,
     "browser-sandbox-managed-harness:local",
     "/project/managed-harness.mjs",
   );
