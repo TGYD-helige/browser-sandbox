@@ -2,15 +2,9 @@ import { readFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import { WorkerCleanupFailure } from "./lifecycle-errors.js";
-import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
+import { type ManagedBackend, type ManagedWorker, WORKER_ENVIRONMENT } from "./managed-backend.js";
 import { createControllerRuntime } from "./network-control.js";
 
-export const WORKER_ENVIRONMENT = [
-  "TIMEOUT",
-  "TZ",
-  "BROWSER_STARTUP_TIMEOUT",
-  "LANG",
-] as const;
 const prefix = "browser-sandbox.";
 export interface DockerBackendOptions {
   installation: string;

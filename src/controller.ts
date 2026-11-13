@@ -840,12 +840,21 @@ export async function createController(options: ControllerOptions) {
     origin,
     command,
     bindings,
-    async stop() {
+    async stop({ preserveWorkers = false }: { preserveWorkers?: boolean } = {}) {
       closing = true;
       let failure: unknown;
       for (const binding of bindings.values()) {
         try {
-          await command({ op: "finalize", executionId: binding.executionId });
+          if (preserveWorkers) {
+            binding.revoked = true;
+            if (!binding.endpoint) {
+              binding.life.abort();
+              await binding.starting?.catch(() => {});
+            }
+            binding.worker?.runtime.close?.();
+          } else {
+            await command({ op: "finalize", executionId: binding.executionId });
+          }
         } catch (error) {
           failure ??= error;
         }
