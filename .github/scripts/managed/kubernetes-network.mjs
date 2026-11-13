@@ -82,6 +82,7 @@ try {
       },
       spec: {
         nodeName: agents[index % 2].metadata.name,
+        terminationGracePeriodSeconds: 5,
         automountServiceAccountToken: false,
         containers: [
           {
@@ -91,7 +92,7 @@ try {
             command: [
               "node",
               "-e",
-              "require('node:http').createServer((q,s)=>s.end('ok')).listen(8080,'0.0.0.0')",
+              "const server=require('node:http').createServer((q,s)=>s.end('ok')).listen(8080,'0.0.0.0');process.on('SIGTERM',()=>{server.closeAllConnections();server.close(()=>process.exit(0))})",
             ],
             readinessProbe: { tcpSocket: { port: 8080 }, periodSeconds: 1 },
             securityContext: {
@@ -150,5 +151,8 @@ try {
     "NetworkPolicy enforced across nodes: agent ingress, management, peer workers, API, metadata denied; controller ingress allowed",
   );
 } finally {
-  if (created) kubectl("delete", "namespace", namespace, "--wait=false");
+  if (created) {
+    kubectl("delete", "namespace", namespace, "--wait=false");
+    kubectl("wait", "--for=delete", `namespace/${namespace}`, "--timeout=90s");
+  }
 }
