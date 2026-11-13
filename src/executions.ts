@@ -23,6 +23,7 @@ import { createProfileArchive } from "./profiles.js";
 import { BrowserSession } from "./session.js";
 import { Takeover } from "./takeover.js";
 import { BrowserViewport } from "./viewport.js";
+import { WORKER_PROTOCOL, type WorkerStatus, workerIdle } from "./worker-protocol.js";
 
 interface BrowserHandle {
   endpoint: string;
@@ -54,6 +55,7 @@ export interface Execution {
   revoked: boolean;
   finishRequested?: boolean;
   browserRequested?: boolean;
+  authPending?: boolean;
   starting?: Promise<BrowserHandle>;
   closing?: Promise<void>;
   reusable?: Promise<void>;
@@ -311,11 +313,25 @@ export async function createExecutions({
       await removeTree(entry.root);
     }
   }
+  function workerStatus(entry: Execution): WorkerStatus {
+    return {
+      protocol: WORKER_PROTOCOL,
+      session: entry.session.status(entry.peers.size),
+      takeover: entry.takeover?.state ?? "automation",
+      pendingAuth: entry.authPending ? 1 : 0,
+    };
+  }
   async function command(request, host = false, fromSocket = false, signal) {
     if (closing) fail("browser_stopping");
     // Grants travel only through the attached storage channel, so a stale host fails loudly instead of skipping its upload.
     if (request.archive !== undefined) fail("browser_profile_binding_invalid");
     if (signal?.aborted) fail("browser_request_cancelled");
+    if (request.op === "worker_status") {
+      if (!host) fail("browser_host_authority_required");
+      const entry = executions.get(request.executionId);
+      if (!entry || entry.revoked) fail("browser_execution_revoked");
+      return workerStatus(entry);
+    }
     if (request.op === "session") {
       if (!host) fail("browser_host_authority_required");
       const entry = executions.get(request.executionId);
@@ -416,6 +432,13 @@ export async function createExecutions({
       if (!host) fail("browser_host_authority_required");
       const entry = executions.get(request.executionId);
       if (!entry) return { status: "absent" };
+      if (request.ifIdle) {
+        const status = workerStatus(entry);
+        if (status.session.generation !== request.expectedGeneration)
+          fail("browser_session_lost");
+        if (!workerIdle(status)) fail("browser_worker_not_idle");
+      }
+      // No await separates the idle recheck from close() revoking this execution.
       let result: any = { used: !!entry.browserRequested };
       if (entry.profileId && entry.profileUsed && entry.storageRequired) {
         result = await command(
