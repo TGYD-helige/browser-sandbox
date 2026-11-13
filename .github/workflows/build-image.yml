@@ -34,19 +34,20 @@ jobs:
           target="$base/browser-sandbox"
           [[ "$(crane digest "$source:v0.1.2")" == "$VERIFIED_DIGEST" ]]
           crane manifest "$source@$VERIFIED_DIGEST" | jq -e '[.manifests[].platform | .os + "/" + .architecture] | sort == ["linux/amd64", "linux/arm64"]'
-          declare -A old_latest
+          old_latest=()
           for name in mirrorx-browser-use-runtime chrome-sidecar; do
             [[ "$(crane digest "$base/$name:v0.1.2")" == "$VERIFIED_DIGEST" ]]
             tags="$(crane ls "$base/$name")"
             case $'\n'"$tags"$'\n' in
-              *$'\nlatest\n'*) old_latest[$name]="$(crane digest "$base/$name:latest")" ;;
-              *) old_latest[$name]=absent ;;
+              *$'\nlatest\n'*) old_latest+=("$(crane digest "$base/$name:latest")") ;;
+              *) old_latest+=(absent) ;;
             esac
           done
           crane copy "$source@$VERIFIED_DIGEST" "$target:v0.1.2"
           [[ "$(crane digest "$target:v0.1.2")" == "$VERIFIED_DIGEST" ]]
           crane tag "$target@$VERIFIED_DIGEST" latest
           [[ "$(crane digest "$target:latest")" == "$VERIFIED_DIGEST" ]]
+          index=0
           for name in mirrorx-browser-use-runtime chrome-sidecar; do
             [[ "$(crane digest "$base/$name:v0.1.2")" == "$VERIFIED_DIGEST" ]]
             tags="$(crane ls "$base/$name")"
@@ -54,7 +55,8 @@ jobs:
               *$'\nlatest\n'*) current="$(crane digest "$base/$name:latest")" ;;
               *) current=absent ;;
             esac
-            [[ "$current" == "${old_latest[$name]}" ]]
+            [[ "$current" == "${old_latest[$index]}" ]]
+            index=$((index + 1))
             printf 'Verified unchanged: %s (v0.1.2 and latest).\n' "$base/$name" >> "$GITHUB_STEP_SUMMARY"
           done
           printf 'Published %s:v0.1.2 and %s:latest at %s (Linux AMD64/ARM64).\n' "$target" "$target" "$VERIFIED_DIGEST" >> "$GITHUB_STEP_SUMMARY"
