@@ -55,7 +55,7 @@ kubectl drain WORKER_NODE --ignore-daemonsets --delete-emptydir-data --timeout=1
 helm uninstall browser -n browsers --wait
 ```
 
-Drain needs no `--force` because workers have a controller ownerReference. Eviction sends SIGTERM and the worker attempts graceful shutdown. A lost worker is reported explicitly and is not replaced. Enable `worker.disruptionBudget.enabled=true` with its default `maxUnavailable: 0` to make voluntary drain wait for executions to finalize. Remove or relax that budget when intentional eviction is required.
+Drain needs no `--force` because workers have a controller ownerReference. Eviction sends SIGTERM and the worker attempts graceful shutdown. A lost worker is reported explicitly and is not replaced. Enable `worker.disruptionBudget.enabled=true` with integer `worker.disruptionBudget.minAvailable` (default `1`) to retain at least that many live workers during voluntary eviction. Remove the budget or set its minimum to zero when intentional eviction is required. Bare Pods have no scalable workload controller, so the budget uses the [integer minimum supported for arbitrary workloads](https://kubernetes.io/docs/tasks/run-application/configure-pdb/#arbitrary-workloads-and-arbitrary-selectors).
 
 Helm uninstall deletes the stable owner and Kubernetes garbage collection removes its workers. Active temporary browser data is disposable; finalize executions before uninstall if you need their results. This chart does not create a Profile store PVC; durable storage and retained-PVC behavior belong to the persistent-storage slice.
 

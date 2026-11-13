@@ -51,7 +51,8 @@ worker:
   extensions: null
   disruptionBudget:
     enabled: false
-    maxUnavailable: 0
+    # Bare Pods have no scalable controller; use an integer minAvailable.
+    minAvailable: 1
 networkPolicy:
   # Required: all control-plane endpoint IPs, including public endpoints and Service IPs.
   apiServerCidrs: []
