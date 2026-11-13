@@ -1,15 +1,11 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
-import { promisify } from "node:util";
 
-const exec = promisify(execFile);
-const docker = async (...args) =>
-  (
-    await exec("docker", args, { timeout: 180000, maxBuffer: 4 * 1024 * 1024 })
-  ).stdout.trim();
+import { docker as command } from "./command.mjs";
+
+const docker = (...args) => command(args);
 const installation = `test-${randomUUID().slice(0, 8)}`;
 const image = process.env.BROWSER_IMAGE ?? "browser-sandbox:managed";
 let controller, network;
