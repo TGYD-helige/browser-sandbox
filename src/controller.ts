@@ -843,13 +843,20 @@ export async function createController(options: ControllerOptions) {
     async stop({ preserveWorkers = false }: { preserveWorkers?: boolean } = {}) {
       closing = true;
       let failure: unknown;
+      if (preserveWorkers) {
+        for (const binding of bindings.values()) {
+          binding.revoked = true;
+          if (!binding.endpoint) binding.life.abort();
+        }
+      }
       for (const binding of bindings.values()) {
         try {
           if (preserveWorkers) {
-            binding.revoked = true;
             if (!binding.endpoint) {
-              binding.life.abort();
-              await binding.starting?.catch(() => {});
+              await binding.starting?.catch((error) => {
+                if (error?.message === "browser_worker_cleanup_unconfirmed")
+                  throw error;
+              });
             }
             binding.worker?.runtime.close?.();
           } else {

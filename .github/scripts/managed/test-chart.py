@@ -52,6 +52,12 @@ class ChartTest(unittest.TestCase):
         self.assertEqual(policy["egress"][1]["ports"], [
             {"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}])
 
+    def test_worker_template_upgrade_rolls_controller_with_cleanup_budget(self):
+        original = next(item for item in render() if item["kind"] == "Deployment")
+        changed = next(item for item in render("--set", "worker.shmSize=1Gi") if item["kind"] == "Deployment")
+        self.assertNotEqual(original["spec"]["template"], changed["spec"]["template"])
+        self.assertGreaterEqual(original["spec"]["template"]["spec"]["terminationGracePeriodSeconds"], 80)
+
 
 if __name__ == "__main__":
     unittest.main()

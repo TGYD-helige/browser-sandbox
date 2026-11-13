@@ -11,3 +11,7 @@
 app.kubernetes.io/name: browser-sandbox
 app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- end -}}
+
+{{- define "browser-sandbox.worker-template" -}}
+{{- merge (dict "imagePullSecrets" .Values.imagePullSecrets) (omit .Values.worker "disruptionBudget") | toPrettyJson -}}
+{{- end -}}

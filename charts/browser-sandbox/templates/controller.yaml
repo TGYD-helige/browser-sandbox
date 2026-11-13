@@ -14,10 +14,13 @@ spec:
       app.kubernetes.io/component: controller
   template:
     metadata:
+      annotations:
+        checksum/worker-template: {{ include "browser-sandbox.worker-template" . | sha256sum }}
       labels:
         {{- include "browser-sandbox.labels" . | nindent 8 }}
         app.kubernetes.io/component: controller
     spec:
+      terminationGracePeriodSeconds: {{ add .Values.worker.terminationGracePeriodSeconds 30 }}
       serviceAccountName: {{ include "browser-sandbox.name" . }}
       imagePullSecrets: {{ .Values.imagePullSecrets | toJson }}
       nodeSelector: {{ .Values.controller.nodeSelector | toJson }}
