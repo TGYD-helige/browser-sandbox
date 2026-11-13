@@ -139,6 +139,7 @@ test("non-loopback controller listeners require a reachable public origin", asyn
 
 test("temporary worker transport loss removes the owned worker and reports failed graceful finalization", async (t) => {
   let removed = 0;
+  const requestLife = new AbortController();
   const worker = createServer((_req, res) => res.end("fixture"));
   await new Promise((resolve) => worker.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => worker.close(resolve)));
@@ -159,12 +160,18 @@ test("temporary worker transport loss removes the owned worker and reports faile
                     origin.replace("http:", "ws:") + "/execution/" + "a".repeat(64),
                   viewerToken: "b".repeat(64),
                 };
+              requestLife.abort();
               throw Error("browser_control_disconnected");
             },
           },
         };
       },
-      async remove() {
+      async remove(_worker, signal) {
+        assert.equal(
+          signal.aborted,
+          false,
+          "Owned cleanup inherited the dropped host request",
+        );
         removed++;
       },
     },
@@ -174,7 +181,7 @@ test("temporary worker transport loss removes the owned worker and reports faile
   const { wsEndpoint } = await controller.command({ op: "register", executionId });
   await fetch(wsEndpoint.replace("ws:", "http:") + "/files/fixture.txt");
   await assert.rejects(
-    controller.command({ op: "finalize", executionId }),
+    controller.command({ op: "finalize", executionId }, undefined, requestLife.signal),
     /browser_worker_finalization_failed/,
   );
   assert.equal(removed, 1);

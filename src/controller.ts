@@ -472,7 +472,7 @@ export async function createController(options: ControllerOptions) {
               ].includes(error.message)
             )
               throw error;
-            await options.backend.remove(current.worker, signal);
+            await options.backend.remove(current.worker, AbortSignal.timeout(30000));
             current.worker.runtime.close?.();
             storage.get(id)?.cleanup();
             bindings.delete(id);
