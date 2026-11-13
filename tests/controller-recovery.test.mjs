@@ -383,6 +383,8 @@ test("semantically corrupt cleanup confirmations cannot skip worker finalization
     { stopConfirmed: "false" },
     { stopConfirmed: true, finalResult: { stopped: false } },
     { phase: "invented" },
+    { phase: "active", cleanupUnconfirmed: true },
+    { phase: "recovery-required", cleanupUnconfirmed: true, generation: "published" },
   ]) {
     const f = await fixture(t);
     const first = await f.start();
@@ -512,4 +514,36 @@ test("restart cleans a network-only remainder of unconfirmed partial creation", 
   await second.reconcile();
   assert.equal(f.resources.size, 0);
   assert.equal(second.capacity().workers, 0);
+});
+
+test("restart retries deletion of an unregistered partial worker without runtime finalization", async (t) => {
+  const f = await fixture(t);
+  const create = f.backend.create;
+  let finalized = 0;
+  f.backend.create = async (placement) => {
+    const worker = await create(placement);
+    worker.runtime.request = async (request) => {
+      if (request.op === "worker_status") throw Error("browser_execution_revoked");
+      finalized++;
+      return { status: "absent" };
+    };
+    throw Error("browser_worker_cleanup_unconfirmed");
+  };
+  const first = await f.start();
+  const endpoint = await first.command({ op: "register", executionId: randomUUID() });
+  assert.equal((await fetch(fileUrl(first, endpoint))).status, 502);
+  await assert.rejects(first.stop(), /browser_worker_cleanup_unconfirmed/);
+  const second = await f.start();
+  const remove = f.backend.remove;
+  f.backend.remove = async () => {
+    throw Error("browser_worker_cleanup_unconfirmed");
+  };
+  await second.reconcile();
+  assert.equal(second.capacity().workers, 1);
+  assert.equal(f.resources.size, 1);
+  f.backend.remove = remove;
+  await second.reconcile();
+  assert.equal(f.resources.size, 0);
+  assert.equal(second.capacity().workers, 0);
+  assert.equal(finalized, 0);
 });
