@@ -247,58 +247,77 @@ try {
           ["proxy", await connectCdp(endpoint)],
         ]) {
           try {
-            const statsBefore = await api(
-              `/containers/${process.env.HOSTNAME}/stats?stream=false&one-shot=true`,
-            );
-            const times = [],
-              cpu = process.cpuUsage(),
-              start = performance.now();
-            let bytes = 0;
-            for (let i = 0; i < 30; i++) {
-              const begin = performance.now();
-              const result = await connection.call("Browser.getVersion");
-              times.push(performance.now() - begin);
-              bytes += Buffer.byteLength(JSON.stringify(result));
-            }
-            const screenshots = [];
-            let payloadBytes = 0;
-            const target = await connection.call("Target.attachToTarget", {
-              targetId: pageId,
-              flatten: true,
-            });
-            const transferStart = performance.now();
-            for (let i = 0; i < 5; i++) {
-              const begin = performance.now();
-              const result = await connection.call(
-                "Page.captureScreenshot",
-                {},
-                target.sessionId,
+            const batches = [];
+            for (let sample = 0; sample < 3; sample++) {
+              const statsBefore = await api(
+                `/containers/${process.env.HOSTNAME}/stats?stream=false&one-shot=true`,
               );
-              screenshots.push(performance.now() - begin);
-              payloadBytes += Buffer.byteLength(result.data);
-            }
-            const statsAfter = await api(
-              `/containers/${process.env.HOSTNAME}/stats?stream=false&one-shot=true`,
-            );
-            const networkBytes = (stats) =>
-              Object.values(stats.networks ?? {}).reduce(
-                (total, network) => total + network.rx_bytes + network.tx_bytes,
-                0,
+              const times = [],
+                cpu = process.cpuUsage(),
+                start = performance.now();
+              let bytes = 0;
+              for (let i = 0; i < 30; i++) {
+                const begin = performance.now();
+                const result = await connection.call("Browser.getVersion");
+                times.push(performance.now() - begin);
+                bytes += Buffer.byteLength(JSON.stringify(result));
+              }
+              const screenshots = [];
+              let payloadBytes = 0;
+              const target = await connection.call("Target.attachToTarget", {
+                targetId: pageId,
+                flatten: true,
+              });
+              const transferStart = performance.now();
+              for (let i = 0; i < 5; i++) {
+                const begin = performance.now();
+                const result = await connection.call(
+                  "Page.captureScreenshot",
+                  {},
+                  target.sessionId,
+                );
+                screenshots.push(performance.now() - begin);
+                payloadBytes += Buffer.byteLength(result.data);
+              }
+              const statsAfter = await api(
+                `/containers/${process.env.HOSTNAME}/stats?stream=false&one-shot=true`,
               );
+              const networkBytes = (stats) =>
+                Object.values(stats.networks ?? {}).reduce(
+                  (total, network) => total + network.rx_bytes + network.tx_bytes,
+                  0,
+                );
+              batches.push({
+                roundTripSamples: times,
+                screenshotSamples: screenshots,
+                controllerCpuNanos:
+                  statsAfter.cpu_stats.cpu_usage.total_usage -
+                  statsBefore.cpu_stats.cpu_usage.total_usage,
+                controllerNetworkBytes:
+                  networkBytes(statsAfter) - networkBytes(statsBefore),
+                roundTripMs: summary(times),
+                screenshotMs: summary(screenshots),
+                payloadBytes,
+                bytesPerSecond:
+                  payloadBytes / ((performance.now() - transferStart) / 1000),
+                clientCpuMicros: process.cpuUsage(cpu),
+                elapsedMs: performance.now() - start,
+                replyBytes: bytes,
+              });
+            }
             results[label] = {
-              controllerCpuNanos:
-                statsAfter.cpu_stats.cpu_usage.total_usage -
-                statsBefore.cpu_stats.cpu_usage.total_usage,
-              controllerNetworkBytes:
-                networkBytes(statsAfter) - networkBytes(statsBefore),
-              roundTripMs: summary(times),
-              screenshotMs: summary(screenshots),
-              payloadBytes,
-              bytesPerSecond:
-                payloadBytes / ((performance.now() - transferStart) / 1000),
-              clientCpuMicros: process.cpuUsage(cpu),
-              elapsedMs: performance.now() - start,
-              replyBytes: bytes,
+              roundTripMs: summary(batches.flatMap((batch) => batch.roundTripSamples)),
+              screenshotMs: summary(
+                batches.flatMap((batch) => batch.screenshotSamples),
+              ),
+              controllerCpuNanos: summary(
+                batches.map((batch) => batch.controllerCpuNanos),
+              ),
+              controllerNetworkBytes: summary(
+                batches.map((batch) => batch.controllerNetworkBytes),
+              ),
+              bytesPerSecond: summary(batches.map((batch) => batch.bytesPerSecond)),
+              batches,
             };
           } finally {
             connection.close();
