@@ -35,6 +35,20 @@ export function createWorkerAdmission({
   };
   return {
     status: () => ({ workers, pending, queued: queue.length }),
+    restore(): WorkerSlot {
+      workers++;
+      let released = false;
+      return {
+        signal: new AbortController().signal,
+        ready() {},
+        release() {
+          if (released) return;
+          released = true;
+          workers--;
+          drain();
+        },
+      };
+    },
     acquire(signal?: AbortSignal): Promise<WorkerSlot> {
       if (signal?.aborted) return Promise.reject(signal.reason);
       if (!available() && queue.length >= maxQueued)

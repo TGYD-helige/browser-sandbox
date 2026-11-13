@@ -101,3 +101,17 @@ test("expired queue entries are removed before capacity becomes available", asyn
   assert.deepEqual(admission.status(), { workers: 1, pending: 0, queued: 0 });
   first.release();
 });
+
+test("recovered workers consume live capacity without re-entering creation", async () => {
+  const admission = createWorkerAdmission({
+    maxWorkers: 1,
+    maxPending: 1,
+    maxQueued: 1,
+    creationTimeoutMs: 10000,
+  });
+  const recovered = admission.restore();
+  assert.deepEqual(admission.status(), { workers: 1, pending: 0, queued: 0 });
+  const waiting = admission.acquire();
+  recovered.release();
+  (await waiting).release();
+});
