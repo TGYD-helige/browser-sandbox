@@ -85,7 +85,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
   }
   return {
     async create(placement, signal) {
-      const name = `bs-${options.installation}-${placement.incarnation}`;
+      const name = `bs-${placement.incarnation}`;
       const expected = labels(placement.executionId, placement.incarnation);
       let network: string, id: string;
       try {
