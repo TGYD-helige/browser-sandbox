@@ -794,16 +794,20 @@ export async function createController(options: ControllerOptions) {
           if (preserveWorkers) {
             if (!binding.endpoint) {
               await binding.starting?.catch((error) => {
-                if (error?.message === "browser_worker_cleanup_unconfirmed")
+                if (
+                  error?.name !== "AbortError" &&
+                  error?.message !== "browser_worker_creation_cancelled"
+                )
                   throw error;
               });
             }
-            binding.worker?.runtime.close?.();
           } else {
             await command({ op: "finalize", executionId: binding.executionId });
           }
         } catch (error) {
           failure ??= error;
+        } finally {
+          if (preserveWorkers) binding.worker?.runtime.close?.();
         }
       }
       for (const attachment of storage.values()) attachment.cleanup();

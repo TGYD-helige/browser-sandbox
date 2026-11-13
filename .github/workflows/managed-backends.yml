@@ -67,7 +67,7 @@ jobs:
       - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: pnpm install --frozen-lockfile && pnpm build
       - run: python -m pip install -r .github/scripts/managed/requirements.txt
-      - run: python .github/scripts/managed/test-chart.py
+      - run: python .github/scripts/managed/test-chart.py && python .github/scripts/managed/test-k3d-cluster.py
       - run: docker build -t browser-sandbox:managed .
       - run: docker build -f .github/scripts/managed/Dockerfile.client -t browser-sandbox-client:managed .
       - run: bash .github/scripts/verify-image.sh browser-sandbox:managed
