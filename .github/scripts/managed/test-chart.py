@@ -58,6 +58,11 @@ class ChartTest(unittest.TestCase):
         self.assertNotEqual(original["spec"]["template"], changed["spec"]["template"])
         self.assertGreaterEqual(original["spec"]["template"]["spec"]["terminationGracePeriodSeconds"], 80)
 
+    def test_bare_worker_disruption_budget_uses_integer_minimum(self):
+        budget = next(item for item in render("--set", "worker.disruptionBudget.enabled=true") if item["kind"] == "PodDisruptionBudget")
+        self.assertEqual(budget["spec"]["minAvailable"], 1)
+        self.assertNotIn("maxUnavailable", budget["spec"])
+
 
 if __name__ == "__main__":
     unittest.main()
