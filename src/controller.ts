@@ -1,0 +1,507 @@
+import { randomBytes, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { createServer, request as httpRequest } from "node:http";
+import type { AddressInfo } from "node:net";
+import { pipeline } from "node:stream";
+import WebSocket, { createWebSocketStream, WebSocketServer } from "ws";
+import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
+import { type ControlPeer, createNetworkHostControl } from "./network-control.js";
+import { normalizeAllowedDomains } from "./network-policy.js";
+import type { SessionStatus } from "./session.js";
+
+export interface ExecutionBinding {
+  executionId: string;
+  incarnation: string;
+  allowedDomains: string[];
+  worker?: ManagedWorker;
+  starting?: Promise<ManagedWorker>;
+  endpoint?: { cdpUrl: string; viewerToken: string };
+  life: AbortController;
+  revoked: boolean;
+  host?: ControlPeer;
+}
+interface Access {
+  token: string;
+  binding: ExecutionBinding;
+  kind: "cdp" | "view";
+  control: boolean;
+  resize: boolean;
+  expiresAt?: number;
+  life: AbortController;
+  timer?: ReturnType<typeof setTimeout>;
+  connections: Set<{ destroy(): void }>;
+}
+export interface ControllerOptions {
+  backend: ManagedBackend;
+  port?: number;
+  host?: string;
+  publicOrigin?: string;
+  viewerOrigins?: string[];
+  creationTimeoutMs?: number;
+  authenticateHost?: Parameters<typeof createNetworkHostControl>[0]["authenticateHost"];
+  /** Reserved for future agent identity validation; every protected route crosses this seam. */
+  authorizeAccess?: (
+    executionId: string,
+    request: import("node:http").IncomingMessage,
+  ) => Promise<void>;
+}
+
+/** Single-controller temporary executions; infrastructure and worker addresses stay behind this interface. */
+export async function createController(options: ControllerOptions) {
+  const bindings = new Map<string, ExecutionBinding>();
+  const grants = new Map<string, Access>();
+  const finished = new Set<string>();
+  let closing = false;
+  let origin = options.publicOrigin;
+  if (
+    origin &&
+    (!/^https?:$/.test(new URL(origin).protocol) || new URL(origin).origin !== origin)
+  )
+    throw Error("browser_access_origin_invalid");
+  const assets = new Map([
+    ["/view", ["index.html", "text/html"]],
+    ["/viewer.js", ["browser-viewer.js", "text/javascript"]],
+    ["/viewer.css", ["viewer.css", "text/css"]],
+  ]);
+  const server = createServer(async (req, res) => {
+    const life = new AbortController();
+    res.once("close", () => {
+      if (!res.writableEnded) life.abort();
+    });
+    try {
+      res.setHeader("cache-control", "no-store");
+      res.setHeader("referrer-policy", "no-referrer");
+      res.setHeader("x-content-type-options", "nosniff");
+      res.setHeader(
+        "content-security-policy",
+        `default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' blob: data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'self' ${(options.viewerOrigins ?? []).join(" ")}`,
+      );
+      if (req.url === "/health") {
+        res.writeHead(closing ? 503 : 204).end();
+        return;
+      }
+      if (!allowedOrigin(req)) {
+        res.writeHead(403).end();
+        return;
+      }
+      const asset = assets.get(req.url);
+      if (asset && req.method === "GET") {
+        res.setHeader("content-type", asset[1]);
+        res.end(await readFile(new URL(`./viewer/${asset[0]}`, import.meta.url)));
+        return;
+      }
+      const match =
+        /^\/execution\/([a-f0-9]{64})(\/(?:session|auth|files\/[^/?]+))$/.exec(
+          req.url ?? "",
+        );
+      const grant = match && (await access(match[1], "cdp", req));
+      if (!grant) {
+        res.writeHead(403).end();
+        return;
+      }
+      const signal = AbortSignal.any([
+        life.signal,
+        grant.life.signal,
+        AbortSignal.timeout(match[2] === "/auth" ? 620000 : 180000),
+      ]);
+      const worker = await ensureWorker(grant.binding, signal);
+      signal.throwIfAborted();
+      const target = new URL(grant.binding.endpoint.cdpUrl);
+      target.protocol = "http:";
+      target.pathname += match[2];
+      const headers = { ...req.headers, host: target.host };
+      delete headers.authorization;
+      delete headers.cookie;
+      delete headers.origin;
+      const upstream = httpRequest(
+        target,
+        { method: req.method, headers, signal },
+        (response) => {
+          res.writeHead(response.statusCode, response.headers);
+          pipeline(response, res, () => {});
+        },
+      );
+      upstream.on("error", () => {
+        if (!res.headersSent)
+          res
+            .writeHead(502)
+            .end(JSON.stringify({ error: "browser_worker_unavailable" }));
+        else res.destroy();
+      });
+      pipeline(req, upstream, () => {});
+      void worker;
+    } catch (error) {
+      if (!res.headersSent)
+        res.writeHead(502).end(JSON.stringify({ error: errorCode(error) }));
+      else res.destroy();
+    }
+  });
+  const allowedOrigin = (req) =>
+    !req.headers.origin ||
+    req.headers.origin === origin ||
+    (options.viewerOrigins ?? []).includes(req.headers.origin);
+  function revoke(grant: Access) {
+    grants.delete(grant.token);
+    clearTimeout(grant.timer);
+    grant.life.abort();
+    for (const connection of grant.connections) connection.destroy();
+    grant.connections.clear();
+  }
+  function issue(
+    binding: ExecutionBinding,
+    kind: Access["kind"],
+    durationMs?: number,
+    control = false,
+    resize = false,
+  ) {
+    if (grants.size >= 2000) throw Error("browser_access_capacity_exceeded");
+    const token = randomBytes(32).toString("hex");
+    const grant: Access = {
+      token,
+      binding,
+      kind,
+      control,
+      resize,
+      life: new AbortController(),
+      connections: new Set(),
+      expiresAt: durationMs ? Date.now() + durationMs : undefined,
+    };
+    grants.set(token, grant);
+    if (durationMs) {
+      grant.timer = setTimeout(() => revoke(grant), durationMs);
+      grant.timer.unref();
+    }
+    return grant;
+  }
+  async function access(
+    token: string,
+    kind: Access["kind"],
+    request,
+  ): Promise<Access | undefined> {
+    const grant = grants.get(token);
+    if (
+      !grant ||
+      closing ||
+      grant.kind !== kind ||
+      grant.binding.revoked ||
+      grant.life.signal.aborted ||
+      (grant.expiresAt && grant.expiresAt <= Date.now()) ||
+      !allowedOrigin(request)
+    )
+      return;
+    await options.authorizeAccess?.(grant.binding.executionId, request);
+    return grant.life.signal.aborted || grant.binding.revoked ? undefined : grant;
+  }
+  const endpoint = (binding: ExecutionBinding) => {
+    let grant = [...grants.values()].find(
+      (grant) => grant.binding === binding && grant.kind === "cdp" && !grant.expiresAt,
+    );
+    grant ??= issue(binding, "cdp");
+    return {
+      protocol: "browser-sandbox.host/v1",
+      wsEndpoint: `${origin.replace(/^http/, "ws")}/execution/${grant.token}`,
+    };
+  };
+  async function ensureWorker(binding: ExecutionBinding, signal: AbortSignal) {
+    signal.throwIfAborted();
+    if (binding.revoked) throw Error("browser_execution_revoked");
+    if (!binding.starting) {
+      // One creation belongs to the binding; a disconnect cancels its initial acquisition.
+      const creationSignal = AbortSignal.any([
+        binding.life.signal,
+        signal,
+        AbortSignal.timeout(options.creationTimeoutMs ?? 90000),
+      ]);
+      binding.starting = (async () => {
+        const worker = await options.backend.create(
+          {
+            executionId: binding.executionId,
+            incarnation: binding.incarnation,
+            allowedDomains: binding.allowedDomains,
+            automation: binding.host
+              ? {
+                  pause: async (executionId, signal) => {
+                    await binding.host.callback("pause", { executionId }, signal);
+                  },
+                  resume: async (executionId, signal) => {
+                    await binding.host.callback("resume", { executionId }, signal);
+                  },
+                }
+              : undefined,
+          },
+          creationSignal,
+        );
+        binding.worker = worker;
+        try {
+          creationSignal.throwIfAborted();
+          const result = await worker.runtime.request<{
+            cdpUrl: string;
+            viewerToken: string;
+          }>(
+            {
+              op: "register",
+              executionId: binding.executionId,
+              allowedDomains: binding.allowedDomains,
+            },
+            { signal: creationSignal },
+          );
+          creationSignal.throwIfAborted();
+          binding.endpoint = result;
+          return worker;
+        } catch (error) {
+          await options.backend.remove(worker, AbortSignal.timeout(30000));
+          worker.runtime.close?.();
+          binding.worker = undefined;
+          throw error;
+        }
+      })();
+      // Keep a failed creation fenced; retry/replacement is an explicit recovery operation.
+      binding.starting.catch(() => {});
+    }
+    return binding.starting;
+  }
+  async function command(
+    request: any,
+    peer?: ControlPeer,
+    signal = AbortSignal.timeout(180000),
+  ): Promise<any> {
+    signal.throwIfAborted();
+    if (
+      !request ||
+      typeof request.op !== "string" ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(
+        request.executionId ?? "",
+      )
+    )
+      throw Error("browser_request_invalid");
+    const id = request.executionId;
+    let binding = bindings.get(id);
+    if (request.op === "register") {
+      if (closing || finished.has(id) || binding?.revoked)
+        throw Error("browser_execution_revoked");
+      if (request.tenantId !== undefined)
+        throw Error("browser_tenant_isolation_unavailable");
+      if (request.profileId !== undefined || request.storage)
+        throw Error("browser_profile_storage_unavailable");
+      const domains = normalizeAllowedDomains(request.allowedDomains);
+      if (binding && JSON.stringify(binding.allowedDomains) !== JSON.stringify(domains))
+        throw Error("browser_domains_changed");
+      if (!binding) {
+        binding = {
+          executionId: id,
+          incarnation: randomUUID(),
+          allowedDomains: domains,
+          life: new AbortController(),
+          revoked: false,
+          host: request.automation ? peer : undefined,
+        };
+        bindings.set(id, binding);
+      }
+      return endpoint(binding);
+    }
+    if (["finalize", "finish"].includes(request.op)) {
+      if (!binding) return { status: "absent" };
+      binding.revoked = true;
+      binding.life.abort();
+      for (const grant of [...grants.values()])
+        if (grant.binding === binding) revoke(grant);
+      await binding.starting?.catch(() => {});
+      let result = { used: false, stopped: true };
+      if (binding.worker) {
+        result = await binding.worker.runtime.request(
+          { op: "finalize", executionId: id },
+          { signal },
+        );
+        await options.backend.remove(binding.worker, signal);
+        binding.worker.runtime.close?.();
+      }
+      bindings.delete(id);
+      finished.add(id);
+      return result;
+    }
+    if (!binding || binding.revoked || closing)
+      throw Error("browser_execution_revoked");
+    if (request.op === "endpoint") return endpoint(binding);
+    if (request.op === "access_create") {
+      const durationMs = request.durationMs ?? 600000;
+      if (
+        !Number.isInteger(durationMs) ||
+        durationMs < 1 ||
+        durationMs > 1800000 ||
+        (request.control !== undefined && typeof request.control !== "boolean") ||
+        (request.resize !== undefined && typeof request.resize !== "boolean")
+      )
+        throw Error("browser_access_request_invalid");
+      const agent = issue(binding, "cdp", durationMs);
+      const viewer = issue(
+        binding,
+        "view",
+        durationMs,
+        request.control === true,
+        request.resize === true,
+      );
+      return {
+        executionId: id,
+        cdpUrl: `${origin.replace(/^http/, "ws")}/execution/${agent.token}`,
+        viewerUrl: `${origin}/view#${viewer.token}`,
+        expiresAt: agent.expiresAt,
+      };
+    }
+    if (request.op === "access_revoke") {
+      for (const grant of [...grants.values()])
+        if (grant.binding === binding) revoke(grant);
+      return { revoked: true };
+    }
+    if (request.op === "session" && !binding.starting) {
+      if ((request.action ?? "status") === "status")
+        return { state: "unused", connectedClients: 0 } satisfies SessionStatus;
+      throw Error("browser_session_not_live");
+    }
+    if (!binding.starting) throw Error("browser_session_not_live");
+    const worker = await binding.starting;
+    return worker.runtime.request(request, { signal });
+  }
+  const control = createNetworkHostControl({
+    server,
+    dispatch: command,
+    authenticateHost: options.authenticateHost,
+  });
+  const viewers = new WebSocketServer({ noServer: true, maxPayload: 16384 });
+  const rawConnections = new Set<import("node:net").Socket>();
+  server.on("connection", (socket) => {
+    rawConnections.add(socket);
+    socket.once("close", () => rawConnections.delete(socket));
+  });
+  function tunnel(client: WebSocket, target: string, grant: Access, auth?: any) {
+    const upstream = new WebSocket(target, {
+      maxPayload: 32 * 1024 * 1024,
+      handshakeTimeout: 30000,
+      ...(auth ? { origin: grant.binding.worker.origin } : {}),
+    });
+    const connection = {
+      destroy() {
+        client.terminate();
+        upstream.terminate();
+      },
+    };
+    grant.connections.add(connection);
+    const downstream = createWebSocketStream(client, {
+      readableObjectMode: true,
+      decodeStrings: false,
+      highWaterMark: 1,
+    });
+    const incoming = createWebSocketStream(upstream, {
+      readableObjectMode: true,
+      decodeStrings: false,
+      highWaterMark: 1,
+    });
+    const close = () => {
+      grant.connections.delete(connection);
+      downstream.destroy();
+      incoming.destroy();
+      connection.destroy();
+    };
+    downstream.on("error", close);
+    incoming.on("error", close);
+    client.once("close", close);
+    upstream.once("close", close);
+    upstream.on("open", () => {
+      if (grant.life.signal.aborted) return close();
+      if (auth) upstream.send(JSON.stringify(auth));
+      downstream.pipe(incoming).pipe(downstream);
+    });
+    upstream.on("error", close);
+  }
+  const cdp = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
+  server.on("upgrade", async (req, socket, head) => {
+    if (req.url === "/host") return;
+    const life = new AbortController();
+    socket.once("close", () => life.abort());
+    try {
+      if (req.url === "/view/socket" && allowedOrigin(req)) {
+        viewers.handleUpgrade(req, socket, head, (client) => {
+          const timer = setTimeout(() => client.terminate(), 5000);
+          client.once("close", () => clearTimeout(timer));
+          client.on("error", () => client.terminate());
+          client.once("message", async (raw) => {
+            clearTimeout(timer);
+            client.pause();
+            try {
+              const auth = JSON.parse(String(raw));
+              const grant =
+                auth.type === "authenticate" && (await access(auth.token, "view", req));
+              if (!grant) throw Error("browser_access_denied");
+              await ensureWorker(
+                grant.binding,
+                AbortSignal.any([life.signal, grant.life.signal]),
+              );
+              tunnel(
+                client,
+                `${grant.binding.worker.origin.replace(/^http/, "ws")}/view/socket`,
+                grant,
+                {
+                  type: "authenticate",
+                  token: grant.binding.endpoint.viewerToken,
+                  control: grant.control,
+                  resize: grant.resize,
+                },
+              );
+              client.resume();
+            } catch {
+              client.close(1008, "browser_access_denied");
+            }
+          });
+        });
+        return;
+      }
+      const match = /^\/execution\/([a-f0-9]{64})$/.exec(req.url ?? "");
+      const grant = match && (await access(match[1], "cdp", req));
+      if (!grant) throw Error("browser_access_denied");
+      await ensureWorker(
+        grant.binding,
+        AbortSignal.any([life.signal, grant.life.signal]),
+      );
+      if (socket.destroyed || grant.life.signal.aborted)
+        throw Error("browser_execution_revoked");
+      cdp.handleUpgrade(req, socket, head, (client) =>
+        tunnel(client, grant.binding.endpoint.cdpUrl, grant),
+      );
+    } catch {
+      socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    }
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(options.port ?? 8080, options.host ?? "127.0.0.1", resolve);
+  });
+  origin ??= `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  return {
+    origin,
+    command,
+    bindings,
+    async stop() {
+      closing = true;
+      let failure: unknown;
+      for (const binding of bindings.values()) {
+        try {
+          await command({ op: "finalize", executionId: binding.executionId });
+        } catch (error) {
+          failure ??= error;
+        }
+      }
+      control.close();
+      for (const grant of [...grants.values()]) revoke(grant);
+      for (const client of [...viewers.clients, ...cdp.clients]) client.terminate();
+      viewers.close();
+      cdp.close();
+      for (const socket of rawConnections) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (failure) throw failure;
+    },
+  };
+}
+function errorCode(error: any) {
+  return /^browser_[a-z_]+$/.test(error?.message)
+    ? error.message
+    : "browser_worker_unavailable";
+}

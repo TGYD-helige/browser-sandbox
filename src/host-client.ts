@@ -3,7 +3,7 @@ import { StringDecoder } from "node:string_decoder";
 
 export interface Registration {
   executionId: string;
-  executorUid: number;
+  executorUid?: number;
   profileId?: string;
   storage?: boolean;
   allowedDomains?: string[];
@@ -18,7 +18,7 @@ export interface BrowserAccess {
 
 export interface Endpoint {
   protocol: "browser-sandbox.host/v1";
-  executorUid: number;
+  executorUid?: number;
   wsEndpoint: string | null;
   profileId?: string;
 }

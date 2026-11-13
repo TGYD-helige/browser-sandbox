@@ -29,6 +29,7 @@ export async function createGateway({
   startupTimeoutMs = 45000,
   maxSessionMs = 1800000,
   access = undefined as AccessOptions | undefined,
+  workerExecutionId = undefined as string | undefined,
 }) {
   const server = createServer();
   let remote: Awaited<ReturnType<typeof createAccessServer>>;
@@ -79,10 +80,11 @@ export async function createGateway({
           executions,
           WebSocket,
           WebSocketServer,
-          options: access,
+          options: { ...access, workerExecutionId },
           fileTransfers,
           authentication,
           automationControl,
+          healthy,
         })
       : undefined;
   } catch (error) {
@@ -119,8 +121,23 @@ export async function createGateway({
   });
   return {
     command,
+    async workerCommand(request, signal?: AbortSignal) {
+      if (!workerExecutionId || request.executionId !== workerExecutionId)
+        throw Error("browser_identity_mismatch");
+      if (request.op === "access_confirm_stopped") return remote.command(request);
+      const result = await executions.command(
+        { ...request, executorUid: undefined },
+        true,
+        false,
+        signal,
+      );
+      if (request.op === "register")
+        return { ...result, ...remote.bindWorker(executions.get(workerExecutionId)) };
+      return result;
+    },
     port: (server.address() as AddressInfo).port,
     accessPort: remote?.port,
+    workerServer: workerExecutionId ? remote?.server : undefined,
     async stop() {
       executions.beginShutdown();
       await remote?.stop();

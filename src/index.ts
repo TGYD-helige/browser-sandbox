@@ -8,6 +8,8 @@ export type {
   BrowserAuthStatus,
 } from "./browser-auth.js";
 export { browserAuthRequest } from "./browser-auth.js";
+export type { ControllerOptions, ExecutionBinding } from "./controller.js";
+export { createController } from "./controller.js";
 export { createGateway } from "./gateway.js";
 export type {
   BrowserAccess,
@@ -21,6 +23,12 @@ export {
   VerifiedBrowserCheckpointFailure,
 } from "./lifecycle-errors.js";
 export { createLocalProfiles, validProfileId } from "./local-profiles.js";
+export type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
+export type { ControllerRuntime, ControlPeer } from "./network-control.js";
+export {
+  createControllerRuntime,
+  createNetworkHostControl,
+} from "./network-control.js";
 export { createProfileArchive } from "./profiles.js";
 export type {
   BrowserRuntime,
