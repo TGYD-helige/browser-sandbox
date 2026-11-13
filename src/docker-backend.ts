@@ -93,6 +93,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         placement.profileId,
       );
       let network: string, id: string;
+      let requestingImage = false;
       try {
         network = (
           await api(
@@ -111,6 +112,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         const environment = WORKER_ENVIRONMENT.filter(
           (key) => options.environment?.[key] !== undefined,
         ).map((key) => `${key}=${options.environment[key]}`);
+        requestingImage = true;
         id = (
           await api(
             `/containers/create?name=${name}`,
@@ -172,6 +174,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
             signal,
           )
         ).Id;
+        requestingImage = false;
         await api(`/containers/${id}/start`, "POST", undefined, signal);
         const origin = `http://${name}:8081`;
         while (true) {

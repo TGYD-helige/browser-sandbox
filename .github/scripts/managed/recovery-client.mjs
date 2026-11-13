@@ -9,7 +9,20 @@ const stateFile = "/controller-data/recovery-test.json";
 const runtime = createControllerRuntime(origin);
 const phase = process.argv[2];
 try {
-  if (phase === "prepare") {
+  if (phase === "image-failure") {
+    const executionId = randomUUID();
+    const endpoint = await runtime.request({ op: "register", executionId });
+    try {
+      const response = await fetch(
+        `${endpoint.wsEndpoint.replace(/^ws/, "http")}/files/failure`,
+      );
+      assert.equal(response.status, 502);
+      assert.equal((await response.json()).error, "browser_worker_image_unavailable");
+      console.log(JSON.stringify({ phase, explicitImageFailure: true }));
+    } finally {
+      await runtime.request({ op: "finalize", executionId });
+    }
+  } else if (phase === "prepare") {
     const executionId = randomUUID();
     const { wsEndpoint } = await runtime.request({ op: "register", executionId });
     const started = performance.now();
@@ -54,7 +67,34 @@ try {
     }
   } else {
     const state = JSON.parse(await readFile(stateFile, "utf8"));
-    if (phase === "replay") {
+    if (phase === "unknown") {
+      const deadline = Date.now() + 20000;
+      while (true) {
+        const status = await runtime.request({
+          op: "controller_status",
+          executionId: state.executionId,
+        });
+        if (status.execution.statusError) {
+          assert.equal(status.workers, 1);
+          assert.equal(status.execution.idleProtection, "unknown");
+          break;
+        }
+        assert(Date.now() < deadline, "Failed status read was not observed");
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      console.log(JSON.stringify({ phase, failedStatusKeptWorker: true }));
+    } else if (phase === "incompatible") {
+      await assert.rejects(
+        runtime.request({
+          op: "session",
+          executionId: state.executionId,
+          action: "renew",
+          durationMs: 10000,
+        }),
+        /browser_worker_protocol_unsupported/,
+      );
+      console.log(JSON.stringify({ phase, incompatibleWorkerRetained: true }));
+    } else if (phase === "replay") {
       await assert.rejects(
         runtime.request({ op: "register", executionId: state.executionId }),
         /browser_execution_revoked/,

@@ -16,6 +16,8 @@ Do not run multiple controllers against the same installation or journal. Shared
 | `BROWSER_MAX_EXECUTION_MS` | `capacity.maxExecutionMs` | `3600000` | Maximum registration lifetime before normal finalization |
 | `BROWSER_IDLE_REGISTRATION_MS` | `capacity.idleRegistrationMs` | `900000` | Inactivity before an unused registration or idle worker becomes eligible for finalization |
 
+The trusted host operation `controller_status` reports capacity, configured limits, and an optional execution's lifecycle phase, last idle protection/error and reclamation reason. It contains no worker addresses or access grants.
+
 Creation is shared by clients waiting for the same execution. Disconnecting the last waiter cancels queued or incomplete creation. A cancelled partial allocation continues to consume capacity until owned cleanup or a complete discovery confirms its outcome. Queue overflow returns `browser_worker_queue_full`; status and cleanup errors never create a replacement worker or replay browser commands.
 
 ## Reclamation and failure recovery
@@ -25,6 +27,8 @@ The controller reads the worker's session, connected-client count, takeover stat
 Normal controller shutdown preserves published workers and closes proxy connections. Clients must reconnect; requests and website writes are never automatically replayed. Startup discovers only the installation's exact worker incarnations, recovers bindings, grants and Profile leases from durable records, and reads retention from the existing worker. Failed discovery blocks admission. Worker or generation loss rejects renewal explicitly and never redirects the old endpoint into a newly created browser.
 
 Finalization revokes access, confirms browser shutdown and any required Profile save, records that confirmation durably, and only then deletes infrastructure. Failed deletion remains pending and can be retried without repeating a confirmed save. Unconfirmed save or cleanup retains ownership and recoverable data. A host using remote storage must reconnect its storage adapter to the same execution after controller replacement before a save can complete. A Profile lease is released only after confirmed finalization and cleanup. Compatible owned orphans use the same finalization path; incompatible or unreadable workers remain available for operator investigation.
+
+The journal stores finalization confirmations without Profile encryption keys or archive transfer grants.
 
 The journal retains finished identities to reject delayed or reused execution IDs across restart. It does not silently evict fences: its current 65,536-record bound rejects new identities when full. Retain and back up this directory. Replacing or deleting the journal removes replay history; do so only after draining the installation and ensuring old execution IDs and endpoints cannot be reused. Corrupt or foreign-installation records block recovery and remain intact.
 

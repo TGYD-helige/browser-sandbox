@@ -112,6 +112,7 @@ async function fixture(t, { pending = false, deleteRace = false, createStatus } 
     listOwner: "release-uid",
     listFailure: false,
     statusOverride: undefined,
+    quota: false,
   };
   const server = createServer(async (request, response) => {
     const chunks = [];
@@ -152,10 +153,8 @@ async function fixture(t, { pending = false, deleteRace = false, createStatus } 
           }),
         );
     } else if (request.method === "POST") {
-      if (createStatus) {
-        response
-          .writeHead(createStatus)
-          .end(JSON.stringify({ message: "private admission diagnostic" }));
+      if (createStatus || state.quota) {
+        response.writeHead(createStatus ?? 403).end(JSON.stringify({ message: state.quota ? "exceeded quota: test" : "private admission diagnostic" }));
         return;
       }
       state.pod = { ...body, metadata: { ...body.metadata, uid: "original" } };
@@ -431,4 +430,14 @@ test("unschedulable and image-pull failures return explicit errors after owned c
     );
     assert.equal(state.deleted, true);
   }
+});
+test("Kubernetes quota rejection reports the cause without allocating a Pod", async (t) => {
+  const { backend, state } = await fixture(t);
+  state.quota = true;
+  await assert.rejects(
+    backend.create({ executionId, incarnation }, AbortSignal.timeout(5000)),
+    /browser_worker_quota_exceeded/,
+  );
+  assert.equal(state.pod, undefined);
+  assert.equal(state.deleted, false);
 });

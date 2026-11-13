@@ -29,12 +29,52 @@ async function connect(endpoint) {
   return cdp;
 }
 try {
-  if (action === "status") {
+  if (["unschedulable", "image-failure", "quota"].includes(action)) {
+    const expected = {
+      unschedulable: "browser_worker_unschedulable",
+      "image-failure": "browser_worker_image_unavailable",
+      quota: "browser_worker_quota_exceeded",
+    }[action];
+    const endpoint = await runtime.request({ op: "register", executionId });
+    try {
+      const response = await fetch(
+        `${endpoint.wsEndpoint.replace(/^ws/, "http")}/files/failure`,
+      );
+      assert.equal(response.status, 502);
+      assert.equal((await response.json()).error, expected);
+      console.log(JSON.stringify({ creationFailure: expected }));
+    } finally {
+      await runtime.request({ op: "finalize", executionId });
+    }
+  } else if (action === "status") {
     console.log(
       JSON.stringify(
         await runtime.request({ op: "session", executionId, action: "status" }),
       ),
     );
+  } else if (action === "unknown") {
+    const deadline = Date.now() + 20000;
+    while (true) {
+      const status = await runtime.request({ op: "controller_status", executionId });
+      if (status.execution.statusError) {
+        assert.equal(status.execution.idleProtection, "unknown");
+        break;
+      }
+      assert(Date.now() < deadline, "Failed status read was not observed");
+      await delay(25);
+    }
+    console.log(JSON.stringify({ failedStatusKeptWorker: true }));
+  } else if (action === "incompatible") {
+    await assert.rejects(
+      runtime.request({
+        op: "session",
+        executionId,
+        action: "renew",
+        durationMs: 10000,
+      }),
+      /browser_worker_protocol_unsupported/,
+    );
+    console.log(JSON.stringify({ incompatibleWorkerRetained: true }));
   } else if (action === "finish") {
     try {
       await runtime.request({ op: "finalize", executionId });

@@ -13,6 +13,7 @@ const namespace = `browser-${suffix}`;
 const release = "trial";
 const deployment = "trial-browser";
 const image = process.env.BROWSER_IMAGE ?? "browser-sandbox:managed";
+const nextImage = `browser-sandbox:protocol-${suffix}`;
 const clientImage =
   process.env.BROWSER_CLIENT_IMAGE ?? "browser-sandbox-client:managed";
 const kubeconfig = process.env.TEST_K3D_CLUSTER
@@ -126,6 +127,30 @@ const profileClient = async (phase = "roundtrip", executionId) => {
     ),
   );
 };
+const recoveryCases = async (phase) =>
+  JSON.parse(
+    await run(
+      "kubectl",
+      [
+        "-n",
+        namespace,
+        "exec",
+        "-i",
+        "client",
+        "--",
+        "env",
+        `TEST_CONTROLLER_ORIGIN=http://${deployment}.${namespace}.svc:8080`,
+        `BROWSER_HOST_ARCHIVE_URL=http://host-storage.${namespace}.svc:8082/archive`,
+        `TEST_RECOVERY_PHASE=${phase}`,
+        "node",
+        "--input-type=module",
+      ],
+      {
+        input: await readFile(".github/scripts/managed/recovery-scenarios.mjs", "utf8"),
+        timeout: 600000,
+      },
+    ),
+  );
 const wait = async (description, predicate, timeout = 90000) => {
   const deadline = Date.now() + timeout;
   while (!(await predicate())) {
@@ -175,7 +200,21 @@ try {
       node.metadata.labels["node-role.kubernetes.io/control-plane"] !== undefined,
   ).metadata.name;
   const workerNode = nodes.find((node) => node.metadata.name !== server).metadata.name;
-  for (const candidate of [image, clientImage]) {
+  await run(
+    "docker",
+    [
+      "build",
+      "--build-arg",
+      `BROWSER_IMAGE=${image}`,
+      "-f",
+      ".github/scripts/managed/Dockerfile.protocol",
+      "-t",
+      nextImage,
+      ".",
+    ],
+    { timeout: 300000 },
+  );
+  for (const candidate of [image, clientImage, nextImage]) {
     await run("k3d", ["image", "import", candidate, "-c", cluster], {
       timeout: 300000,
     });
@@ -197,6 +236,15 @@ try {
   assert(/^sha256:[a-f0-9]{64}$/.test(digest));
   const repository = normalized.slice(0, normalized.lastIndexOf(":"));
   const pinned = `${repository}@${digest}`;
+  const nextNormalized = `docker.io/library/${nextImage}`;
+  const nextRow = images
+    .split("\n")
+    .find((line) => line.split(/\s+/)[0] === nextNormalized);
+  assert(nextRow, "Imported protocol image was not found");
+  const nextDigest = nextRow.split(/\s+/)[2];
+  assert(/^sha256:[a-f0-9]{64}$/.test(nextDigest));
+  const nextRepository = nextNormalized.slice(0, nextNormalized.lastIndexOf(":"));
+  const nextPinned = `${nextRepository}@${nextDigest}`;
   extraction = await run("docker", ["create", image]);
   await run("docker", [
     "cp",
@@ -229,6 +277,18 @@ try {
       "--force",
       normalized,
       pinned,
+    ]);
+    await run("docker", [
+      "exec",
+      node.metadata.name,
+      "ctr",
+      "-n",
+      "k8s.io",
+      "images",
+      "tag",
+      "--force",
+      nextNormalized,
+      nextPinned,
     ]);
   }
   stage = "NetworkPolicy enforcement";
@@ -272,6 +332,13 @@ try {
     JSON.stringify({
       image: { repository, digest },
       profileStore: { enabled: true },
+      capacity: {
+        maxWorkers: 2,
+        maxPending: 1,
+        maxQueued: 1,
+        idleRegistrationMs: 500,
+        maxExecutionMs: 180000,
+      },
       networkPolicy: {
         storageEgress: [{ address: hostStorageAddress, port: 9083 }],
         apiServerCidrs: [
@@ -483,6 +550,68 @@ try {
     "Client image must match the native runner architecture",
   );
   assert.equal((await pods()).length, 0, "Temporary worker was not removed");
+  stage = "recovery scenarios";
+  const recoveryReport = [];
+  for (const phase of ["core", "ttl-volume", "ttl-host"])
+    recoveryReport.push(await recoveryCases(phase));
+  await writeFile(
+    "managed-results/recovery-kubernetes.json",
+    `${JSON.stringify(recoveryReport, null, 2)}\n`,
+  );
+  stage = "creation failure scenarios";
+  cordoned = workerNode;
+  await run("kubectl", ["cordon", workerNode]);
+  try {
+    await client("unschedulable");
+    assert.equal((await pods()).length, 0);
+  } finally {
+    await run("kubectl", ["uncordon", workerNode]);
+    cordoned = undefined;
+  }
+  const namespacePods = JSON.parse(await kubectl("get", "pods", "-o", "json")).items
+    .length;
+  await kubectl("create", "quota", "recovery-quota", `--hard=pods=${namespacePods}`);
+  await wait(
+    "Resource quota usage did not settle",
+    async () =>
+      JSON.parse(await kubectl("get", "quota", "recovery-quota", "-o", "json")).status
+        .used?.pods === String(namespacePods),
+  );
+  try {
+    await client("quota");
+    assert.equal((await pods()).length, 0);
+  } finally {
+    await kubectl("delete", "quota", "recovery-quota");
+  }
+  await run("docker", [
+    "exec",
+    workerNode,
+    "ctr",
+    "-n",
+    "k8s.io",
+    "images",
+    "rm",
+    pinned,
+    normalized,
+  ]);
+  try {
+    await client("image-failure");
+    assert.equal((await pods()).length, 0);
+  } finally {
+    await run("k3d", ["image", "import", image, "-c", cluster], { timeout: 300000 });
+    await run("docker", [
+      "exec",
+      workerNode,
+      "ctr",
+      "-n",
+      "k8s.io",
+      "images",
+      "tag",
+      "--force",
+      normalized,
+      pinned,
+    ]);
+  }
   stage = "rollout and drain";
   const held = await client("hold");
   const original = (await pods())[0];
@@ -496,6 +625,55 @@ try {
     ),
     "Controller rollout deleted the live worker",
   );
+  await client("resume", held.executionId);
+  const rule = [
+    "INPUT",
+    "-p",
+    "tcp",
+    "--dport",
+    "8081",
+    "-j",
+    "REJECT",
+    "--reject-with",
+    "tcp-reset",
+  ];
+  await kubectl("exec", original.metadata.name, "--", "iptables", "-I", ...rule);
+  try {
+    await client("unknown", held.executionId);
+    assert((await pods()).some((pod) => pod.metadata.uid === original.metadata.uid));
+  } finally {
+    await kubectl("exec", original.metadata.name, "--", "iptables", "-D", ...rule);
+  }
+  await run("helm", [
+    "upgrade",
+    release,
+    "charts/browser-sandbox",
+    "-n",
+    namespace,
+    "-f",
+    values,
+    "--set",
+    `image.repository=${nextRepository}`,
+    "--set",
+    `image.digest=${nextDigest}`,
+    "--wait",
+    "--timeout",
+    "120s",
+  ]);
+  await client("incompatible", held.executionId);
+  assert((await pods()).some((pod) => pod.metadata.uid === original.metadata.uid));
+  await run("helm", [
+    "upgrade",
+    release,
+    "charts/browser-sandbox",
+    "-n",
+    namespace,
+    "-f",
+    values,
+    "--wait",
+    "--timeout",
+    "120s",
+  ]);
   await client("resume", held.executionId);
   // Optional PDB must make ordinary drain wait without deleting workers.
   await run("helm", [
@@ -578,6 +756,42 @@ try {
   await client("replay", losing.executionId);
   await run("kubectl", ["uncordon", workerNode]);
   cordoned = undefined;
+  const deadlineHeld = await client("hold");
+  const deadlinePod = (await pods()).find(
+    (pod) =>
+      pod.metadata.labels["browser-sandbox.io/execution"] === deadlineHeld.executionId,
+  );
+  assert(deadlinePod?.spec.activeDeadlineSeconds);
+  await kubectl("scale", `deployment/${deployment}`, "--replicas=0");
+  await wait(
+    "Controller did not stop",
+    async () =>
+      JSON.parse(
+        await kubectl(
+          "get",
+          "pods",
+          "-l",
+          "app.kubernetes.io/component=controller",
+          "-o",
+          "json",
+        ),
+      ).items.length === 0,
+    120000,
+  );
+  await wait(
+    "Pod lifetime backstop did not fire",
+    async () => {
+      const pod = JSON.parse(
+        await kubectl("get", "pod", deadlinePod.metadata.name, "-o", "json"),
+      );
+      return pod.status.phase === "Failed" && pod.status.reason === "DeadlineExceeded";
+    },
+    (deadlinePod.spec.activeDeadlineSeconds + 60) * 1000,
+  );
+  await kubectl("scale", `deployment/${deployment}`, "--replicas=1");
+  await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
+  await client("lost", deadlineHeld.executionId);
+  await client("finish", deadlineHeld.executionId);
   stage = "safe uninstall";
   await client("hold");
   const finalWorker = (await pods())[0];
@@ -632,6 +846,10 @@ try {
     rolloutPreservedWorker: true,
     rolloutRecoveredOriginalPage: true,
     finishedIdsFencedAcrossRestart: true,
+    incompatibleProtocolPreservedWorker: true,
+    failedStatusPreservedWorker: true,
+    controllerAbsentDeadlineEnforced: true,
+    unschedulableQuotaAndPullFailuresExplicit: true,
     drainWithoutForce: true,
     pdbBlockedDrain: true,
     uninstallRemovedWorkers: true,
@@ -692,6 +910,7 @@ try {
       "-p",
       JSON.stringify({ metadata: { finalizers: [] } }),
     ).catch(() => {});
+  await run("docker", ["image", "rm", nextImage]).catch(() => {});
   if (cordoned) await run("kubectl", ["uncordon", cordoned]).catch(() => {});
   if (installed)
     await run("helm", [
