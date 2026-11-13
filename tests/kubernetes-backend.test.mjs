@@ -101,7 +101,7 @@ test("Kubernetes creates an owned single-execution Pod and fences deletion by UI
   assert.deepEqual(deleted.preconditions, { uid: "pod-uid" });
 });
 
-async function fixture(t, { pending = false } = {}) {
+async function fixture(t, { pending = false, deleteRace = false } = {}) {
   const state = {
     pod: undefined,
     deleted: false,
@@ -130,6 +130,7 @@ async function fixture(t, { pending = false } = {}) {
       response.end(JSON.stringify(state.pod));
     } else if (request.method === "DELETE") {
       state.deleted = true;
+      if (deleteRace) response.writeHead(404);
       response.end("{}");
     } else if (state.deleted) response.writeHead(404).end("{}");
     else {
@@ -198,4 +199,14 @@ test("cancelling Pending creation deletes its exact partial Pod before returning
     /browser_worker_creation_cancelled/,
   );
   assert.equal(state.deleted, true);
+});
+
+test("cleanup is idempotent when eviction removes the Pod immediately before DELETE", async (t) => {
+  const { backend } = await fixture(t, { deleteRace: true });
+  const worker = await backend.create(
+    { executionId, incarnation },
+    AbortSignal.timeout(5000),
+  );
+  t.after(() => worker.runtime.close());
+  await backend.remove(worker, AbortSignal.timeout(5000));
 });

@@ -5,16 +5,12 @@ let backend: import("./managed-backend.js").ManagedBackend;
 if (backendName === "kubernetes") {
   const { readFile } = await import("node:fs/promises");
   const { createKubernetesBackend } = await import("./kubernetes-backend.js");
-  const serviceAccount = "/var/run/secrets/kubernetes.io/serviceaccount";
+  const { readKubernetesAccess } = await import("./kubernetes-api.js");
   backend = createKubernetesBackend({
     installation: process.env.BROWSER_INSTALLATION ?? "default",
-    namespace:
-      process.env.BROWSER_KUBERNETES_NAMESPACE ??
-      (await readFile(`${serviceAccount}/namespace`, "utf8")).trim(),
+    ...(await readKubernetesAccess()),
     ownerName: process.env.BROWSER_KUBERNETES_OWNER,
     image: process.env.BROWSER_IMAGE,
-    ca: await readFile(`${serviceAccount}/ca.crt`),
-    tokenFile: `${serviceAccount}/token`,
     template: JSON.parse(
       await readFile(
         process.env.BROWSER_WORKER_TEMPLATE ??
