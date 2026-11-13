@@ -24,7 +24,7 @@ concurrency:
 env:
   REGISTRY: ${{ vars.BAIDU_CCR_REGISTRY }}
   NAMESPACE: ${{ vars.BAIDU_CCR_NAMESPACE }}
-  IMAGE_NAMES: ${{ vars.BROWSER_IMAGE_NAMES }}
+  IMAGE_NAMES: ${{ vars.BROWSER_IMAGE_NAMES || 'browser-sandbox mirrorx-browser-use-runtime chrome-sidecar' }}
   IMAGE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.image_tag }}
   PUBLISH_LATEST: ${{ inputs.publish_latest }}
 
