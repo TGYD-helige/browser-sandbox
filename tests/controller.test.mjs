@@ -455,3 +455,23 @@ for (const mode of ["volume", "host", "host-disconnect"])
     assert.equal(setupSignal.aborted, true);
     await response;
   });
+test("registration cannot replace a live storage callback owner", async (t) => {
+  const controller = await createController({
+    port: 0,
+    backend: { list: async () => [] },
+  });
+  t.after(() => controller.stop());
+  const life = new AbortController();
+  const peer = { signal: life.signal, callback: async () => ({}) };
+  const other = { signal: new AbortController().signal, callback: async () => ({}) };
+  const registration = { executionId: randomUUID(), profileId: "owned-storage" };
+  await controller.command({ ...registration, op: "storage_attach" }, peer);
+  await controller.command({ ...registration, op: "register", storage: true }, peer);
+  await assert.rejects(
+    controller.command({ ...registration, op: "register", storage: true }, other),
+    /browser_storage_already_attached/,
+  );
+  assert.equal(controller.bindings.get(registration.executionId).storagePeer, peer);
+  life.abort();
+  await controller.command({ ...registration, op: "storage_attach" }, other);
+});
