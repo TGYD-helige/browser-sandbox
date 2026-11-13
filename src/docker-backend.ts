@@ -42,6 +42,33 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
     [prefix + "execution"]: executionId,
     [prefix + "incarnation"]: incarnation,
   });
+  async function removeNetwork(
+    network: string,
+    expected: Record<string, string>,
+    signal: AbortSignal,
+  ) {
+    const state = await api(`/networks/${network}`, "GET", undefined, signal).catch(
+      absent,
+    );
+    if (!state) return;
+    if (
+      !Object.entries(expected).every(([key, value]) => state.Labels?.[key] === value)
+    )
+      throw Error("browser_worker_ownership_mismatch");
+    const connected = Object.entries(state.Containers ?? {}).some(
+      ([id, value]: [string, any]) =>
+        id.startsWith(options.controllerContainer) ||
+        value.Name === options.controllerContainer,
+    );
+    if (connected)
+      await api(
+        `/networks/${network}/disconnect`,
+        "POST",
+        { Container: options.controllerContainer, Force: true },
+        signal,
+      );
+    await api(`/networks/${network}`, "DELETE", undefined, signal).catch(absent);
+  }
   async function removeOwned(
     id: string,
     expected: Record<string, string>,
@@ -164,15 +191,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         const cleanup = AbortSignal.timeout(30000);
         try {
           if (id) await removeOwned(id, expected, cleanup);
-          if (network) {
-            await api(
-              `/networks/${network}/disconnect`,
-              "POST",
-              { Container: options.controllerContainer, Force: true },
-              cleanup,
-            );
-            await api(`/networks/${network}`, "DELETE", undefined, cleanup);
-          }
+          if (network) await removeNetwork(network, expected, cleanup);
         } catch {
           throw Error("browser_worker_cleanup_unconfirmed");
         }
@@ -201,35 +220,8 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         return;
       }
       networks.set(worker.id, network);
-      const networkState = await api(
-        `/networks/${network}`,
-        "GET",
-        undefined,
-        signal,
-      ).catch(absent);
-      if (
-        networkState &&
-        !Object.entries(expected).every(
-          ([key, value]) => networkState.Labels?.[key] === value,
-        )
-      )
-        throw Error("browser_worker_ownership_mismatch");
       if (state) await removeOwned(worker.id, expected, signal);
-      if (networkState) {
-        const connected = Object.entries(networkState.Containers ?? {}).some(
-          ([id, value]: [string, any]) =>
-            id.startsWith(options.controllerContainer) ||
-            value.Name === options.controllerContainer,
-        );
-        if (connected)
-          await api(
-            `/networks/${network}/disconnect`,
-            "POST",
-            { Container: options.controllerContainer, Force: true },
-            signal,
-          );
-        await api(`/networks/${network}`, "DELETE", undefined, signal).catch(absent);
-      }
+      await removeNetwork(network, expected, signal);
       networks.delete(worker.id);
     },
   };
