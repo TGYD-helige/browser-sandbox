@@ -11,11 +11,14 @@ docker build -t browser-sandbox:managed .
 docker run -d --name browser-controller \
   --cap-drop ALL --security-opt no-new-privileges \
   --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+  --mount type=volume,src=browser-controller-data,dst=/controller-data \
   -p 127.0.0.1:8080:8080 \
   -e BROWSER_INSTALLATION=example \
   -e BROWSER_CONTROLLER_ORIGIN=http://127.0.0.1:8080 \
   browser-sandbox:managed controller
 ```
+
+Keep the private `browser-controller-data` volume and `BROWSER_INSTALLATION` value across controller replacement; the volume holds the execution journal and may also hold Profile archives.
 
 The startup command selects `local` (default), `controller`, or `worker`. Controller startup does not load Browserless, start Chrome, install a browser firewall, or require worker capabilities. The controller creates workers from its own immutable Docker image ID. An explicit `BROWSER_IMAGE` override must be an image digest or immutable image ID. This Docker adapter supports a containerized controller, which resolves worker names on the private Docker networks. Set `BROWSER_CONTROLLER_CONTAINER` to its Docker ID or name if the container hostname does not identify it.
 
