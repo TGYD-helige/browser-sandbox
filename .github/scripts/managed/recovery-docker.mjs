@@ -188,6 +188,17 @@ try {
   await docker("restart", "-t", "30", controller);
   await ready();
   results.push(await run("replay"));
+  results.push(await run("prepare"));
+  const lostWorker = await workerIds();
+  await docker("kill", lostWorker);
+  results.push(await run("lost"));
+  assert.equal(
+    await workerIds(),
+    lostWorker,
+    "Loss silently allocated a replacement worker",
+  );
+  results.push(await run("finish-lost"));
+  assert.equal(await workerIds(), "");
   await replace(image, true, `sha256:${"f".repeat(64)}`);
   results.push(await run("image-failure"));
   assert.equal(await workerIds(), "");

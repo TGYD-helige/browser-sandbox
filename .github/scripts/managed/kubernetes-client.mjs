@@ -113,7 +113,12 @@ try {
     console.log(JSON.stringify({ samePage: true, sameGeneration: true }));
   } else if (action === "lost") {
     await assert.rejects(
-      runtime.request({ op: "session", executionId, action: "status" }),
+      runtime.request({
+        op: "session",
+        executionId,
+        action: "renew",
+        durationMs: 1000,
+      }),
       /browser_(?:control_|worker_|session_lost)/,
     );
     console.log(JSON.stringify({ workerLossReported: true }));

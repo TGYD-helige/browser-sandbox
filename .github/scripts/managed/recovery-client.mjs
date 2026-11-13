@@ -83,6 +83,24 @@ try {
         await new Promise((resolve) => setTimeout(resolve, 25));
       }
       console.log(JSON.stringify({ phase, failedStatusKeptWorker: true }));
+    } else if (phase === "lost") {
+      await assert.rejects(
+        runtime.request({
+          op: "session",
+          executionId: state.executionId,
+          action: "renew",
+          durationMs: 1000,
+        }),
+        /browser_(?:control_|worker_|session_lost)/,
+      );
+      await assert.rejects(connectCdp(state.wsEndpoint), /browser_cdp_/);
+      console.log(JSON.stringify({ phase, renewalFailedWithoutReplacement: true }));
+    } else if (phase === "finish-lost") {
+      await assert.rejects(
+        runtime.request({ op: "finalize", executionId: state.executionId }),
+        /browser_worker_finalization_failed/,
+      );
+      console.log(JSON.stringify({ phase, ownedLossCleaned: true }));
     } else if (phase === "incompatible") {
       await assert.rejects(
         runtime.request({

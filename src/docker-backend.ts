@@ -231,6 +231,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
       );
       if (!Array.isArray(containers)) throw Error("browser_docker_response_invalid");
       const workers: ManagedWorker[] = [];
+      const accounted = new Set<string>();
       try {
         for (const item of containers) {
           const state = await api(
@@ -278,6 +279,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
               { Container: options.controllerContainer },
               signal,
             );
+          accounted.add(network);
           networks.set(item.Id, network);
           workers.push({
             id: item.Id,
@@ -288,6 +290,44 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
             runtime: createControllerRuntime(origin),
           });
         }
+        const remaining = await api(
+          `/networks?filters=${filter}`,
+          "GET",
+          undefined,
+          signal,
+        );
+        if (!Array.isArray(remaining)) throw Error("browser_worker_discovery_failed");
+        for (const network of remaining) {
+          if (accounted.has(network.Id)) continue;
+          const tags = network.Labels;
+          const executionId = tags?.[`${prefix}execution`],
+            incarnation = tags?.[`${prefix}incarnation`],
+            profileId = tags?.[`${prefix}profile`] || undefined;
+          if (
+            tags?.[`${prefix}installation`] !== options.installation ||
+            !/^[a-f0-9-]{36}$/.test(executionId ?? "") ||
+            !/^[a-f0-9-]{36}$/.test(incarnation ?? "") ||
+            !/^[a-zA-Z0-9-]{1,128}$/.test(network.Id ?? "")
+          )
+            throw Error("browser_worker_ownership_mismatch");
+          workers.push({
+            id: `network/${network.Id}`,
+            executionId,
+            incarnation,
+            profileId,
+            origin: "",
+            infrastructureOnly: true,
+            runtime: {
+              request: async () => {
+                throw Error("browser_worker_unavailable");
+              },
+              attachStorage: async () => {
+                throw Error("browser_worker_unavailable");
+              },
+              close() {},
+            },
+          });
+        }
         return workers;
       } catch (error) {
         for (const worker of workers) worker.runtime.close?.();
@@ -296,6 +336,13 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
     },
     async remove(worker: ManagedWorker, signal) {
       const expected = labels(worker.executionId, worker.incarnation, worker.profileId);
+      if (worker.infrastructureOnly) {
+        const [kind, network, extra] = worker.id.split("/");
+        if (kind !== "network" || extra || !/^[a-zA-Z0-9-]{1,128}$/.test(network ?? ""))
+          throw Error("browser_worker_ownership_mismatch");
+        await removeNetwork(network, expected, signal);
+        return;
+      }
       const state = await api(
         `/containers/${worker.id}/json`,
         "GET",

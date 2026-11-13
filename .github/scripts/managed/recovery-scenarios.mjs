@@ -145,7 +145,7 @@ try {
     await runtime.request({
       op: "takeover",
       executionId: id,
-      action: { op: "release", ...identity, epoch: lease.epoch },
+      action: { op: "release", ...identity, epoch: lease.epoch, origin: lease.origin },
     });
     const caller = new AbortController();
     const auth = fetch(`${current.handle.wsEndpoint.replace(/^ws/, "http")}/auth`, {
