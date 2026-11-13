@@ -231,7 +231,8 @@ try {
   } else if (phase === "ttl-volume" || phase === "ttl-host") {
     const profileId = `abandoned-${randomUUID()}`;
     let latest,
-      failSave = false;
+      failSave = false,
+      failedSaveRequests = 0;
     const host = {
       async load() {
         return {
@@ -245,7 +246,10 @@ try {
         };
       },
       async save() {
-        if (failSave) throw Error("browser_synthetic_save_failure");
+        if (failSave) {
+          failedSaveRequests++;
+          throw Error("browser_synthetic_save_failure");
+        }
         const key = randomBytes(32).toString("hex");
         return {
           target: {
@@ -295,9 +299,10 @@ try {
         () => status(abandoned.handle.executionId),
         (value) =>
           value.execution.phase === "finalizing" &&
-          value.execution.statusError === "browser_synthetic_save_failure",
+          value.execution.statusError === "browser_profile_storage_unavailable",
         limits.maxExecutionMs + 60000,
       );
+      assert(failedSaveRequests > 0, "Injected host save failure was not exercised");
       assert.equal(latest.archive.sha256, confirmed);
       await assert.rejects(sessions.open(options), /browser_profile_busy/);
       assert.equal((await status()).workers, 1);
