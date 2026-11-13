@@ -290,7 +290,7 @@ try {
       ],
       { timeout: 20000 },
     ),
-    /disruption budget/i,
+    (error) => /disruption budget/i.test(`${error.output}\n${error.errors}`),
   );
   assert(
     (await pods()).some(
@@ -417,11 +417,10 @@ try {
     JSON.stringify({
       kubernetesFailed: true,
       stage,
-      diagnostic: String(error.message)
-        .split("\n")[0]
+      diagnostic: String(error.actual?.message ?? error.message)
         .replace(/(?:https?|wss?):\/\/[^\s]+/g, "<url>")
         .replace(/[a-f0-9]{64}/g, "<digest>")
-        .slice(0, 500),
+        .slice(0, 2000),
       codes: [...new Set(String(error).match(/\bbrowser_[a-z_]+\b/g) ?? [])],
       diagnostics,
     }),
