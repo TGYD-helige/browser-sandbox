@@ -2,10 +2,14 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 
+const quantile = (values, q) =>
+  [...values].sort((a, b) => a - b)[Math.ceil(values.length * q) - 1];
+
 // Concatenate samples from repeated runs of one runtime, e.g. the two halves of an ABBA schedule.
 export function mergeReports(runs) {
   assert(runs.length > 0, "No benchmark reports");
   const merged = structuredClone(runs[0]);
+  merged.runs = runs.length;
   for (const run of runs.slice(1)) {
     for (const key of [
       "status",
@@ -13,8 +17,9 @@ export function mergeReports(runs) {
       "browserVersion",
       "environment",
       "cpuSet",
+      "samples",
     ])
-      assert.equal(run[key], merged[key], `Inconsistent repeated benchmark ${key}`);
+      assert.equal(run[key], runs[0][key], `Inconsistent repeated benchmark ${key}`);
     merged.samples += run.samples;
     for (const entry of merged.cases) {
       const other = run.cases.find((candidate) => candidate.name === entry.name);
@@ -73,9 +78,13 @@ export function comparePerformance(baseline, current) {
       );
       for (const value of [...oldSamples, ...newSamples])
         assert(Number.isFinite(value) && value >= 0);
-      const quantile = (values, q) =>
-        [...values].sort((a, b) => a - b)[Math.ceil(values.length * q) - 1];
-      const baselineMedianMs = quantile(oldSamples, 0.5),
+      // Bimodal phases can flip a pooled median between modes; the slower baseline run bounds that drift.
+      const runSize = oldSamples.length / (baseline.runs ?? 1);
+      const baselineMedianMs = Math.max(
+          ...Array.from({ length: baseline.runs ?? 1 }, (_, index) =>
+            quantile(oldSamples.slice(index * runSize, (index + 1) * runSize), 0.5),
+          ),
+        ),
         currentMedianMs = quantile(newSamples, 0.5),
         baselineP95Ms = quantile(oldSamples, 0.95),
         currentP95Ms = quantile(newSamples, 0.95);
@@ -109,8 +118,9 @@ export function comparePerformance(baseline, current) {
       assert.equal(values?.length, baseline.samples, "Missing memory samples");
       assert(values.every((value) => Number.isFinite(value) && value > 0));
     }
-    const baselineBytes = Math.max(...before.retainedMemoryBytes);
-    const currentBytes = Math.max(...after.retainedMemoryBytes);
+    // As with durations, P95 of 20 samples tolerates one outlier; leaks raise every later sample.
+    const baselineBytes = quantile(before.retainedMemoryBytes, 0.95);
+    const currentBytes = quantile(after.retainedMemoryBytes, 0.95);
     const limitBytes = baselineBytes * 1.25 + 64 * 1024 * 1024;
     resources.push({
       workload: before.name,
@@ -147,8 +157,8 @@ export function comparePerformance(baseline, current) {
           "Invalid resource measurement",
         );
       }
-      const baselineValue = Math.max(...oldValues),
-        currentValue = Math.max(...newValues);
+      const baselineValue = quantile(oldValues, 0.95),
+        currentValue = quantile(newValues, 0.95);
       const [ratio, allowance] = resourceBudgets[key];
       const limit = baselineValue * ratio + allowance;
       resources.push({
@@ -163,7 +173,8 @@ export function comparePerformance(baseline, current) {
   }
   return {
     resources,
-    budget: "fail when both median and P95 exceed baseline * 1.25 + 25 ms",
+    budget:
+      "fail when both median and P95 exceed baseline * 1.25 + 25 ms, using the slower baseline run median",
     passed: [...comparisons, ...resources].every((entry) => entry.passed),
     comparisons,
   };

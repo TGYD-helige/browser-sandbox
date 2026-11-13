@@ -24,33 +24,52 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  image:
-    name: Sandboxed image (${{ matrix.runner }})
+  performance:
+    name: Image performance (${{ matrix.runner }}, ${{ matrix.suite }})
     strategy:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        suite: [lifecycle, extended]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - run: docker build -t browser-sandbox:local .
       - name: Verify mounted Chrome extensions
+        if: matrix.suite == 'lifecycle'
         run: VERIFY_EXTENSIONS=1 bash .github/scripts/verify-image.sh browser-sandbox:local
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - run: bash .github/scripts/benchmark-pair.sh "$BASE_REF" "performance-${{ matrix.runner }}"
+      - run: bash .github/scripts/benchmark-pair.sh "$BASE_REF" "performance-${{ matrix.runner }}-${{ matrix.suite }}"
         env:
           BASE_REF: ${{ inputs.baseline_ref || github.event.pull_request.base.sha || github.event.before }}
+          BENCHMARK_SUITE: ${{ matrix.suite }}
       - uses: actions/upload-artifact@v4
         with:
-          name: browser-performance-${{ matrix.runner }}-attempt-${{ github.run_attempt }}
-          path: performance-${{ matrix.runner }}/*.json
+          name: browser-performance-${{ matrix.runner }}-${{ matrix.suite }}-attempt-${{ github.run_attempt }}
+          path: performance-${{ matrix.runner }}-${{ matrix.suite }}/*.json
           if-no-files-found: error
         if: always()
+
+  # Branch protection requires these names; matrix needs cannot be split per runner, so each reports every shard.
+  image:
+    name: Sandboxed image (${{ matrix.runner }})
+    if: always()
+    needs: performance
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every image performance shard
+        env:
+          RESULT: ${{ needs.performance.result }}
+        run: test "$RESULT" = success
 
   viewer:
     name: Live viewer and authentication E2E
