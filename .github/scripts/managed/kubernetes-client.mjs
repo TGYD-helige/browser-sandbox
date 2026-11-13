@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -35,6 +35,42 @@ try {
         await runtime.request({ op: "session", executionId, action: "status" }),
       ),
     );
+  } else if (action === "finish") {
+    try {
+      await runtime.request({ op: "finalize", executionId });
+    } catch (error) {
+      assert.match(error.message, /browser_worker_finalization_failed/);
+    }
+    console.log(JSON.stringify({ finished: true }));
+  } else if (action === "replay") {
+    await assert.rejects(
+      runtime.request({ op: "register", executionId }),
+      /browser_execution_revoked/,
+    );
+    console.log(JSON.stringify({ fenced: true }));
+  } else if (action === "resume") {
+    const original = JSON.parse(
+      await readFile(`/tmp/managed-retention-${executionId}.json`, "utf8"),
+    );
+    const status = await sessionRequest(original.wsEndpoint);
+    assert.equal(status.state, "retained");
+    assert.equal(status.generation, original.generation);
+    await connect(original.wsEndpoint);
+    const { sessionId } = await cdp.call("Target.attachToTarget", {
+      targetId: original.targetId,
+      flatten: true,
+    });
+    assert.equal(
+      (
+        await cdp.call(
+          "Runtime.evaluate",
+          { expression: "window.marker", returnByValue: true },
+          sessionId,
+        )
+      ).result.value,
+      original.marker,
+    );
+    console.log(JSON.stringify({ samePage: true, sameGeneration: true }));
   } else if (action === "lost") {
     await assert.rejects(
       runtime.request({ op: "session", executionId, action: "status" }),
@@ -105,6 +141,11 @@ try {
       marker,
     );
     if (action === "hold") {
+      await writeFile(
+        `/tmp/managed-retention-${executionId}.json`,
+        JSON.stringify({ wsEndpoint, targetId, marker, generation: before.generation }),
+        { mode: 0o600 },
+      );
       console.log(
         JSON.stringify({
           executionId,
@@ -114,8 +155,8 @@ try {
         }),
       );
     } else {
-      const base = wsEndpoint.replace(/^ws/, "http") + "/files/";
-      const upload = await fetch(base + "upload.txt", {
+      const base = `${wsEndpoint.replace(/^ws/, "http")}/files/`;
+      const upload = await fetch(`${base}upload.txt`, {
         method: "PUT",
         body: "managed upload",
       });
@@ -161,7 +202,7 @@ try {
       );
       const downloadDeadline = Date.now() + 10000;
       while (true) {
-        const download = await fetch(base + "download.txt");
+        const download = await fetch(`${base}download.txt`);
         if (download.ok) {
           assert.equal(await download.text(), "managed download");
           break;

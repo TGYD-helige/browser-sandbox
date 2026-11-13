@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -64,6 +64,7 @@ async function fixture(t) {
     await rm(directory, { recursive: true, force: true });
   });
   return {
+    directory,
     resources,
     backend,
     get created() {
@@ -371,4 +372,48 @@ test("unconfirmed partial creation retains capacity until successful discovery p
   f.backend.list = list;
   await controller.command({ op: "finalize", executionId });
   assert.equal(controller.capacity().workers, 0);
+});
+
+test("semantically corrupt cleanup confirmations cannot skip worker finalization", async (t) => {
+  for (const corrupt of [
+    { stopConfirmed: "false" },
+    { stopConfirmed: true, finalResult: { stopped: false } },
+    { phase: "invented" },
+  ]) {
+    const f = await fixture(t);
+    const first = await f.start();
+    const executionId = randomUUID();
+    const endpoint = await first.command({ op: "register", executionId });
+    await fetch(fileUrl(first, endpoint));
+    await first.stop();
+    const path = join(f.directory, `${executionId}.json`);
+    const record = JSON.parse(await readFile(path, "utf8"));
+    Object.assign(record.data, corrupt);
+    const broken = JSON.stringify(record);
+    await writeFile(path, broken);
+    await assert.rejects(f.start(), /browser_execution_journal_corrupt/);
+    assert.equal(await readFile(path, "utf8"), broken);
+    assert.equal(f.resources.size, 1);
+  }
+});
+
+test("failed controller listen closes recovered transports without deleting workers", async (t) => {
+  const f = await fixture(t);
+  const first = await f.start();
+  const endpoint = await first.command({ op: "register", executionId: randomUUID() });
+  await fetch(fileUrl(first, endpoint));
+  await first.stop();
+  let closes = 0;
+  const worker = [...f.resources.values()][0];
+  worker.runtime.close = () => {
+    closes++;
+  };
+  const blocker = createServer();
+  await new Promise((resolve) => blocker.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => blocker.close(resolve)));
+  await assert.rejects(f.start({ port: blocker.address().port }), {
+    code: "EADDRINUSE",
+  });
+  assert.equal(closes, 1);
+  assert.equal(f.resources.size, 1);
 });

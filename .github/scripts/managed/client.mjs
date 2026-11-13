@@ -150,7 +150,7 @@ try {
         ),
       );
       assert.equal((await sessionRequest(endpoint)).generation, retained.generation);
-      const files = endpoint.replace("ws:", "http:") + "/files/check.txt";
+      const files = `${endpoint.replace("ws:", "http:")}/files/check.txt`;
       assert.equal(
         (await fetch(files, { method: "PUT", body: "managed transfer" })).status,
         201,
@@ -226,7 +226,7 @@ try {
       await runtime.request({ op: "access_revoke", executionId });
       await assert.rejects(connectCdp(access.cdpUrl));
       assert.equal(
-        (await fetch(access.cdpUrl.replace("ws:", "http:") + "/session")).status,
+        (await fetch(`${access.cdpUrl.replace("ws:", "http:")}/session`)).status,
         403,
       );
       endpoint = (await runtime.request({ op: "endpoint", executionId })).wsEndpoint;
@@ -360,7 +360,7 @@ try {
         assert.equal(expiredSession.state, "expired");
         await assert.rejects(
           sessionRequest(secondEndpoint, "renew", 10000),
-          /browser_session_not_live/,
+          /browser_session_lost/,
         );
         const secondWorker = await workerFor(secondId);
         const secondDetails = await api(`/containers/${secondWorker.Id}/json`);

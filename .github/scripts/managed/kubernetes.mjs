@@ -344,7 +344,7 @@ try {
   const profileReport = { ...(await profileClient()), ...missingStorage };
   await writeFile(
     "managed-results/profiles-kubernetes.json",
-    JSON.stringify(profileReport, null, 2) + "\n",
+    `${JSON.stringify(profileReport, null, 2)}\n`,
   );
   await profileClient("restart-seed");
   const persistent = await profileClient("lease-hold");
@@ -496,6 +496,7 @@ try {
     ),
     "Controller rollout deleted the live worker",
   );
+  await client("resume", held.executionId);
   // Optional PDB must make ordinary drain wait without deleting workers.
   await run("helm", [
     "upgrade",
@@ -569,6 +570,12 @@ try {
   const loss = await client("lost", losing.executionId);
   assert(loss.workerLossReported);
   assert.equal((await pods()).length, 0, "Drain silently replaced a lost worker");
+  await client("finish", held.executionId);
+  await client("finish", losing.executionId);
+  await kubectl("rollout", "restart", `deployment/${deployment}`);
+  await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
+  await client("replay", held.executionId);
+  await client("replay", losing.executionId);
   await run("kubectl", ["uncordon", workerNode]);
   cordoned = undefined;
   stage = "safe uninstall";
@@ -623,6 +630,8 @@ try {
     controllerStartupMs,
     ...functional,
     rolloutPreservedWorker: true,
+    rolloutRecoveredOriginalPage: true,
+    finishedIdsFencedAcrossRestart: true,
     drainWithoutForce: true,
     pdbBlockedDrain: true,
     uninstallRemovedWorkers: true,
@@ -631,7 +640,7 @@ try {
   };
   await writeFile(
     "managed-results/kubernetes.json",
-    JSON.stringify(report, null, 2) + "\n",
+    `${JSON.stringify(report, null, 2)}\n`,
   );
   console.log(JSON.stringify(report));
 } catch (error) {

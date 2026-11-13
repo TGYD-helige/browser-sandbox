@@ -37,7 +37,7 @@ test("Docker removal checks ownership and is idempotent after confirmed absence"
   const backend = createDockerBackend({
     installation: "test",
     controllerContainer: "controller",
-    image: "sha256:" + "a".repeat(64),
+    image: `sha256:${"a".repeat(64)}`,
     socketPath,
     seccomp: {},
   });
@@ -91,7 +91,7 @@ test("Docker creation failure removes a network before the controller was attach
   const backend = createDockerBackend({
     installation: "test",
     controllerContainer: "controller",
-    image: "sha256:" + "a".repeat(64),
+    image: `sha256:${"a".repeat(64)}`,
     socketPath,
     seccomp: {},
   });
