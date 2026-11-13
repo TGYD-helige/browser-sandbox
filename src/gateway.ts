@@ -125,11 +125,10 @@ export async function createGateway({
       if (!workerExecutionId || request.executionId !== workerExecutionId)
         throw Error("browser_identity_mismatch");
       if (request.op === "access_confirm_stopped") return remote.command(request);
-      const result = await executions.command(
+      const result = await executions.dispatch(
         { ...request, executorUid: undefined },
-        true,
-        false,
         signal,
+        false,
       );
       if (request.op === "register")
         return { ...result, ...remote.bindWorker(executions.get(workerExecutionId)) };

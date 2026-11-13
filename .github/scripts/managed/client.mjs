@@ -335,7 +335,8 @@ try {
           for(const target of ['http://169.254.169.254/','http://${controllerIp}:8080/health','http://${secondIp}:8081/health']) await assert.rejects(fetch(target,{signal:AbortSignal.timeout(2000)}));
           const rules=execFileSync('iptables',['-L','OUTPUT','-nvx']).toString();
           assert(rules.split('\n').some(line=>line.includes('REJECT')&&line.includes('169.254.0.0/16')&&Number(line.trim().split(/\s+/)[0])>0));
-          console.log('metadata, other worker, and controller egress denied');
+          execFileSync(process.execPath, ['-e', "fetch('http://127.0.0.1:8081/health',{signal:AbortSignal.timeout(2000)}).then(()=>process.exit(1),()=>process.exit(0))"], {uid:20001,gid:20001});
+          console.log('metadata, other worker, controller, and browser-loopback egress denied');
         `,
         );
         assert.match(checks, /egress denied/);

@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { release } from "node:os";
 import { createGateway } from "./gateway.js";
+import { attachStorage } from "./host-client.js";
 import { createBrowserLauncher } from "./launcher.js";
 import { createBrowserLimiter } from "./limiter.js";
 import { type ControlPeer, createNetworkHostControl } from "./network-control.js";
@@ -76,6 +77,7 @@ let verified = false;
 const workerExecutionId =
   process.argv[2] === "worker" ? process.env.BROWSER_EXECUTION_ID : undefined;
 let controllerPeer: ControlPeer;
+let controllerAutomation = false;
 const gateway = await createGateway({
   workerExecutionId,
   WebSocket,
@@ -93,6 +95,7 @@ const gateway = await createGateway({
         host: "0.0.0.0",
         publicOrigin: process.env.BROWSER_WORKER_ORIGIN,
         automation: {
+          available: () => controllerAutomation,
           pause: async (executionId, signal) => {
             await controllerPeer.callback("pause", { executionId }, signal);
           },
@@ -126,8 +129,40 @@ const networkControl = workerExecutionId
   ? createNetworkHostControl({
       server: gateway.workerServer,
       dispatch: async (request, peer, signal) => {
+        if (request.executionId !== workerExecutionId)
+          throw Error("browser_identity_mismatch");
         if (!controllerPeer || controllerPeer.signal.aborted || request.automation)
           controllerPeer = peer;
+        if (request.op === "register")
+          controllerAutomation = request.automation === true;
+        if (request.op === "storage_attach") {
+          const channel = await attachStorage(
+            process.env.BROWSER_CONTROL_SOCKET ?? "/run/browser-sandbox/control.sock",
+            { ...request, executorUid: 20001, existingOnly: true },
+            {
+              load: (callbackSignal) =>
+                peer.callback(
+                  "load",
+                  { executionId: workerExecutionId },
+                  callbackSignal,
+                ),
+              save: (callbackSignal) =>
+                peer.callback(
+                  "save",
+                  { executionId: workerExecutionId },
+                  callbackSignal,
+                ),
+              commit: (payload, callbackSignal) =>
+                peer.callback(
+                  "commit",
+                  { executionId: workerExecutionId, payload },
+                  callbackSignal,
+                ),
+            },
+          );
+          peer.signal.addEventListener("abort", () => channel.close(), { once: true });
+          return { attached: true };
+        }
         return gateway.workerCommand(request, signal);
       },
     })

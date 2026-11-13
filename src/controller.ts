@@ -4,6 +4,7 @@ import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { pipeline } from "node:stream";
 import WebSocket, { createWebSocketStream, WebSocketServer } from "ws";
+import type { Registration } from "./host-client.js";
 import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
 import { type ControlPeer, createNetworkHostControl } from "./network-control.js";
 import { normalizeAllowedDomains } from "./network-policy.js";
@@ -59,6 +60,15 @@ export async function createController(options: ControllerOptions) {
   const bindings = new Map<string, ExecutionBinding>();
   const grants = new Map<string, Access>();
   const finished = new Set<string>();
+  const storage = new Map<
+    string,
+    {
+      registration: Registration;
+      peer: ControlPeer;
+      channel?: { close(): void };
+      cleanup(): void;
+    }
+  >();
   let closing = false;
   let origin = options.publicOrigin;
   if (
@@ -66,6 +76,19 @@ export async function createController(options: ControllerOptions) {
     (!/^https?:$/.test(new URL(origin).protocol) || new URL(origin).origin !== origin)
   )
     throw Error("browser_access_origin_invalid");
+  if (
+    !origin &&
+    options.host &&
+    !["127.0.0.1", "localhost", "::1"].includes(options.host)
+  )
+    throw Error("browser_access_origin_required");
+  if ((options.viewerOrigins?.length ?? 0) > 8)
+    throw Error("browser_access_origin_invalid");
+  for (const value of options.viewerOrigins ?? []) {
+    const url = new URL(value);
+    if (url.origin !== value || !["http:", "https:"].includes(url.protocol))
+      throw Error("browser_access_origin_invalid");
+  }
   const assets = new Map([
     ["/view", ["index.html", "text/html"]],
     ["/viewer.js", ["browser-viewer.js", "text/javascript"]],
@@ -299,6 +322,33 @@ export async function createController(options: ControllerOptions) {
             { signal: creationSignal },
           );
           creationSignal.throwIfAborted();
+          const attachment = storage.get(binding.executionId);
+          if (attachment) {
+            attachment.channel = await worker.runtime.attachStorage(
+              attachment.registration,
+              {
+                load: (callbackSignal) =>
+                  attachment.peer.callback(
+                    "load",
+                    { executionId: binding.executionId },
+                    callbackSignal,
+                  ),
+                save: (callbackSignal) =>
+                  attachment.peer.callback(
+                    "save",
+                    { executionId: binding.executionId },
+                    callbackSignal,
+                  ),
+                commit: (payload, callbackSignal) =>
+                  attachment.peer.callback(
+                    "commit",
+                    { executionId: binding.executionId, payload },
+                    callbackSignal,
+                  ),
+              },
+            );
+          }
+          creationSignal.throwIfAborted();
           binding.endpoint = result;
           event(binding, "ready", { elapsedMs: performance.now() - startedAt });
           return worker;
@@ -335,6 +385,38 @@ export async function createController(options: ControllerOptions) {
       throw Error("browser_request_invalid");
     const id = request.executionId;
     let binding = bindings.get(id);
+    if (request.op === "storage_attach") {
+      if (
+        !peer ||
+        peer.signal.aborted ||
+        closing ||
+        finished.has(id) ||
+        binding?.revoked
+      )
+        throw Error("browser_storage_disconnected");
+      if (storage.has(id)) throw Error("browser_storage_already_attached");
+      if (storage.size >= 2000) throw Error("browser_access_capacity_exceeded");
+      const attachment = {
+        registration: { executionId: id, profileId: request.profileId },
+        peer,
+        channel: undefined as { close(): void } | undefined,
+        cleanup() {
+          attachment.channel?.close();
+          peer.signal.removeEventListener("abort", attachment.cleanup);
+          if (storage.get(id) === attachment) storage.delete(id);
+        },
+      };
+      storage.set(id, attachment);
+      peer.signal.addEventListener("abort", attachment.cleanup, { once: true });
+      return { attached: true };
+    }
+    if (request.op === "storage_detach") {
+      const attachment = storage.get(id);
+      if (attachment && attachment.peer !== peer)
+        throw Error("browser_host_authority_required");
+      attachment?.cleanup();
+      return { detached: true };
+    }
     if (request.op === "register") {
       if (closing || finished.has(id) || binding?.revoked)
         throw Error("browser_execution_revoked");
@@ -346,6 +428,8 @@ export async function createController(options: ControllerOptions) {
       if (binding && JSON.stringify(binding.allowedDomains) !== JSON.stringify(domains))
         throw Error("browser_domains_changed");
       if (!binding) {
+        if (bindings.size + finished.size >= 65536)
+          throw Error("browser_execution_capacity_exceeded");
         binding = {
           executionId: id,
           incarnation: randomUUID(),
@@ -359,7 +443,10 @@ export async function createController(options: ControllerOptions) {
       return endpoint(binding);
     }
     if (["finalize", "finish"].includes(request.op)) {
-      if (!binding) return { status: "absent" };
+      if (!binding) {
+        storage.get(id)?.cleanup();
+        return { status: "absent" };
+      }
       if (binding.finishing) return binding.finishing;
       const current = binding;
       current.finishing = (async () => {
@@ -370,13 +457,32 @@ export async function createController(options: ControllerOptions) {
         await current.starting?.catch(() => {});
         let result = { used: false, stopped: true };
         if (current.worker) {
-          result = await current.worker.runtime.request(
-            { op: "finalize", executionId: id },
-            { signal },
-          );
+          try {
+            result = await current.worker.runtime.request(
+              { op: "finalize", executionId: id },
+              { signal },
+            );
+          } catch (error) {
+            if (
+              ![
+                "browser_control_disconnected",
+                "browser_control_unavailable",
+                "browser_control_timeout",
+              ].includes(error.message)
+            )
+              throw error;
+            await options.backend.remove(current.worker, signal);
+            current.worker.runtime.close?.();
+            storage.get(id)?.cleanup();
+            bindings.delete(id);
+            finished.add(id);
+            event(current, "removed", { error: errorCode(error) });
+            throw Error("browser_worker_finalization_failed");
+          }
           await options.backend.remove(current.worker, signal);
           current.worker.runtime.close?.();
         }
+        storage.get(id)?.cleanup();
         bindings.delete(id);
         finished.add(id);
         event(current, "removed");
@@ -557,6 +663,7 @@ export async function createController(options: ControllerOptions) {
           failure ??= error;
         }
       }
+      for (const attachment of storage.values()) attachment.cleanup();
       control.close();
       for (const grant of [...grants.values()]) revoke(grant);
       for (const client of [...viewers.clients, ...cdp.clients]) client.terminate();

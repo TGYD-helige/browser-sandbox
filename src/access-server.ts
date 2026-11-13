@@ -317,6 +317,8 @@ export async function createAccessServer({
           const auth = JSON.parse(String(raw));
           grant = auth.type === "authenticate" && resolve(auth.token, "view");
           if (worker && grant) {
+            if (auth.resize === true && viewportOwners.has(workerEntry))
+              throw Error("browser_viewport_busy");
             grant = issue(
               workerEntry,
               "view",
@@ -326,7 +328,6 @@ export async function createAccessServer({
             );
             grant.token = auth.token;
             if (grant.resize) {
-              if (viewportOwners.has(workerEntry)) throw Error("browser_viewport_busy");
               viewportOwners.set(workerEntry, grant);
             }
             client.once("close", grant.cleanup);

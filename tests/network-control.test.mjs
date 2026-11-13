@@ -106,3 +106,66 @@ test("storage callbacks cross the host connection without serializing archive by
     /browser_storage_disconnected/,
   );
 });
+
+test("controller routes attached storage callbacks between the real host and worker transports", async (t) => {
+  const { createController } = await import("../dist/controller.js");
+  const { randomUUID } = await import("node:crypto");
+  const executionId = randomUUID();
+  const worker = createServer((_req, res) => res.end("fixture"));
+  let callbacks;
+  const control = createNetworkHostControl({
+    server: worker,
+    dispatch: async (request, peer, signal) => {
+      if (request.op === "register")
+        return {
+          cdpUrl: `ws://127.0.0.1:${worker.address().port}/execution/` + "a".repeat(64),
+          viewerToken: "b".repeat(64),
+        };
+      if (request.op === "storage_attach") {
+        callbacks = await peer.callback("load", { executionId }, signal);
+        return { attached: true };
+      }
+      return { stopped: true };
+    },
+  });
+  await new Promise((resolve) => worker.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    control.close();
+    await new Promise((resolve) => worker.close(resolve));
+  });
+  const origin = `http://127.0.0.1:${worker.address().port}`;
+  const controller = await createController({
+    port: 0,
+    backend: {
+      create: async (placement) => ({
+        ...placement,
+        id: "synthetic",
+        origin,
+        runtime: createControllerRuntime(origin),
+      }),
+      remove: async () => {},
+    },
+  });
+  t.after(() => controller.stop());
+  const runtime = createControllerRuntime(controller.origin);
+  t.after(() => runtime.close());
+  const attachment = await runtime.attachStorage(
+    { executionId },
+    {
+      load: async () => ({ absent: true }),
+      save: async () => ({}),
+      commit: async () => ({ confirmedSha: "unused" }),
+    },
+  );
+  const { wsEndpoint } = await runtime.request({ op: "register", executionId });
+  assert.equal(callbacks, undefined, "Attachment allocated a worker eagerly");
+  assert.equal(
+    await (
+      await fetch(wsEndpoint.replace("ws:", "http:") + "/files/fixture.txt")
+    ).text(),
+    "fixture",
+  );
+  assert.deepEqual(callbacks, { absent: true });
+  await runtime.request({ op: "finalize", executionId });
+  attachment.close();
+});

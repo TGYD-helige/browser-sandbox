@@ -204,7 +204,8 @@ export function createControllerRuntime(
     handshakeTimeout: 30000,
   });
   const rpc = connectPeer(socket, async (request, signal) => {
-    if (["pause", "resume"].includes(request.op) && automation) {
+    if (["pause", "resume"].includes(request.op)) {
+      if (!automation) throw Error("browser_automation_stop_required");
       await automation[request.op](request.executionId, signal);
       return { confirmed: true };
     }
@@ -247,6 +248,10 @@ export function createControllerRuntime(
       return {
         close() {
           storage.delete(registration.executionId);
+          request({
+            op: "storage_detach",
+            executionId: registration.executionId,
+          }).catch(() => {});
         },
       };
     },

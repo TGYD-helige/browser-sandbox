@@ -17,10 +17,13 @@ import { sessionRequest } from "../dist/session.js";
 
 test("controller and a private single-execution worker preserve text frames and session retention", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "managed-worker-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const cleanups = [() => rm(root, { recursive: true, force: true })];
+  t.after(async () => {
+    for (const cleanup of cleanups.reverse()) await cleanup();
+  });
   const browser = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   await once(browser, "listening");
-  t.after(
+  cleanups.push(
     () =>
       new Promise((resolve) => {
         for (const socket of browser.clients) socket.terminate();
@@ -56,12 +59,12 @@ test("controller and a private single-execution worker preserve text frames and 
       close: async () => {},
     }),
   });
-  t.after(() => gateway.stop());
+  cleanups.push(() => gateway.stop());
   const workerControl = createNetworkHostControl({
     server: gateway.workerServer,
     dispatch: (request, _peer, signal) => gateway.workerCommand(request, signal),
   });
-  t.after(() => workerControl.close());
+  cleanups.push(() => workerControl.close());
   const origin = `http://127.0.0.1:${gateway.accessPort}`;
   let allocations = 0;
   const controller = await createController({
@@ -79,9 +82,9 @@ test("controller and a private single-execution worker preserve text frames and 
       async remove() {},
     },
   });
-  t.after(() => controller.stop());
+  cleanups.push(() => controller.stop());
   const runtime = createControllerRuntime(controller.origin);
-  t.after(() => runtime.close());
+  cleanups.push(() => runtime.close());
   await assert.rejects(
     gateway.workerCommand({ op: "register", executionId: randomUUID() }),
     /browser_identity_mismatch/,
@@ -101,7 +104,7 @@ test("controller and a private single-execution worker preserve text frames and 
     { origin: controller.origin },
   );
   viewer.on("error", () => {});
-  t.after(() => viewer.terminate());
+  cleanups.push(() => viewer.terminate());
   await once(viewer, "open");
   const frame = once(viewer, "message");
   viewer.send(

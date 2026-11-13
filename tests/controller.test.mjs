@@ -129,3 +129,54 @@ test("managed sessions reject tenant placement and persistent profiles before wo
     /browser_profile_storage_unavailable/,
   );
 });
+
+test("non-loopback controller listeners require a reachable public origin", async () => {
+  await assert.rejects(
+    createController({ host: "0.0.0.0", port: 0, backend: {} }),
+    /browser_access_origin_required/,
+  );
+});
+
+test("temporary worker transport loss removes the owned worker and reports failed graceful finalization", async (t) => {
+  let removed = 0;
+  const worker = createServer((_req, res) => res.end("fixture"));
+  await new Promise((resolve) => worker.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => worker.close(resolve)));
+  const origin = `http://127.0.0.1:${worker.address().port}`;
+  const controller = await createController({
+    port: 0,
+    backend: {
+      async create(placement) {
+        return {
+          ...placement,
+          id: "temporary",
+          origin,
+          runtime: {
+            request: async (request) => {
+              if (request.op === "register")
+                return {
+                  cdpUrl:
+                    origin.replace("http:", "ws:") + "/execution/" + "a".repeat(64),
+                  viewerToken: "b".repeat(64),
+                };
+              throw Error("browser_control_disconnected");
+            },
+          },
+        };
+      },
+      async remove() {
+        removed++;
+      },
+    },
+  });
+  t.after(() => controller.stop());
+  const executionId = randomUUID();
+  const { wsEndpoint } = await controller.command({ op: "register", executionId });
+  await fetch(wsEndpoint.replace("ws:", "http:") + "/files/fixture.txt");
+  await assert.rejects(
+    controller.command({ op: "finalize", executionId }),
+    /browser_worker_finalization_failed/,
+  );
+  assert.equal(removed, 1);
+  assert.equal(controller.bindings.size, 0);
+});

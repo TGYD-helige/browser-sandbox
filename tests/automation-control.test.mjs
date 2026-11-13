@@ -51,3 +51,22 @@ test("host stop confirmation belongs to one browser generation and is consumed o
   assert.equal(control.canPause(execution), false);
   await assert.rejects(control.pause(execution, signal), /stop_required/);
 });
+
+test("a worker without an upstream coordinator retains explicit stop confirmation", async () => {
+  const { createAutomationControl } = await import("../dist/automation-control.js");
+  const entry = {
+    executionId: "managed",
+    peers: new Set(),
+    session: { status: () => ({ generation: "one" }) },
+  };
+  const control = createAutomationControl({
+    available: () => false,
+    pause: async () => assert.fail("no coordinator"),
+    resume: async () => assert.fail("no coordinator"),
+  });
+  assert.equal(control.canPause(entry), false);
+  control.confirm(entry);
+  assert.equal(control.canPause(entry), true);
+  await control.pause(entry, new AbortController().signal);
+  assert.equal(await control.resume(entry, new AbortController().signal), false);
+});
