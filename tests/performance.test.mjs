@@ -73,6 +73,67 @@ test("performance budgets ignore tail-only noise but reject a shifted distributi
   );
 });
 
+test("a bimodal phase is judged against the slower baseline half, not a pooled median", () => {
+  const run = (values) => ({
+    architecture: "x64",
+    browserVersion: "Chrome/146",
+    environment: "same runner",
+    samples: values.length,
+    cases: [
+      {
+        name: "remote-small",
+        phases: { finalize: {} },
+        measurements: { finalize: values },
+      },
+    ],
+  });
+  const compare = (baseline, current) =>
+    comparePerformance(mergeReports(baseline.map(run)), mergeReports(current.map(run)));
+  // Remote finalization samples from one amd64 runner; both modes appear in both runtimes.
+  const baseline = [
+    [306, 300, 297, 156, 156, 159, 165, 178, 163, 166],
+    [178, 170, 286, 288, 177, 288, 311, 289, 287, 303],
+  ];
+  const current = [
+    [321, 326, 300, 292, 439, 166, 306, 160, 436, 169],
+    [171, 311, 171, 154, 167, 294, 320, 281, 281, 293],
+  ];
+  assert.equal(compare(baseline, current).passed, true);
+  const shifted = current.map((values) => values.map((value) => value * 1.5 + 40));
+  assert.equal(compare(baseline, shifted).passed, false);
+  assert.throws(
+    () => mergeReports([run(baseline[0]), run(baseline[1].slice(1))]),
+    /Inconsistent repeated benchmark samples/,
+  );
+});
+
+test("resource budgets ignore one outlier sample but reject a shifted distribution", () => {
+  const report = (cpuMicros) => ({
+    architecture: "x64",
+    browserVersion: "Chrome/146",
+    environment: "same runner",
+    samples: 20,
+    cases: [
+      {
+        name: "viewer-1",
+        phases: { frame: {} },
+        measurements: { frame: Array(20).fill(30) },
+        resources: { cpuMicros },
+      },
+    ],
+  });
+  const baseline = report(Array(20).fill(600_000));
+  const outlier = [...Array(19).fill(550_000), 1_150_000];
+  assert.equal(comparePerformance(baseline, report(outlier)).passed, true);
+  assert.equal(
+    comparePerformance(
+      baseline,
+      report([...Array(18).fill(550_000), 1_150_000, 1_150_000]),
+    ).passed,
+    false,
+  );
+});
+
 test("performance budgets use raw durations rather than a stale summary", () => {
   const report = (value) => ({
     architecture: "x64",
