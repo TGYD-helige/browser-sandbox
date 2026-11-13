@@ -20,6 +20,8 @@ export interface DockerBackendOptions {
   environment?: Record<string, string>;
   memoryBytes?: number;
   shmBytes?: number;
+  /** Docker-host absolute directory containing trusted unpacked extensions. */
+  extensionsSource?: string;
 }
 
 /** Docker management credentials and the socket are confined to the controller. */
@@ -31,10 +33,15 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
     throw Error("browser_docker_configuration_invalid");
   const api = createDockerClient(options.socketPath);
   const networks = new Map<string, string>();
-  const labels = (executionId: string, incarnation: string) => ({
-    [prefix + "installation"]: options.installation,
-    [prefix + "execution"]: executionId,
-    [prefix + "incarnation"]: incarnation,
+  const absent = (error: any) => {
+    if (error.statusCode === 404) return undefined;
+    throw error;
+  };
+  const labels = (executionId: string, incarnation: string, profileId = "") => ({
+    [`${prefix}installation`]: options.installation,
+    [`${prefix}execution`]: executionId,
+    [`${prefix}incarnation`]: incarnation,
+    [`${prefix}profile`]: profileId,
   });
   async function removeNetwork(
     network: string,
@@ -78,79 +85,6 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
     await api(`/containers/${id}?force=true&v=true`, "DELETE", undefined, signal);
   }
   return {
-    async list(signal) {
-      const filter = encodeURIComponent(
-        JSON.stringify({ label: [`${prefix}installation=${options.installation}`] }),
-      );
-      const containers = await api(
-        `/containers/json?all=true&filters=${filter}`,
-        "GET",
-        undefined,
-        signal,
-      );
-      if (!Array.isArray(containers)) throw Error("browser_docker_response_invalid");
-      const workers: ManagedWorker[] = [];
-      try {
-        for (const item of containers) {
-          const state = await api(
-            `/containers/${item.Id}/json`,
-            "GET",
-            undefined,
-            signal,
-          );
-          const tags = state.Config?.Labels;
-          const executionId = tags?.[prefix + "execution"],
-            incarnation = tags?.[prefix + "incarnation"],
-            network = tags?.[prefix + "network"];
-          if (
-            tags?.[prefix + "installation"] !== options.installation ||
-            !/^[a-f0-9-]{36}$/.test(executionId ?? "") ||
-            !/^[a-f0-9-]{36}$/.test(incarnation ?? "") ||
-            !network
-          )
-            throw Error("browser_worker_ownership_mismatch");
-          const origin =
-            tags[prefix + "origin"] ??
-            state.Config.Env?.find((value) =>
-              value.startsWith("BROWSER_WORKER_ORIGIN="),
-            )?.slice("BROWSER_WORKER_ORIGIN=".length);
-          if (!origin || !/^http:\/\/bs-[a-z0-9-]+:8081$/.test(origin))
-            throw Error("browser_worker_ownership_mismatch");
-          const net = await api(`/networks/${network}`, "GET", undefined, signal);
-          if (
-            !Object.entries(labels(executionId, incarnation)).every(
-              ([key, value]) => net.Labels?.[key] === value,
-            )
-          )
-            throw Error("browser_worker_ownership_mismatch");
-          const controller = await api(
-            `/containers/${options.controllerContainer}/json`,
-            "GET",
-            undefined,
-            signal,
-          );
-          if (!net.Containers?.[controller.Id])
-            await api(
-              `/networks/${network}/connect`,
-              "POST",
-              { Container: options.controllerContainer },
-              signal,
-            );
-          networks.set(item.Id, network);
-          workers.push({
-            id: item.Id,
-            executionId,
-            incarnation,
-            origin,
-            runtime: createControllerRuntime(origin),
-          });
-        }
-        return workers;
-      } catch (error) {
-        for (const worker of workers) worker.runtime.close?.();
-        throw error;
-      }
-    },
     async create(placement, signal) {
       const name = `bs-${placement.incarnation}`;
       const expected = labels(
@@ -188,16 +122,32 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
                 ...environment,
                 "CONCURRENT=1",
                 "QUEUED=0",
+                `BROWSER_WORKER_PROTOCOL=${WORKER_PROTOCOL}`,
                 `BROWSER_EXECUTION_ID=${placement.executionId}`,
                 `BROWSER_WORKER_ORIGIN=http://${name}:8081`,
+                ...(options.extensionsSource
+                  ? ["BROWSER_EXTENSIONS_DIR=/browser-extensions"]
+                  : []),
               ],
               Labels: {
                 ...expected,
-                [prefix + "network"]: network,
-                [prefix + "origin"]: `http://${name}:8081`,
-                [prefix + "protocol"]: WORKER_PROTOCOL,
+                [`${prefix}network`]: network,
+                [`${prefix}origin`]: `http://${name}:8081`,
+                [`${prefix}protocol`]: WORKER_PROTOCOL,
               },
               HostConfig: {
+                ...(options.extensionsSource
+                  ? {
+                      Mounts: [
+                        {
+                          Type: "bind",
+                          Source: options.extensionsSource,
+                          Target: "/browser-extensions",
+                          ReadOnly: true,
+                        },
+                      ],
+                    }
+                  : {}),
                 NetworkMode: network,
                 CapDrop: ["ALL"],
                 CapAdd: [
@@ -244,6 +194,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
           executionId: placement.executionId,
           incarnation: placement.incarnation,
           origin,
+          profileId: placement.profileId,
           runtime: createControllerRuntime(origin, {
             automation: placement.automation,
           }),
@@ -265,17 +216,96 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         throw error;
       }
     },
+    async list(signal) {
+      const filter = encodeURIComponent(
+        JSON.stringify({ label: [`${prefix}installation=${options.installation}`] }),
+      );
+      const containers = await api(
+        `/containers/json?all=true&filters=${filter}`,
+        "GET",
+        undefined,
+        signal,
+      );
+      if (!Array.isArray(containers)) throw Error("browser_docker_response_invalid");
+      const workers: ManagedWorker[] = [];
+      try {
+        for (const item of containers) {
+          const state = await api(
+            `/containers/${item.Id}/json`,
+            "GET",
+            undefined,
+            signal,
+          );
+          const tags = state.Config?.Labels;
+          const executionId = tags?.[`${prefix}execution`],
+            incarnation = tags?.[`${prefix}incarnation`],
+            network = tags?.[`${prefix}network`],
+            profileId = tags?.[`${prefix}profile`] || undefined;
+          if (
+            tags?.[`${prefix}installation`] !== options.installation ||
+            !/^[a-f0-9-]{36}$/.test(executionId ?? "") ||
+            !/^[a-f0-9-]{36}$/.test(incarnation ?? "") ||
+            !network
+          )
+            throw Error("browser_worker_ownership_mismatch");
+          const origin =
+            tags[`${prefix}origin`] ??
+            state.Config.Env?.find((value) =>
+              value.startsWith("BROWSER_WORKER_ORIGIN="),
+            )?.slice("BROWSER_WORKER_ORIGIN=".length);
+          if (!origin || !/^http:\/\/bs-[a-z0-9-]+:8081$/.test(origin))
+            throw Error("browser_worker_ownership_mismatch");
+          const net = await api(`/networks/${network}`, "GET", undefined, signal);
+          if (
+            !Object.entries(labels(executionId, incarnation, profileId)).every(
+              ([key, value]) => net.Labels?.[key] === value,
+            )
+          )
+            throw Error("browser_worker_ownership_mismatch");
+          const controller = await api(
+            `/containers/${options.controllerContainer}/json`,
+            "GET",
+            undefined,
+            signal,
+          );
+          if (!net.Containers?.[controller.Id])
+            await api(
+              `/networks/${network}/connect`,
+              "POST",
+              { Container: options.controllerContainer },
+              signal,
+            );
+          networks.set(item.Id, network);
+          workers.push({
+            id: item.Id,
+            executionId,
+            incarnation,
+            origin,
+            profileId,
+            runtime: createControllerRuntime(origin),
+          });
+        }
+        return workers;
+      } catch (error) {
+        for (const worker of workers) worker.runtime.close?.();
+        throw error;
+      }
+    },
     async remove(worker: ManagedWorker, signal) {
-      const expected = labels(worker.executionId, worker.incarnation);
+      const expected = labels(worker.executionId, worker.incarnation, worker.profileId);
       const state = await api(
         `/containers/${worker.id}/json`,
         "GET",
         undefined,
         signal,
-      ).catch((error) => {
-        if (error.statusCode === 404) return undefined;
-        throw error;
-      });
+      ).catch(absent);
+      if (
+        state &&
+        !Object.entries(expected).every(
+          ([key, value]) => state.Config.Labels?.[key] === value,
+        )
+      )
+        throw Error("browser_worker_ownership_mismatch");
       const network =
         state?.Config.Labels?.[prefix + "network"] ?? networks.get(worker.id);
       if (!network) {
