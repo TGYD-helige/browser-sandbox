@@ -336,7 +336,7 @@ try {
         maxWorkers: 2,
         maxPending: 1,
         maxQueued: 1,
-        idleRegistrationMs: 500,
+        idleRegistrationMs: 30000,
         maxExecutionMs: 180000,
       },
       networkPolicy: {
@@ -551,6 +551,21 @@ try {
   );
   assert.equal((await pods()).length, 0, "Temporary worker was not removed");
   stage = "recovery scenarios";
+  await run("helm", [
+    "upgrade",
+    release,
+    "charts/browser-sandbox",
+    "-n",
+    namespace,
+    "--reuse-values",
+    "--set",
+    "capacity.idleRegistrationMs=500",
+    "--wait",
+    "--timeout=120s",
+  ]);
+  const recoveryValues = JSON.parse(await readFile(values, "utf8"));
+  recoveryValues.capacity.idleRegistrationMs = 500;
+  await writeFile(values, JSON.stringify(recoveryValues));
   const recoveryReport = [];
   for (const phase of ["core", "ttl-volume", "ttl-host"])
     recoveryReport.push(await recoveryCases(phase));

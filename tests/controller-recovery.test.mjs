@@ -417,3 +417,67 @@ test("failed controller listen closes recovered transports without deleting work
   assert.equal(closes, 1);
   assert.equal(f.resources.size, 1);
 });
+
+test("network-only Profile orphans survive another restart after failed deletion", async (t) => {
+  const f = await fixture(t);
+  const worker = {
+    id: "network/owned",
+    executionId: randomUUID(),
+    incarnation: randomUUID(),
+    profileId: "persistent-profile",
+    infrastructureOnly: true,
+    origin: "",
+    runtime: {
+      request: async () => {
+        throw Error("must not connect");
+      },
+    },
+  };
+  f.resources.set(worker.id, worker);
+  const remove = f.backend.remove;
+  f.backend.remove = async () => {
+    throw Error("network removal failed");
+  };
+  const first = await f.start();
+  await first.reconcile();
+  assert.equal(f.resources.size, 1);
+  await first.stop();
+  const second = await f.start();
+  assert.equal(second.bindings.get(worker.executionId).profileId, worker.profileId);
+  await second.reconcile();
+  assert.equal(f.resources.size, 1);
+  f.backend.remove = remove;
+  await second.reconcile();
+  assert.equal(f.resources.size, 0);
+  assert.equal(second.capacity().workers, 0);
+});
+
+test("slow worker creation refreshes idle activity before the first CDP connection", async (t) => {
+  const f = await fixture(t);
+  let now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const create = f.backend.create;
+  f.backend.create = async (placement) => {
+    now += 5000;
+    const worker = await create(placement);
+    const request = worker.runtime.request;
+    worker.runtime.request = async (message) =>
+      message.op === "worker_status"
+        ? {
+            protocol: "browser-sandbox.worker/v1",
+            session: { state: "unused", connectedClients: 0 },
+            takeover: "automation",
+            pendingAuth: 0,
+          }
+        : request(message);
+    return worker;
+  };
+  const controller = await f.start({ idleRegistrationMs: 1000 });
+  const endpoint = await controller.command({
+    op: "register",
+    executionId: randomUUID(),
+  });
+  assert.equal((await fetch(fileUrl(controller, endpoint))).status, 200);
+  await controller.reconcile();
+  assert.equal(f.resources.size, 1);
+});
