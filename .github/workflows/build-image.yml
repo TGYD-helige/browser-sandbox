@@ -15,7 +15,7 @@ jobs:
     runs-on: ${{ vars.BROWSER_IMAGE_PUBLISH_RUNNER || 'arc-simple' }}
     timeout-minutes: 20
     env:
-      DOCKER_CONFIG: ${{ runner.temp }}/browser-image-auth
+      DOCKER_CONFIG: /tmp/browser-image-auth-${{ github.run_id }}-${{ github.run_attempt }}
       REGISTRY: ${{ vars.BAIDU_CCR_REGISTRY }}
       NAMESPACE: ${{ vars.BAIDU_CCR_NAMESPACE }}
       VERIFIED_DIGEST: sha256:de2f7cf91e6eb5b9d791157ec9b7c6e6c50dfbc7e07318159e55f77950ab2d4e
