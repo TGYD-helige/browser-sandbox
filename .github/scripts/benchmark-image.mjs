@@ -150,8 +150,9 @@ if (process.argv[2] === "worker") {
 } else if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const samples = Number(process.env.SAMPLES ?? 20);
   assert(Number.isInteger(samples) && samples >= 10 && samples <= 100);
+  // standard is lifecycle followed by extended; CI runs those halves as parallel jobs.
   const suite = process.env.BENCHMARK_SUITE ?? "standard";
-  assert(["standard", "soak"].includes(suite));
+  assert(["standard", "lifecycle", "extended", "soak"].includes(suite));
   const root = await mkdtemp(join(tmpdir(), "browser-benchmark-"));
   const socket = process.env.BROWSER_CONTROL_SOCKET;
   const { site, transfers } = createBenchmarkSite(root);
@@ -189,7 +190,7 @@ if (process.argv[2] === "worker") {
         note: "First readiness includes client startup, Profile restore, browser startup, navigation, and screenshot. Finalization includes checkpoint, browser exit, encryption/archive, upload, and commit. HTTP transfer timings are measured at the local storage server. Profile acquisition and source lookup/restore are measured inside the runtime. Browser launch includes Browserless queue wait. Unused executions use a generic Node client without connecting CDP; real harness startup is measured separately. These measurements do not establish production/cloud latency or a comparative performance claim.",
         cases,
       });
-      if (suite === "standard") {
+      if (suite === "standard" || suite === "lifecycle") {
         for (const [name, bytes] of [
           ["unused", -1],
           ["temporary", null],
@@ -385,7 +386,6 @@ if (process.argv[2] === "worker") {
         await collectBenchmark(report, "concurrent-temporary", () =>
           benchmarkLoad({ socket, url: origin + "/page", samples, report }),
         );
-        await benchmarkExtended({ socket, origin, root, samples }, report);
       } else {
         report.activeWorkload = "browser-version";
         const probe = await execution(socket);
@@ -396,6 +396,10 @@ if (process.argv[2] === "worker") {
         } finally {
           await probe.finish();
         }
+      }
+      if (suite === "standard" || suite === "extended")
+        await benchmarkExtended({ socket, origin, root, samples }, report);
+      if (suite === "soak") {
         const cycles = Number(process.env.SOAK_CYCLES ?? 500);
         await collectBenchmark(report, "soak-temporary", () =>
           benchmarkSoak({ socket, origin, samples, cycles, report }),
