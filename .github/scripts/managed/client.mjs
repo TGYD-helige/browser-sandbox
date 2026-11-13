@@ -226,7 +226,7 @@ try {
         executionId,
         durationMs: 1,
       });
-      await delay(5);
+      await delay(Math.max(1, expired.expiresAt - Date.now() + 1));
       await assert.rejects(connectCdp(expired.cdpUrl));
       // Measure the same CDP payload on the direct private worker and controller routes.
       const details = await api(`/containers/${primaryWorker.Id}/json`);
@@ -317,11 +317,23 @@ try {
         const second = await connectCdp(secondEndpoint);
         try {
           await second.call("Browser.getVersion");
-          await sessionRequest(secondEndpoint, "retain", 120000);
+          await sessionRequest(secondEndpoint, "retain", 100);
         } finally {
           second.close();
           await second.closed;
         }
+        const expiryDeadline = Date.now() + 15000;
+        let expiredSession;
+        do {
+          expiredSession = await sessionRequest(secondEndpoint);
+          if (expiredSession.state === "expired") break;
+          await delay(25);
+        } while (Date.now() < expiryDeadline);
+        assert.equal(expiredSession.state, "expired");
+        await assert.rejects(
+          sessionRequest(secondEndpoint, "renew", 10000),
+          /browser_session_not_live/,
+        );
         const secondWorker = await workerFor(secondId);
         const secondDetails = await api(`/containers/${secondWorker.Id}/json`);
         const secondIp = Object.values(secondDetails.NetworkSettings.Networks)[0]

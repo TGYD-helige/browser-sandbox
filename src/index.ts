@@ -10,6 +10,8 @@ export type {
 export { browserAuthRequest } from "./browser-auth.js";
 export type { ControllerOptions, ExecutionBinding } from "./controller.js";
 export { createController } from "./controller.js";
+export type { DockerBackendOptions } from "./docker-backend.js";
+export { createDockerBackend } from "./docker-backend.js";
 export { createGateway } from "./gateway.js";
 export type {
   BrowserAccess,
