@@ -18,3 +18,18 @@ export async function docker(args, execute = exec) {
     );
   }
 }
+
+export function diagnostics(logs, state = {}) {
+  return {
+    running: state.Running,
+    oomKilled: state.OOMKilled,
+    exitCode: state.ExitCode,
+    codes: [
+      ...new Set(
+        String(logs).match(
+          /\bbrowser_[a-z_]+\b|\b(?:EPERM|ENOENT|EACCES|ENOSPC|SIGSEGV|SIGKILL|FATAL|OOM)\b/g,
+        ) ?? [],
+      ),
+    ],
+  };
+}

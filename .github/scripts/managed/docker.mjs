@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { docker as command } from "./command.mjs";
+import { docker as command, diagnostics } from "./command.mjs";
 
 const docker = (...args) => command(args);
 const installation = `test-${randomUUID().slice(0, 8)}`;
@@ -147,14 +147,28 @@ try {
   );
 } catch (error) {
   if (controller) {
-    const logs = await docker("logs", controller).catch(() => "");
+    const records = [];
+    const owned = (
+      await docker(
+        "ps",
+        "-aq",
+        "--filter",
+        `label=browser-sandbox.installation=${installation}`,
+      ).catch(() => "")
+    )
+      .split("\n")
+      .filter(Boolean);
+    for (const [kind, id] of [
+      ["controller", controller],
+      ...owned.map((id) => ["worker", id]),
+    ]) {
+      const details = JSON.parse(await docker("inspect", id).catch(() => "[]"))[0];
+      const logs = await docker("logs", id).catch(() => "");
+      records.push({ kind, ...diagnostics(logs, details?.State) });
+    }
     await writeFile(
-      "managed-results/diagnostics.txt",
-      [
-        ...new Set(
-          logs.match(/\bbrowser_[a-z_]+\b|\b(?:EPERM|ENOENT|EACCES|ENOSPC)\b/g) ?? [],
-        ),
-      ].join("\n"),
+      "managed-results/diagnostics.json",
+      JSON.stringify(records, null, 2) + "\n",
     );
   }
   throw error;

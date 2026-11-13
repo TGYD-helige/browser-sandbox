@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { docker } from "./managed/command.mjs";
+import { diagnostics, docker } from "./managed/command.mjs";
 
 test("managed Docker failures keep actionable diagnostics without argv or execution references", async () => {
   const endpoint = "ws://controller:8080/execution/" + "a".repeat(64);
@@ -20,4 +20,22 @@ test("managed Docker failures keep actionable diagnostics without argv or execut
       return true;
     },
   );
+});
+
+test("managed diagnostics retain worker state and known codes without log text or secret fields", () => {
+  const record = diagnostics(
+    "browser_worker_unavailable ws://private/secret SECRET=value SIGSEGV",
+    {
+      Running: false,
+      OOMKilled: false,
+      ExitCode: 1,
+      Config: { Env: ["SECRET=value"] },
+    },
+  );
+  assert.deepEqual(record, {
+    running: false,
+    oomKilled: false,
+    exitCode: 1,
+    codes: ["browser_worker_unavailable", "SIGSEGV"],
+  });
 });
