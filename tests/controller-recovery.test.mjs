@@ -1760,3 +1760,86 @@ for (const failure of [null, Error("browser_profile_save_failed")]) {
     }
   });
 }
+
+test("a blocked persistent finalization accepts an absent worker after confirmed commit", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1000 });
+  const f = await fixture(t);
+  let adapter,
+    finalizes = 0,
+    commits = 0;
+  const create = f.backend.create;
+  const result = {
+    used: true,
+    archive: { sha256: "a".repeat(64), byteSize: 1 },
+    previousSha256: null,
+  };
+  f.backend.create = async (...args) => {
+    const worker = await create(...args);
+    const request = worker.runtime.request;
+    worker.runtime.attachStorage = async (_registration, value) => {
+      adapter = value;
+      return { close() {} };
+    };
+    worker.runtime.request = async (input) => {
+      if (input.op !== "finalize") return request(input);
+      finalizes++;
+      if (finalizes === 1) await adapter.commit(result);
+      if (finalizes <= 4) throw Error("browser_control_disconnected");
+      return { status: "absent" };
+    };
+    return worker;
+  };
+  // Synthetic commit confirmation isolates blocked recovery from archive transport.
+  const profileStore = {
+    open: () => ({
+      commit: async () => {
+        commits++;
+        return { confirmedSha: result.archive.sha256 };
+      },
+      close: async () => {},
+    }),
+  };
+  const controller = await f.start({ profileStore, reconciliationMs: 60000 });
+  const executionId = randomUUID();
+  const endpoint = await controller.command({
+    op: "register",
+    executionId,
+    profileId: "blocked-commit",
+  });
+  await fetch(fileUrl(controller, endpoint));
+  try {
+    await assert.rejects(
+      controller.command({ op: "finish", executionId }),
+      /browser_control_disconnected/,
+    );
+    for (const delay of [0, 1000, 2000]) {
+      t.mock.timers.tick(delay);
+      await controller.reconcile();
+    }
+    const status = await controller.command({ op: "controller_status", executionId });
+    assert.equal(status.execution.phase, "recovery-blocked");
+    assert.equal(controller.capacity().workers, 1);
+    await assert.rejects(
+      controller.command({
+        op: "register",
+        executionId: randomUUID(),
+        profileId: "blocked-commit",
+      }),
+      /browser_profile_busy/,
+    );
+    const saved = await controller.command({ op: "finish", executionId });
+    assert.equal(saved.stopped, true);
+    assert.equal(saved.archive.sha256, result.archive.sha256);
+    assert.equal(commits, 1);
+    assert.equal(f.resources.size, 0);
+    assert.equal(controller.capacity().workers, 0);
+    await controller.command({
+      op: "register",
+      executionId: randomUUID(),
+      profileId: "blocked-commit",
+    });
+  } finally {
+    for (const worker of f.resources.values())
+      worker.runtime.request = async () => ({ stopped: true });
+  }
+});
