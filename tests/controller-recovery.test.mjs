@@ -707,3 +707,36 @@ test("unconfirmed persistent recovery becomes visible and retains its lease unti
     profileId: "kept-profile",
   });
 });
+
+test("late protocol mismatch preserves the original endpoint through compatible rollback", async (t) => {
+  const f = await fixture(t);
+  const first = await f.start({ reconciliationMs: 60000 });
+  const executionId = randomUUID();
+  const endpoint = await first.command({ op: "register", executionId });
+  await fetch(fileUrl(first, endpoint));
+  await first.stop();
+  const worker = [...f.resources.values()][0];
+  const request = worker.runtime.request;
+  let statusError = true;
+  worker.runtime.request = async (input) => {
+    if (input.op !== "worker_status") return request(input);
+    if (statusError) throw Error("browser_control_disconnected");
+    return { protocol: "browser-sandbox.worker/v2" };
+  };
+  t.after(() => {
+    worker.runtime.request = request;
+  });
+  const second = await f.start({ reconciliationMs: 60000 });
+  await second.reconcile();
+  statusError = false;
+  await second.reconcile();
+  assert.equal(
+    (await second.command({ op: "controller_status", executionId })).execution.phase,
+    "recovery-blocked",
+  );
+  await second.stop();
+  worker.runtime.request = request;
+  const third = await f.start({ reconciliationMs: 60000 });
+  assert.equal(await (await fetch(fileUrl(third, endpoint))).text(), "same-worker");
+  assert.equal(f.created, 1);
+});
