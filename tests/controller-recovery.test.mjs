@@ -1873,3 +1873,123 @@ test("HTTP renewal preserves detected session loss while revoking the old endpoi
     worker.runtime.request = request;
   }
 });
+
+test("confirmed commit records reject corrupt witnesses without changing recoverable data", async (t) => {
+  const changes = [
+    (commit) => {
+      commit.incarnation = randomUUID();
+    },
+    (commit) => {
+      commit.result.archive.sha256 = ["a".repeat(64)];
+    },
+    (commit) => {
+      commit.result.archive.byteSize = 0;
+    },
+    (commit) => {
+      commit.result.used = "true";
+    },
+    (commit) => {
+      commit.result.archive.url = "https://fixture.invalid/archive";
+    },
+  ];
+  for (const change of changes) {
+    const f = await fixture(t);
+    const profileStore = { open: () => ({ close: async () => {} }) };
+    const first = await f.start({ profileStore, reconciliationMs: 60000 });
+    const executionId = randomUUID();
+    const endpoint = await first.command({
+      op: "register",
+      executionId,
+      profileId: "witness",
+    });
+    await fetch(fileUrl(first, endpoint));
+    await first.stop();
+    const filename = join(f.directory, `${executionId}.json`);
+    const record = JSON.parse(await readFile(filename, "utf8"));
+    record.data.confirmedCommit = {
+      incarnation: record.data.incarnation,
+      result: { used: true, archive: { sha256: "a".repeat(64), byteSize: 1 } },
+    };
+    change(record.data.confirmedCommit);
+    const corrupt = JSON.stringify(record);
+    await writeFile(filename, corrupt);
+    await assert.rejects(
+      f.start({ profileStore }),
+      /browser_execution_journal_corrupt/,
+    );
+    assert.equal(await readFile(filename, "utf8"), corrupt);
+    assert.equal(f.resources.size, 1);
+  }
+});
+
+test("a journal failure prevents acknowledging a confirmed storage commit to the worker", async (t) => {
+  const f = await fixture(t);
+  let storageCommitted = false,
+    acknowledged = false,
+    adapter;
+  // Synthetic archive metadata isolates the controller's durability boundary.
+  const result = { used: true, archive: { sha256: "b".repeat(64), byteSize: 1 } };
+  const profileStore = {
+    open: () => ({
+      commit: async () => {
+        storageCommitted = true;
+        return { confirmedSha: result.archive.sha256 };
+      },
+      close: async () => {},
+    }),
+  };
+  const create = f.backend.create;
+  f.backend.create = async (...args) => {
+    const worker = await create(...args);
+    worker.runtime.attachStorage = async (_registration, value) => {
+      adapter = value;
+      return { close() {} };
+    };
+    return worker;
+  };
+  const controller = await f.start({ profileStore, reconciliationMs: 60000 });
+  const executionId = randomUUID();
+  const endpoint = await controller.command({
+    op: "register",
+    executionId,
+    profileId: "ack-boundary",
+  });
+  await fetch(fileUrl(controller, endpoint));
+  const worker = [...f.resources.values()][0],
+    request = worker.runtime.request;
+  worker.runtime.request = async (input) => {
+    if (input.op !== "finalize") return request(input);
+    await adapter.commit(result);
+    acknowledged = true;
+    return { stopped: true };
+  };
+  const folder = await open(f.directory, "r");
+  const inode = (await folder.stat()).ino;
+  const prototype = Object.getPrototypeOf(folder),
+    sync = prototype.sync;
+  await folder.close();
+  const mock = t.mock.method(prototype, "sync", async function () {
+    if (storageCommitted && (await this.stat()).ino === inode)
+      throw Object.assign(Error("Injected commit journal failure"), { code: "EIO" });
+    return sync.call(this);
+  });
+  try {
+    await assert.rejects(controller.command({ op: "finish", executionId }), {
+      code: "EIO",
+    });
+    assert.equal(storageCommitted, true);
+    assert.equal(acknowledged, false);
+    assert.equal(controller.capacity().workers, 1);
+    await assert.rejects(
+      controller.command({
+        op: "register",
+        executionId: randomUUID(),
+        profileId: "ack-boundary",
+      }),
+      /browser_profile_busy/,
+    );
+  } finally {
+    mock.mock.restore();
+    worker.runtime.request = request;
+  }
+});

@@ -19,6 +19,7 @@ import {
 } from "./network-control.js";
 import { normalizeAllowedDomains } from "./network-policy.js";
 import type { createProfileStore } from "./profile-store.js";
+import { MAX_ARCHIVE_BYTES } from "./profiles.js";
 import type { SessionStatus } from "./session.js";
 import { createWorkerAdmission, type WorkerSlot } from "./worker-admission.js";
 import { WORKER_PROTOCOL, workerIdleProtection } from "./worker-protocol.js";
@@ -237,22 +238,10 @@ export async function createController(options: ControllerOptions) {
       finalResult: binding.finalResult
         ? {
             stopped: binding.finalResult.stopped,
-            ...(typeof binding.finalResult.used === "boolean"
-              ? { used: binding.finalResult.used }
-              : {}),
-            ...(typeof binding.finalResult.graceful === "boolean"
-              ? { graceful: binding.finalResult.graceful }
-              : {}),
-            ...(binding.finalResult.archive
-              ? {
-                  archive: {
-                    sha256: binding.finalResult.archive.sha256,
-                    byteSize: binding.finalResult.archive.byteSize,
-                  },
-                }
-              : {}),
+            ...finalizationDetails(binding.finalResult),
           }
         : undefined,
+      confirmedCommit: binding.confirmedCommit,
       generation: binding.generation,
       workerProtocol: binding.workerProtocol ?? WORKER_PROTOCOL,
       cleanupUnconfirmed: binding.cleanupUnconfirmed,
@@ -580,13 +569,22 @@ export async function createController(options: ControllerOptions) {
         const confirmation = await adapter.commit(result, signal);
         const archive = result.archive as { sha256?: unknown } | undefined;
         if (
+          binding.profileId &&
           /^[a-f0-9]{64}$/.test(confirmation?.confirmedSha) &&
           confirmation.confirmedSha === archive?.sha256 &&
           bindings.get(binding.executionId) === binding &&
           binding.incarnation === worker.incarnation &&
           binding.worker === worker
-        )
-          binding.confirmedCommit = { incarnation: worker.incarnation, result };
+        ) {
+          const commit = {
+            incarnation: worker.incarnation,
+            result: finalizationDetails(result),
+          };
+          if (!validConfirmedCommit(commit, binding.incarnation))
+            throw Error("browser_profile_archive_invalid");
+          binding.confirmedCommit = commit;
+          await persist(binding);
+        }
         return confirmation;
       },
     };
@@ -1542,6 +1540,7 @@ export async function createController(options: ControllerOptions) {
             worker,
             stopConfirmed: data.stopConfirmed,
             finalResult: data.finalResult,
+            confirmedCommit: data.confirmedCommit,
             generation: data.generation,
             // Journal v1 originally described worker protocol v1.
             workerProtocol: data.workerProtocol ?? "browser-sandbox.worker/v1",
@@ -2057,6 +2056,45 @@ function errorStatus(error: unknown, grant?: Access) {
   return /_(capacity_exceeded|overloaded)$/.test(code) ? 503 : 502;
 }
 
+function finalizationDetails(result: any) {
+  return {
+    ...(typeof result.used === "boolean" ? { used: result.used } : {}),
+    ...(typeof result.graceful === "boolean" ? { graceful: result.graceful } : {}),
+    ...(result.archive
+      ? {
+          archive: { sha256: result.archive.sha256, byteSize: result.archive.byteSize },
+        }
+      : {}),
+  };
+}
+function validConfirmedCommit(commit: any, incarnation: string) {
+  const result = commit?.result;
+  const archive = result?.archive;
+  return (
+    !!commit &&
+    typeof commit === "object" &&
+    !Array.isArray(commit) &&
+    typeof commit.incarnation === "string" &&
+    commit.incarnation === incarnation &&
+    Object.keys(commit).every((key) => ["incarnation", "result"].includes(key)) &&
+    !!result &&
+    typeof result === "object" &&
+    !Array.isArray(result) &&
+    Object.keys(result).every((key) => ["used", "graceful", "archive"].includes(key)) &&
+    ["used", "graceful"].every(
+      (key) => result[key] === undefined || typeof result[key] === "boolean",
+    ) &&
+    !!archive &&
+    typeof archive === "object" &&
+    !Array.isArray(archive) &&
+    Object.keys(archive).every((key) => ["sha256", "byteSize"].includes(key)) &&
+    typeof archive.sha256 === "string" &&
+    /^[a-f0-9]{64}$/.test(archive.sha256) &&
+    Number.isSafeInteger(archive.byteSize) &&
+    archive.byteSize > 0 &&
+    archive.byteSize <= MAX_ARCHIVE_BYTES
+  );
+}
 function validateControllerRecord(data: any) {
   const invalid = () => {
     throw Error("browser_execution_journal_corrupt");
@@ -2110,6 +2148,11 @@ function validateControllerRecord(data: any) {
       typeof data.finalResult !== "object" ||
       Array.isArray(data.finalResult) ||
       data.finalResult.stopped !== true)
+  )
+    invalid();
+  if (
+    data.confirmedCommit !== undefined &&
+    (!data.profileId || !validConfirmedCommit(data.confirmedCommit, data.incarnation))
   )
     invalid();
   if (

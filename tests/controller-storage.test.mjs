@@ -13,7 +13,13 @@ import { createProfileStore } from "../dist/profile-store.js";
 import { createProfileArchive } from "../dist/profiles.js";
 
 for (const [mode, failure] of ["host", "volume"].flatMap((mode) =>
-  ["removal", "response", "unconfirmed response"].map((failure) => [mode, failure]),
+  [
+    "removal",
+    "response",
+    "unconfirmed response",
+    "restart response",
+    "restart without witness",
+  ].map((failure) => [mode, failure]),
 ))
   test(`controller ${mode} storage preserves native Profile state after ${failure} failure`, async (t) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "controller-storage-"));
@@ -36,13 +42,19 @@ for (const [mode, failure] of ["host", "volume"].flatMap((mode) =>
     const archive = createProfileArchive({
       browserVersion: async () => "Google Chrome 146.0.7680.177",
     });
+    const restart = failure.startsWith("restart");
+    const committed = Promise.withResolvers(),
+      release = Promise.withResolvers();
+    t.after(() => release.resolve());
     const workers = new Map();
     let removed = 0,
       finalizations = 0,
+      commits = 0,
       finalizeRequests = 0,
       skipCommit = false,
       failRemoval = false,
-      dropResponse = false;
+      dropResponse = false,
+      holdResponse = restart;
     const backend = {
       async list() {
         return [...workers.values()];
@@ -93,6 +105,9 @@ for (const [mode, failure] of ["host", "volume"].flatMap((mode) =>
           origin,
           server,
           entry,
+          reconnect() {
+            closed = false;
+          },
           runtime: {
             async attachStorage(registration, storage) {
               assert.equal(registration.profileId, placement.profileId);
@@ -120,13 +135,21 @@ for (const [mode, failure] of ["host", "volume"].flatMap((mode) =>
                 await adapter.save(AbortSignal.timeout(5000)),
                 AbortSignal.timeout(5000),
               );
-              if (!skipCommit)
+              if (!skipCommit) {
                 assert.equal(
                   (await adapter.commit(result, AbortSignal.timeout(5000)))
                     .confirmedSha,
                   result.archive.sha256,
                 );
+                commits++;
+              }
               finalized = true;
+              if (holdResponse) {
+                holdResponse = false;
+                committed.resolve();
+                await release.promise;
+                throw Error("browser_control_disconnected");
+              }
               if (dropResponse) {
                 dropResponse = false;
                 throw Error("browser_control_disconnected");
@@ -150,15 +173,23 @@ for (const [mode, failure] of ["host", "volume"].flatMap((mode) =>
         workers.delete(worker.id);
       },
     };
-    const controller = await createController({
+    const controllerOptions = {
       port: 0,
       backend,
       profileStore: store,
-    });
+      ...(restart
+        ? {
+            stateDirectory: path.join(root, "controller"),
+            installationId: "test",
+            reconciliationMs: 60000,
+          }
+        : {}),
+    };
+    let controller = await createController(controllerOptions);
     t.after(async () => {
       try {
         await controller.stop({
-          preserveWorkers: failure === "unconfirmed response",
+          preserveWorkers: restart || failure.endsWith("unconfirmed response"),
         });
       } finally {
         for (const worker of workers.values()) {
@@ -167,7 +198,7 @@ for (const [mode, failure] of ["host", "volume"].flatMap((mode) =>
         }
       }
     });
-    const runtime = createControllerRuntime(controller.controlOrigin);
+    let runtime = createControllerRuntime(controller.controlOrigin);
     t.after(() => runtime.close());
     let latest, key;
     let failCommit = false;
@@ -205,7 +236,7 @@ for (const [mode, failure] of ["host", "volume"].flatMap((mode) =>
       await (await fetch(first.url, { method: "PUT" })).text(),
       "confirmed native data",
     );
-    if (mode === "host") {
+    if (mode === "host" && !restart) {
       failCommit = true;
       await assert.rejects(
         runtime.request({ op: "finalize", executionId: first.executionId }),
@@ -219,18 +250,67 @@ for (const [mode, failure] of ["host", "volume"].flatMap((mode) =>
       await assert.rejects(open(), /browser_profile_busy/);
       failCommit = false;
     }
-    failRemoval = failure === "removal";
-    dropResponse = failure !== "removal";
-    skipCommit = failure === "unconfirmed response";
-    await assert.rejects(
-      runtime.request({ op: "finalize", executionId: first.executionId }),
-      failure === "removal"
-        ? /browser_synthetic_worker_removal_failed/
-        : /browser_control_disconnected/,
-    );
-    const saves = finalizations;
+    if (restart) {
+      const finishing = controller.command({
+        op: "finalize",
+        executionId: first.executionId,
+      });
+      const rejected = assert.rejects(finishing, /browser_control_disconnected/);
+      await committed.promise;
+      const record = JSON.parse(
+        await fs.readFile(
+          path.join(root, "controller", `${first.executionId}.json`),
+          "utf8",
+        ),
+      );
+      assert.equal(
+        record.data.confirmedCommit.incarnation,
+        [...workers.values()][0].incarnation,
+      );
+      assert.deepEqual(Object.keys(record.data.confirmedCommit.result).sort(), [
+        "archive",
+        "used",
+      ]);
+      assert.deepEqual(Object.keys(record.data.confirmedCommit.result.archive).sort(), [
+        "byteSize",
+        "sha256",
+      ]);
+      assert.equal(record.data.confirmedCommit.result.used, true);
+      await controller.stop({ preserveWorkers: true });
+      runtime.close();
+      release.resolve();
+      await rejected;
+      if (failure === "restart without witness") {
+        // Older journal v1 records contain no durable commit witness.
+        delete record.data.confirmedCommit;
+        await fs.writeFile(
+          path.join(root, "controller", `${first.executionId}.json`),
+          JSON.stringify(record),
+        );
+      }
+      for (const worker of workers.values()) worker.reconnect();
+      controller = await createController(controllerOptions);
+      runtime = createControllerRuntime(controller.controlOrigin);
+      if (mode === "host")
+        await runtime.attachStorage(
+          { executionId: first.executionId, profileId: first.profileId },
+          hostAdapter,
+        );
+    } else {
+      failRemoval = failure === "removal";
+      dropResponse = failure !== "removal";
+      skipCommit = failure === "unconfirmed response";
+      await assert.rejects(
+        runtime.request({ op: "finalize", executionId: first.executionId }),
+        failure === "removal"
+          ? /browser_synthetic_worker_removal_failed/
+          : /browser_control_disconnected/,
+      );
+    }
+    const saves = finalizations,
+      confirmations = commits;
     await assert.rejects(open(), /browser_profile_busy/);
-    if (skipCommit) {
+    if (skipCommit || failure === "restart without witness") {
       const request = { op: "finalize", executionId: first.executionId };
       await assert.rejects(
         runtime.request(request),
@@ -247,6 +327,7 @@ for (const [mode, failure] of ["host", "volume"].flatMap((mode) =>
         "Terminal failure must not retry the worker",
       );
       assert.equal(removed, 0);
+      assert.equal(commits, confirmations);
       await assert.rejects(open(), /browser_profile_busy/);
       assert.equal(
         await fs.readFile(
@@ -268,6 +349,11 @@ for (const [mode, failure] of ["host", "volume"].flatMap((mode) =>
       finalizations,
       saves,
       "Cleanup retry must not repeat a confirmed save",
+    );
+    assert.equal(
+      commits,
+      confirmations,
+      "Cleanup retry must not repeat a confirmed commit",
     );
     const next = await open();
     assert.equal(await (await fetch(next.url)).text(), "confirmed native data");
