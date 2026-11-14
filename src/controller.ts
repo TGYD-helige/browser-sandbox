@@ -32,6 +32,8 @@ export interface ExecutionBinding {
   life: AbortController;
   revoked: boolean;
   finishing?: Promise<any>;
+  stopConfirmed?: boolean;
+  finalResult?: Record<string, unknown>;
   host?: ControlPeer;
 }
 interface StorageAttachment {
@@ -696,39 +698,44 @@ export async function createController(options: ControllerOptions) {
         await current.starting?.catch(() => {});
         if (!current.worker && current.creationFailure instanceof WorkerCleanupFailure)
           throw current.creationFailure;
-        let result = { used: false, stopped: true };
+        let result = current.finalResult ?? { used: false, stopped: true };
         if (current.worker) {
-          try {
-            result = await current.worker.runtime.request(
-              { op: "finalize", executionId: id },
-              { signal },
-            );
-          } catch (error) {
-            if (current.profileId) throw error;
-            if (
-              ![
-                "browser_control_disconnected",
-                "browser_control_unavailable",
-                "browser_control_timeout",
-              ].includes(error.message)
-            ) {
+          if (!current.stopConfirmed) {
+            try {
+              result = await current.worker.runtime.request(
+                { op: "finalize", executionId: id },
+                { signal },
+              );
+            } catch (error) {
+              if (current.profileId) throw error;
+              if (
+                ![
+                  "browser_control_disconnected",
+                  "browser_control_unavailable",
+                  "browser_control_timeout",
+                ].includes(error.message)
+              ) {
+                try {
+                  current.worker.runtime.close?.();
+                } catch (cleanup) {
+                  throw new WorkerCleanupFailure(error, cleanup);
+                }
+                throw error;
+              }
               try {
-                current.worker.runtime.close?.();
+                await removeWorker(current.worker, AbortSignal.timeout(30000));
               } catch (cleanup) {
                 throw new WorkerCleanupFailure(error, cleanup);
               }
-              throw error;
+              storage.get(id)?.cleanup();
+              bindings.delete(id);
+              rememberFinished(id);
+              event(current, "removed", { error: errorCode(error) });
+              throw Error("browser_worker_finalization_failed");
             }
-            try {
-              await removeWorker(current.worker, AbortSignal.timeout(30000));
-            } catch (cleanup) {
-              throw new WorkerCleanupFailure(error, cleanup);
-            }
-            storage.get(id)?.cleanup();
-            bindings.delete(id);
-            rememberFinished(id);
-            event(current, "removed", { error: errorCode(error) });
-            throw Error("browser_worker_finalization_failed");
+            if (result.stopped !== true) throw Error("browser_worker_stop_unconfirmed");
+            current.stopConfirmed = true;
+            current.finalResult = result;
           }
           await removeWorker(current.worker, signal);
         }
