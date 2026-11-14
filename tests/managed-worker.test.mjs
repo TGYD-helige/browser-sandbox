@@ -92,6 +92,8 @@ test("controller and a private single-execution worker preserve text frames and 
   const { wsEndpoint } = await runtime.request({ op: "register", executionId });
   let cdp = await connectCdp(wsEndpoint);
   assert.equal((await cdp.call("Browser.getVersion")).product, "synthetic-browser");
+  const metrics = await runtime.request({ op: "worker_metrics", executionId });
+  assert(Number.isFinite(metrics.preparation.browserLaunchMs));
   const retained = await sessionRequest(wsEndpoint, "retain", 10000);
   cdp.close();
   await cdp.closed;

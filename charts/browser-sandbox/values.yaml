@@ -65,6 +65,22 @@ networkPolicy:
   apiServerCidrs: []
   # Add any public node, Pod, Service or API endpoint CIDRs used by your cluster.
   deniedCidrs: []
+  # Exact host-issued storage destinations, shared by CNI and the trusted runtime.
+  # Example: [{address: "10.42.1.2", port: 9083}]
+  storageEgress: []
   dnsNamespace: kube-system
   dnsLabels:
     k8s-app: kube-dns
+
+# One controller-only volume; workers transfer archives through private HTTP grants.
+profileStore:
+  enabled: false
+  existingClaim: ""
+  storageClass: ""
+  size: 16Gi
+  retainOnDelete: true
+  maxProfiles: 10000
+  maxBytes: "10737418240"
+  maxStagedBytes: "1073741824"
+  maxTransfers: 4
+  idleTtlMs: ""

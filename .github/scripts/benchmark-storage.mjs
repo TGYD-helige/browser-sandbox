@@ -9,7 +9,7 @@ import { attachStorage } from "../../dist/host-client.js";
 import { barrier, execution, workload } from "./benchmark-fixture.mjs";
 import { trackBenchmark } from "./benchmark-report.mjs";
 
-export async function archiveFixture(root) {
+export async function archiveFixture(root, { host = "127.0.0.1", port = 0 } = {}) {
   const gates = new Map();
   const site = createServer(async (req, res) => {
     const life = new AbortController();
@@ -47,7 +47,7 @@ export async function archiveFixture(root) {
       res.off("close", cancelled);
     }
   });
-  site.listen(0, "127.0.0.1");
+  site.listen(port, host);
   await once(site, "listening");
   return {
     url: `http://127.0.0.1:${site.address().port}/archive`,
