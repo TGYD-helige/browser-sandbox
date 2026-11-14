@@ -1,0 +1,70 @@
+# One image for the controller and every newly allocated worker.
+image:
+  repository: amaster/browser-sandbox
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+controller:
+  publicOrigin: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+service:
+  port: 8080
+  # Internal-only until controller authentication is implemented.
+  type: ClusterIP
+hostControl:
+  port: 8082
+  # Trusted host Pods only, in this namespace unless a namespaceSelector is explicit.
+  allowedPeers:
+    - podSelector:
+        matchLabels:
+          browser-sandbox.io/host-control: "true"
+ingress:
+  enabled: false
+  className: ""
+  host: ""
+  tls: []
+runtime:
+  TIMEOUT: "1800000"
+worker:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      memory: 2Gi
+  securityContext:
+    runAsUser: 0
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+      add: [SETUID, SETGID, CHOWN, KILL, DAC_OVERRIDE, SYS_CHROOT, NET_ADMIN]
+    seccompProfile:
+      type: Localhost
+      localhostProfile: browser-sandbox.json
+  shmSize: 512Mi
+  terminationGracePeriodSeconds: 60
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  # An optional read-only ConfigMap/PVC extension projection, never hostPath.
+  extensions: null
+  disruptionBudget:
+    enabled: false
+    # Bare Pods have no scalable controller; use an integer minAvailable.
+    minAvailable: 1
+networkPolicy:
+  # Required: all control-plane endpoint IPs, including public endpoints and Service IPs.
+  apiServerCidrs: []
+  # Add any public node, Pod, Service or API endpoint CIDRs used by your cluster.
+  deniedCidrs: []
+  dnsNamespace: kube-system
+  dnsLabels:
+    k8s-app: kube-dns

@@ -58,6 +58,10 @@ flowchart LR
 | **Files and rendering** | Execution-scoped upload/download handling, screenshots, and Chinese/Emoji font support |
 | **Chrome extensions** | Load trusted unpacked extensions from a read-only mounted directory on each browser launch |
 
+## Managed Docker workers
+
+For a controller that creates one private Docker worker per execution, see [managed Docker setup](./docs/managed-docker.md). Managed mode is an internal-only preview with temporary Profiles; local mode remains the default.
+
 ## Local Chrome extensions
 
 Add the following settings to your existing sandboxed Compose service:
@@ -136,3 +140,7 @@ These controlled fixtures are regression guards, not production SLAs or proof th
 ## License
 
 The code in this repository is licensed under [MIT](./LICENSE). Browserless, CloakBrowser, and their browser binaries remain subject to their respective licenses. This repository's license does not grant rights to redistribute upstream binaries or operate an upstream-based hosted offering; verify the applicable terms for your distribution and deployment.
+
+## Kubernetes controller
+
+See [Kubernetes installation and operation](./docs/kubernetes.md) for the controller-only Helm chart, worker template, NetworkPolicy, drain and uninstall behavior. This backend builds on the controller/worker delivery and currently supports temporary Profiles; durable storage and restart binding recovery are separate slices.
