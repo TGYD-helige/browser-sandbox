@@ -102,7 +102,10 @@ test("Kubernetes creates an owned single-execution Pod and fences deletion by UI
   assert.deepEqual(deleted.preconditions, { uid: "pod-uid" });
 });
 
-async function fixture(t, { pending = false, deleteRace = false, createStatus } = {}) {
+async function fixture(
+  t,
+  { pending = false, deleteRace = false, createStatus, waitingReason } = {},
+) {
   const state = {
     pod: undefined,
     deleted: false,
@@ -152,13 +155,19 @@ async function fixture(t, { pending = false, deleteRace = false, createStatus } 
             ...state.pod.metadata,
             uid: state.replacement ? "replacement" : "original",
           },
-          status: pending
-            ? { phase: "Pending" }
-            : {
-                phase: "Running",
-                podIP: "10.42.1.4",
-                conditions: [{ type: "Ready", status: "True" }],
-              },
+          status:
+            pending || waitingReason
+              ? {
+                  phase: "Pending",
+                  containerStatuses: waitingReason
+                    ? [{ state: { waiting: { reason: waitingReason } } }]
+                    : [],
+                }
+              : {
+                  phase: "Running",
+                  podIP: "10.42.1.4",
+                  conditions: [{ type: "Ready", status: "True" }],
+                },
         }),
       );
       state.observed?.();
@@ -264,3 +273,14 @@ test("matching labels and Pod UID cannot authorize deletion under a foreign owne
   );
   assert.equal(state.deleted, false);
 });
+
+for (const reason of ["CreateContainerError", "RunContainerError"]) {
+  test(`Kubernetes fails creation promptly for ${reason}`, async (t) => {
+    const { backend, state } = await fixture(t, { waitingReason: reason });
+    await assert.rejects(
+      backend.create({ executionId, incarnation }, AbortSignal.timeout(1000)),
+      { message: "browser_worker_start_failed" },
+    );
+    assert.equal(state.deleted, true);
+  });
+}

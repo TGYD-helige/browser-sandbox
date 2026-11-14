@@ -8,9 +8,9 @@ import yaml
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 
-def render(*arguments):
+def render(*arguments, release="trial"):
     output = subprocess.check_output([
-        "helm", "template", "trial", str(ROOT / "charts/browser-sandbox"),
+        "helm", "template", release, str(ROOT / "charts/browser-sandbox"),
         "--namespace", "browser-test", "--set", "networkPolicy.apiServerCidrs[0]=10.43.0.1/32", "--set", "image.digest=sha256:" + "a" * 64,
         *arguments,
     ], text=True)
@@ -18,6 +18,16 @@ def render(*arguments):
 
 
 class ChartTest(unittest.TestCase):
+    def test_invalid_release_names_fail_at_render_time(self):
+        for release in ["a.b", "a" * 49 + "--aa"]:
+            with self.subTest(release=release):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    render(release=release)
+        for release in ["trial", "a" * 53]:
+            with self.subTest(release=release):
+                resources = render(release=release)
+                self.assertTrue(any(item["kind"] == "Deployment" for item in resources))
+
     def test_only_controller_is_a_workload(self):
         resources = render()
         workloads = [item for item in resources if not item["metadata"].get("annotations", {}).get("helm.sh/hook") and item["kind"] in
@@ -67,6 +77,9 @@ class ChartTest(unittest.TestCase):
         hook = next(item for item in render() if item["kind"] == "Job")
         self.assertEqual(hook["metadata"]["annotations"]["helm.sh/hook"], "pre-delete")
         self.assertEqual(hook["spec"]["backoffLimit"], 0)
+        self.assertNotIn("ttlSecondsAfterFinished", hook["spec"])
+        self.assertEqual(hook["metadata"]["annotations"]["helm.sh/hook-delete-policy"],
+                         "before-hook-creation,hook-succeeded")
         container = hook["spec"]["template"]["spec"]["containers"][0]
         self.assertEqual(container["command"], ["node", "/opt/browser-sandbox/dist/kubernetes-drain-main.js"])
         self.assertEqual(container["securityContext"]["capabilities"]["drop"], ["ALL"])
