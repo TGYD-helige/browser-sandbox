@@ -247,6 +247,7 @@ try {
     "--overrides=" +
       JSON.stringify({
         spec: {
+          nodeName: server,
           automountServiceAccountToken: false,
           containers: [
             {
@@ -263,9 +264,15 @@ try {
       }),
   );
   await kubectl("wait", "--for=condition=Ready", "pod/host-storage", "--timeout=120s");
-  hostStorageAddress = JSON.parse(
+  const hostStoragePod = JSON.parse(
     await kubectl("get", "pod/host-storage", "-o", "json"),
-  ).status.podIP;
+  );
+  assert.notEqual(
+    hostStoragePod.spec.nodeName,
+    workerNode,
+    "Host archive fixture must remain off the drain target",
+  );
+  hostStorageAddress = hostStoragePod.status.podIP;
   const values = join(directory, "values.json");
   await writeFile(
     values,
