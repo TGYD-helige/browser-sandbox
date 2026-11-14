@@ -586,3 +586,19 @@ test("revoked recovered bindings do not consume the live access grant quota", as
     200,
   );
 });
+
+test("recovery finalizes an execution when discovery confirms its worker disappeared", async (t) => {
+  const f = await fixture(t);
+  const first = await f.start({ reconciliationMs: 60000 });
+  const executionId = randomUUID();
+  const endpoint = await first.command({ op: "register", executionId });
+  await fetch(fileUrl(first, endpoint));
+  await first.stop();
+  f.resources.clear();
+  const second = await f.start({ reconciliationMs: 60000 });
+  await second.reconcile();
+  const status = await second.command({ op: "controller_status", executionId });
+  assert.equal(status.execution.phase, "finished");
+  assert.equal(second.capacity().workers, 0);
+  assert.equal(f.created, 1);
+});
