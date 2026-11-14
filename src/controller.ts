@@ -53,6 +53,7 @@ export interface ExecutionBinding {
   recoveryAttempts?: number;
   recovered?: boolean;
   generation?: string;
+  workerProtocol?: string;
   cleanupUnconfirmed?: boolean;
   infrastructureOnly?: boolean;
   checkedAt?: number;
@@ -131,7 +132,7 @@ export async function createController(options: ControllerOptions) {
       throw Error("browser_controller_deadline_invalid");
   const profileLeases = new Map<string, { executionId: string; incarnation: string }>();
   let recoveredProfiles = false;
-  let recovering: Promise<void> | undefined;
+  let recovering: Promise<ManagedWorker[]> | undefined;
   const localLease = (lease: { executionId: string; incarnation: string }) => {
     const binding = bindings.get(lease.executionId);
     return (
@@ -139,54 +140,59 @@ export async function createController(options: ControllerOptions) {
       (!binding.recovered || binding.phase === "registered")
     );
   };
-  const recoverProfiles = (profileId?: string) => {
+  const recoverProfiles = async (profileId?: string, owningExecutionId?: string) => {
     const leases = profileId
       ? [profileLeases.get(profileId)].filter(Boolean)
       : [...profileLeases.values()];
     if (recoveredProfiles && !leases.some((lease) => !localLease(lease)))
       return Promise.resolve();
-    return (recovering ??= (async () => {
-      if (!options.backend.list) throw Error("browser_profile_leases_unavailable");
-      const workers = await options.backend.list(AbortSignal.timeout(30000));
-      const recovered = new Map<string, ManagedWorker>();
-      for (const worker of workers) {
-        if (
-          !worker.profileId ||
-          worker.infrastructureOnly ||
-          finished.has(worker.executionId)
-        )
-          continue;
-        if (!validProfileId(worker.profileId) || recovered.has(worker.profileId))
-          throw Error("browser_profile_lease_recovery_failed");
-        recovered.set(worker.profileId, worker);
+    if (!options.backend.list) throw Error("browser_profile_leases_unavailable");
+    // Share discovery, while finalization stays in each execution's own operation.
+    const workers = await (recovering ??= options.backend
+      .list(AbortSignal.timeout(30000))
+      .finally(() => {
+        recovering = undefined;
+      }));
+    const recovered = new Map<string, ManagedWorker>();
+    for (const worker of workers) {
+      if (
+        !worker.profileId ||
+        worker.infrastructureOnly ||
+        finished.has(worker.executionId)
+      )
+        continue;
+      if (!validProfileId(worker.profileId) || recovered.has(worker.profileId))
+        throw Error("browser_profile_lease_recovery_failed");
+      recovered.set(worker.profileId, worker);
+    }
+    for (const [id, worker] of recovered) {
+      const lease = profileLeases.get(id);
+      if (lease && localLease(lease) && lease.incarnation !== worker.incarnation)
+        throw Error("browser_profile_lease_recovery_failed");
+    }
+    for (const [id, lease] of profileLeases) {
+      if (profileId && id !== profileId) continue;
+      const binding = bindings.get(lease.executionId);
+      if (!localLease(lease) && binding?.recovered && !recovered.has(id)) {
+        adoptRecoveredWorker(binding, undefined);
+        binding.stopConfirmed = true;
+        binding.cleanupUnconfirmed = false;
+        binding.finalResult ??= { stopped: true, used: true, graceful: false };
+        binding.phase = "cleanup-pending";
+        const finish = { op: "finalize", executionId: binding.executionId };
+        if (binding.executionId === owningExecutionId) await dispatch(finish);
+        else await command(finish);
       }
-      for (const [id, worker] of recovered) {
-        const lease = profileLeases.get(id);
-        if (lease && localLease(lease) && lease.incarnation !== worker.incarnation)
-          throw Error("browser_profile_lease_recovery_failed");
-      }
-      for (const [id, lease] of profileLeases) {
-        const binding = bindings.get(lease.executionId);
-        if (!localLease(lease) && binding?.recovered && !recovered.has(id)) {
-          adoptRecoveredWorker(binding, undefined);
-          binding.stopConfirmed = true;
-          binding.cleanupUnconfirmed = false;
-          binding.finalResult ??= { stopped: true, used: true, graceful: false };
-          binding.phase = "cleanup-pending";
-          await command({ op: "finalize", executionId: binding.executionId });
-        }
-      }
-      // Only a successful authoritative read can release recovered occupancy.
-      for (const [id, lease] of profileLeases)
-        if (!localLease(lease)) profileLeases.delete(id);
-      for (const [id, worker] of recovered) {
-        const lease = profileLeases.get(id);
-        if (!lease) profileLeases.set(id, worker);
-      }
-      recoveredProfiles = true;
-    })().finally(() => {
-      recovering = undefined;
-    }));
+    }
+    // Only a successful authoritative read can release recovered occupancy.
+    for (const [id, lease] of profileLeases)
+      if ((!profileId || id === profileId) && !localLease(lease))
+        profileLeases.delete(id);
+    for (const [id, worker] of recovered) {
+      const lease = profileLeases.get(id);
+      if (!lease) profileLeases.set(id, worker);
+    }
+    recoveredProfiles = true;
   };
   let closing = false;
   let stopped = false;
@@ -244,6 +250,7 @@ export async function createController(options: ControllerOptions) {
           }
         : undefined,
       generation: binding.generation,
+      workerProtocol: binding.workerProtocol ?? WORKER_PROTOCOL,
       cleanupUnconfirmed: binding.cleanupUnconfirmed,
       recoveryAttempts: binding.recoveryAttempts,
       recoveryError: binding.recoveryError,
@@ -638,13 +645,14 @@ export async function createController(options: ControllerOptions) {
       throw Error("browser_worker_ownership_mismatch");
     if (binding.worker === worker) return;
     binding.storageConnection?.close();
+    binding.storageConnection = undefined;
     closeWorkerChannel(binding.worker);
     binding.worker = worker;
     binding.starting = worker ? Promise.resolve(worker) : undefined;
   }
   function closeUnusedDiscovery(workers: ManagedWorker[]) {
-    const live = new Set([...bindings.values()].map((binding) => binding.worker));
-    for (const worker of workers) if (!live.has(worker)) closeWorkerChannel(worker);
+    const live = new Set([...bindings.values()].map((binding) => binding.worker?.id));
+    for (const worker of workers) if (!live.has(worker.id)) closeWorkerChannel(worker);
   }
   async function checkGeneration(binding: ExecutionBinding, signal?: AbortSignal) {
     const status = await binding.worker.runtime.request<any>(
@@ -707,8 +715,10 @@ export async function createController(options: ControllerOptions) {
     if (!binding.starting) {
       const attempt = { abort: new AbortController(), waiters: 0 };
       binding.creation = attempt;
+      binding.recovered = false;
       binding.creationFailure = undefined;
       binding.incarnation = randomUUID();
+      binding.workerProtocol = WORKER_PROTOCOL;
       const queuedSignal = AbortSignal.any([binding.life.signal, attempt.abort.signal]);
       const startedAt = performance.now();
       event(binding, "creating");
@@ -726,7 +736,7 @@ export async function createController(options: ControllerOptions) {
               incarnation: binding.incarnation,
               profileId: binding.profileId,
               allowedDomains: binding.allowedDomains,
-              automation: automationCallbacks(binding),
+              automation: binding.host ? automationCallbacks(binding) : undefined,
             },
             creationSignal,
           );
@@ -851,7 +861,7 @@ export async function createController(options: ControllerOptions) {
     if (request?.op === "profile_delete") {
       if (!validProfileId(request.profileId) || !options.profileStore)
         throw Error("browser_profile_storage_unavailable");
-      await recoverProfiles(request.profileId);
+      await recoverProfiles(request.profileId, request.executionId);
       if (profileLeases.has(request.profileId)) throw Error("browser_profile_busy");
       return { deleted: await options.profileStore.delete(request.profileId, signal) };
     }
@@ -895,7 +905,7 @@ export async function createController(options: ControllerOptions) {
       if (request.profileId) {
         if (!hostStorage && !options.profileStore)
           throw Error("browser_profile_storage_unavailable");
-        await recoverProfiles(request.profileId);
+        await recoverProfiles(request.profileId, request.executionId);
         signal.throwIfAborted();
         binding = bindings.get(id);
         if (closing || finished.has(id) || (binding?.revoked && !storageReconnect))
@@ -1139,12 +1149,8 @@ export async function createController(options: ControllerOptions) {
     return result;
   }
   const mutations = new Map<string, Promise<unknown>>();
-  function command(request: any, peer?: ControlPeer, signal?: AbortSignal) {
-    if (request?.op === "controller_status") return dispatch(request, peer, signal);
-    const id = request?.executionId;
-    const work = (mutations.get(id) ?? Promise.resolve()).then(() =>
-      dispatch(request, peer, signal),
-    );
+  function serializeExecution<T>(id: string, action: () => Promise<T>): Promise<T> {
+    const work = (mutations.get(id) ?? Promise.resolve()).then(action);
     const settled = work
       .catch(() => {})
       .finally(() => {
@@ -1152,6 +1158,12 @@ export async function createController(options: ControllerOptions) {
       });
     mutations.set(id, settled);
     return work;
+  }
+  function command(request: any, peer?: ControlPeer, signal?: AbortSignal) {
+    if (request?.op === "controller_status") return dispatch(request, peer, signal);
+    return serializeExecution(request?.executionId, () =>
+      dispatch(request, peer, signal),
+    );
   }
   const controlServer = createServer((_req, res) => res.writeHead(404).end());
   controlServer.on("upgrade", (req, socket) => {
@@ -1351,6 +1363,8 @@ export async function createController(options: ControllerOptions) {
             stopConfirmed: data.stopConfirmed,
             finalResult: data.finalResult,
             generation: data.generation,
+            // Journal v1 originally described worker protocol v1.
+            workerProtocol: data.workerProtocol ?? "browser-sandbox.worker/v1",
             cleanupUnconfirmed: data.cleanupUnconfirmed,
             recoveryAttempts: data.recoveryAttempts,
             recoveryError: data.recoveryError,
@@ -1380,6 +1394,8 @@ export async function createController(options: ControllerOptions) {
             binding.starting = Promise.resolve(worker);
             binding.slot = admission.restore();
             try {
+              if (!binding.stopConfirmed && binding.workerProtocol !== WORKER_PROTOCOL)
+                throw Error("browser_worker_protocol_unsupported");
               worker.runtime.setAutomation?.(automationCallbacks(binding));
               if (!binding.stopConfirmed && data.phase !== "recovery-blocked")
                 await attachWorkerStorage(binding, AbortSignal.timeout(10000));
@@ -1410,6 +1426,7 @@ export async function createController(options: ControllerOptions) {
               binding.revoked = true;
               binding.phase = "recovery-required";
               binding.recoveryError = errorCode(error);
+              binding.statusError = binding.recoveryError;
             }
           } else if (data.phase !== "registered") {
             binding.revoked = true;
@@ -1494,6 +1511,8 @@ export async function createController(options: ControllerOptions) {
             { op: "worker_status", executionId: worker.executionId },
             { timeoutMs: 10000 },
           );
+          if (typeof status.protocol === "string")
+            binding.workerProtocol = status.protocol;
           if (status.protocol !== WORKER_PROTOCOL)
             throw Error("browser_worker_protocol_unsupported");
           binding.phase = "finalizing";
@@ -1511,143 +1530,173 @@ export async function createController(options: ControllerOptions) {
   function reconcile(): Promise<void> {
     const run = async () => {
       if (closing) return;
-      let discovered: Promise<ManagedWorker[]> | undefined;
-      const recoveryWorkers = () =>
-        (discovered ??= options.backend.list(AbortSignal.timeout(30000)));
       for (const binding of [...bindings.values()]) {
         if (closing) break;
-        try {
-          if (binding.revoked || binding.cleanupUnconfirmed) {
-            if (binding.phase === "recovery-blocked") continue;
-            if (binding.recoveryError === "browser_worker_protocol_unsupported") {
-              // Preserve the durable descriptor and grants so a compatible controller can roll back.
-              binding.phase = "recovery-blocked";
-              event(binding, "recovery-blocked", { error: binding.recoveryError });
-              continue;
-            }
-            binding.recoveryAttempts = Math.min(3, (binding.recoveryAttempts ?? 0) + 1);
-            await persist(binding, "recovery-attempt");
-            if (options.backend.list) {
-              const worker = (await recoveryWorkers()).find(
-                (worker) =>
-                  worker.executionId === binding.executionId &&
-                  worker.incarnation === binding.incarnation,
-              );
-              if (!worker) {
-                adoptRecoveredWorker(binding, undefined);
-                binding.cleanupUnconfirmed = false;
-                binding.stopConfirmed = true;
-                binding.finalResult ??= { stopped: true, used: true, graceful: false };
-                binding.phase = "cleanup-pending";
-              } else if (
-                !binding.cleanupUnconfirmed &&
-                !binding.stopConfirmed &&
-                binding.recoveryError !== "browser_worker_protocol_unsupported"
-              ) {
-                adoptRecoveredWorker(binding, worker);
-                try {
-                  worker.runtime.setAutomation?.(automationCallbacks(binding));
-                  const status = await worker.runtime.request<any>(
-                    { op: "worker_status", executionId: binding.executionId },
-                    { timeoutMs: 10000 },
-                  );
-                  if (status.protocol !== WORKER_PROTOCOL)
-                    throw Error("browser_worker_protocol_unsupported");
-                  await attachWorkerStorage(binding, AbortSignal.timeout(10000));
-                  await command({ op: "finalize", executionId: binding.executionId });
-                } catch (error) {
-                  if (
-                    !binding.profileId &&
-                    binding.recoveryAttempts >= 3 &&
-                    errorCode(error) !== "browser_worker_protocol_unsupported"
-                  ) {
-                    try {
-                      await removeWorker(worker, AbortSignal.timeout(30000));
-                    } catch (cleanup) {
-                      throw new WorkerCleanupFailure(error, cleanup);
-                    }
-                    binding.worker = undefined;
-                    binding.starting = undefined;
-                    binding.cleanupUnconfirmed = false;
-                    binding.stopConfirmed = true;
-                    binding.finalResult = {
-                      stopped: true,
-                      used: true,
-                      graceful: false,
-                    };
-                    binding.phase = "cleanup-pending";
-                    await command({ op: "finalize", executionId: binding.executionId });
-                  } else throw error;
-                }
-                continue;
+        await serializeExecution(binding.executionId, async () => {
+          if (closing || bindings.get(binding.executionId) !== binding) return;
+          let discovered: ManagedWorker[] | undefined;
+          try {
+            if (binding.revoked || binding.cleanupUnconfirmed) {
+              if (binding.phase === "recovery-blocked") return;
+              if (binding.recoveryError === "browser_worker_protocol_unsupported") {
+                // Preserve the durable descriptor and grants so a compatible controller can roll back.
+                binding.phase = "recovery-blocked";
+                event(binding, "recovery-blocked", { error: binding.recoveryError });
+                return;
               }
+              binding.recoveryAttempts = Math.min(
+                3,
+                (binding.recoveryAttempts ?? 0) + 1,
+              );
+              await persist(binding, "recovery-attempt");
+              if (options.backend.list) {
+                discovered = await options.backend.list(AbortSignal.timeout(30000));
+                const worker = discovered.find(
+                  (worker) =>
+                    worker.executionId === binding.executionId &&
+                    worker.incarnation === binding.incarnation,
+                );
+                if (!worker) {
+                  adoptRecoveredWorker(binding, undefined);
+                  binding.cleanupUnconfirmed = false;
+                  binding.stopConfirmed = true;
+                  binding.finalResult ??= {
+                    stopped: true,
+                    used: true,
+                    graceful: false,
+                  };
+                  binding.phase = "cleanup-pending";
+                } else if (
+                  !binding.cleanupUnconfirmed &&
+                  !binding.stopConfirmed &&
+                  binding.recoveryError !== "browser_worker_protocol_unsupported"
+                ) {
+                  const retryingSave = binding.phase === "finalizing";
+                  const sameResource =
+                    binding.worker?.id === worker.id &&
+                    worker.profileId === binding.profileId;
+                  const controlFailed =
+                    /^browser_control_(disconnected|unavailable|timeout)$/.test(
+                      binding.statusError ?? "",
+                    );
+                  if (!retryingSave || !sameResource || controlFailed)
+                    adoptRecoveredWorker(binding, worker);
+                  const currentWorker = binding.worker;
+                  try {
+                    currentWorker.runtime.setAutomation?.(automationCallbacks(binding));
+                    // A failed save has already revoked the worker's live session.
+                    if (!retryingSave) {
+                      const status = await currentWorker.runtime.request<any>(
+                        { op: "worker_status", executionId: binding.executionId },
+                        { timeoutMs: 10000 },
+                      );
+                      if (status.protocol !== WORKER_PROTOCOL)
+                        throw Error("browser_worker_protocol_unsupported");
+                    }
+                    if (!binding.storageConnection)
+                      await attachWorkerStorage(binding, AbortSignal.timeout(10000));
+                    await dispatch({
+                      op: "finalize",
+                      executionId: binding.executionId,
+                    });
+                  } catch (error) {
+                    if (
+                      !binding.profileId &&
+                      binding.recoveryAttempts >= 3 &&
+                      errorCode(error) !== "browser_worker_protocol_unsupported"
+                    ) {
+                      try {
+                        await removeWorker(currentWorker, AbortSignal.timeout(30000));
+                      } catch (cleanup) {
+                        throw new WorkerCleanupFailure(error, cleanup);
+                      }
+                      binding.worker = undefined;
+                      binding.starting = undefined;
+                      binding.cleanupUnconfirmed = false;
+                      binding.stopConfirmed = true;
+                      binding.finalResult = {
+                        stopped: true,
+                        used: true,
+                        graceful: false,
+                      };
+                      binding.phase = "cleanup-pending";
+                      await dispatch({
+                        op: "finalize",
+                        executionId: binding.executionId,
+                      });
+                    } else throw error;
+                  }
+                  return;
+                }
+              }
+              if (
+                binding.cleanupUnconfirmed ||
+                ["cleanup-pending", "finalizing"].includes(binding.phase) ||
+                binding.stopConfirmed
+              )
+                await dispatch({ op: "finalize", executionId: binding.executionId });
+              return;
             }
-            if (
-              binding.cleanupUnconfirmed ||
-              ["cleanup-pending", "finalizing"].includes(binding.phase) ||
-              binding.stopConfirmed
-            )
-              await command({ op: "finalize", executionId: binding.executionId });
-            continue;
-          }
-          const now = Date.now();
-          if (now - binding.registeredAt >= maxExecutionMs) {
-            binding.reclaimReason = "maximum-lifetime";
-            await command({ op: "finalize", executionId: binding.executionId });
-            continue;
-          }
-          if (now - binding.lastActivityAt < idleRegistrationMs || binding.creation)
-            continue;
-          if (!binding.worker) {
+            const now = Date.now();
+            if (now - binding.registeredAt >= maxExecutionMs) {
+              binding.reclaimReason = "maximum-lifetime";
+              await dispatch({ op: "finalize", executionId: binding.executionId });
+              return;
+            }
+            if (now - binding.lastActivityAt < idleRegistrationMs || binding.creation)
+              return;
+            if (!binding.worker) {
+              binding.reclaimReason = "idle";
+              await dispatch({ op: "finalize", executionId: binding.executionId });
+              return;
+            }
+            const status = await binding.worker.runtime.request<any>(
+              { op: "worker_status", executionId: binding.executionId },
+              { timeoutMs: 10000 },
+            );
+            binding.checkedAt = Date.now();
+            binding.statusError = undefined;
+            binding.idleProtection = workerIdleProtection(status, now);
+            if (binding.idleProtection) return;
             binding.reclaimReason = "idle";
-            await command({ op: "finalize", executionId: binding.executionId });
-            continue;
-          }
-          const status = await binding.worker.runtime.request<any>(
-            { op: "worker_status", executionId: binding.executionId },
-            { timeoutMs: 10000 },
-          );
-          binding.checkedAt = Date.now();
-          binding.statusError = undefined;
-          binding.idleProtection = workerIdleProtection(status, now);
-          if (binding.idleProtection) continue;
-          binding.reclaimReason = "idle";
-          await command({
-            op: "finalize",
-            executionId: binding.executionId,
-            ifIdle: true,
-            expectedGeneration: status.session.generation,
-          });
-        } catch (error) {
-          binding.checkedAt = Date.now();
-          binding.statusError = errorCode(error);
-          binding.idleProtection = "unknown";
-          if (
-            binding.revoked &&
-            binding.statusError === "browser_worker_protocol_unsupported"
-          ) {
-            binding.phase = "recovery-blocked";
-            binding.recoveryError = binding.statusError;
-            event(binding, "recovery-blocked", { error: binding.recoveryError });
-          } else if (
-            binding.revoked &&
-            binding.recoveryAttempts >= 3 &&
-            bindings.has(binding.executionId)
-          ) {
-            binding.phase = "recovery-blocked";
-            binding.recoveryError = binding.statusError;
-            try {
-              await persist(binding);
-            } catch {
-              binding.statusError = binding.recoveryError =
-                "browser_execution_journal_unavailable";
+            await dispatch({
+              op: "finalize",
+              executionId: binding.executionId,
+              ifIdle: true,
+              expectedGeneration: status.session.generation,
+            });
+          } catch (error) {
+            binding.checkedAt = Date.now();
+            binding.statusError = errorCode(error);
+            binding.idleProtection = "unknown";
+            if (
+              binding.revoked &&
+              binding.statusError === "browser_worker_protocol_unsupported"
+            ) {
+              binding.phase = "recovery-blocked";
+              binding.recoveryError = binding.statusError;
+              event(binding, "recovery-blocked", { error: binding.recoveryError });
+            } else if (
+              binding.revoked &&
+              binding.recoveryAttempts >= 3 &&
+              bindings.has(binding.executionId)
+            ) {
+              binding.phase = "recovery-blocked";
+              binding.recoveryError = binding.statusError;
+              try {
+                await persist(binding);
+              } catch {
+                binding.statusError = binding.recoveryError =
+                  "browser_execution_journal_unavailable";
+              }
+              event(binding, "recovery-blocked", { error: binding.recoveryError });
             }
-            event(binding, "recovery-blocked", { error: binding.recoveryError });
+            /* Unknown status or failed finalization retains resources and ownership. */
+          } finally {
+            if (discovered) closeUnusedDiscovery(discovered);
           }
-          /* Unknown status or failed finalization retains resources and ownership. */
-        }
+        });
       }
-      if (discovered) closeUnusedDiscovery(await discovered.catch(() => []));
     };
     reconciliation = reconciliation.then(run, run);
     return reconciliation;
@@ -1781,6 +1830,12 @@ function validateControllerRecord(data: any) {
     throw Error("browser_execution_journal_corrupt");
   };
   if (!data || typeof data !== "object" || Array.isArray(data)) invalid();
+  if (
+    data.workerProtocol !== undefined &&
+    (typeof data.workerProtocol !== "string" ||
+      !/^browser-sandbox\.worker\/v[1-9][0-9]{0,3}$/.test(data.workerProtocol))
+  )
+    invalid();
   if (
     data.recoveryError !== undefined &&
     (typeof data.recoveryError !== "string" ||

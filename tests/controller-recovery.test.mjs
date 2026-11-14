@@ -901,3 +901,165 @@ test("automatic temporary cleanup preserves status and deletion failures and clo
     f.backend.remove = remove;
   }
 });
+
+test("normal save retry does not require a live session after the worker has stopped", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1000 });
+  const f = await fixture(t);
+  const controller = await f.start({
+    profileStore: { open: () => ({ close: async () => {} }) },
+    maxExecutionMs: 100,
+    reconciliationMs: 60000,
+  });
+  const executionId = randomUUID();
+  const endpoint = await controller.command({
+    op: "register",
+    executionId,
+    profileId: "save-retry",
+  });
+  await fetch(fileUrl(controller, endpoint));
+  const worker = [...f.resources.values()][0];
+  const request = worker.runtime.request;
+  let stopped = false,
+    recover = false,
+    saves = 0;
+  worker.runtime.request = async (input) => {
+    if (input.op === "worker_status" && stopped)
+      throw Error("browser_execution_revoked");
+    if (input.op === "finalize") {
+      stopped = true;
+      saves++;
+      if (!recover) throw Error("browser_profile_storage_unavailable");
+    }
+    return request(input);
+  };
+  try {
+    t.mock.timers.tick(100);
+    await controller.reconcile();
+    assert.equal(saves, 1);
+    assert.equal(f.resources.size, 1);
+    recover = true;
+    await controller.reconcile();
+    assert.equal(saves, 2);
+    assert.equal(
+      (await controller.command({ op: "controller_status", executionId })).execution
+        .phase,
+      "finished",
+    );
+    assert.equal(f.resources.size, 0);
+  } finally {
+    worker.runtime.request = request;
+  }
+});
+
+test("concurrent Profile deletion and host reconnect do not deadlock recovered absence", {
+  timeout: 5000,
+}, async (t) => {
+  const f = await fixture(t);
+  const executionId = randomUUID(),
+    incarnation = randomUUID();
+  const worker = await f.backend.create({
+    executionId,
+    incarnation,
+    profileId: "absent-host",
+  });
+  const journal = await createExecutionJournal({
+    directory: f.directory,
+    installationId: "test",
+  });
+  await journal.create(executionId, {
+    phase: "finalizing",
+    incarnation,
+    profileId: "absent-host",
+    storageMode: "host",
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+    workerId: worker.id,
+  });
+  const controller = await f.start({
+    reconciliationMs: 60000,
+    profileStore: {
+      async delete() {
+        return true;
+      },
+    },
+  });
+  f.resources.clear();
+  const entered = Promise.withResolvers(),
+    release = Promise.withResolvers();
+  f.backend.list = async () => {
+    entered.resolve();
+    await release.promise;
+    return [];
+  };
+  const deletion = controller.command({
+    op: "profile_delete",
+    profileId: "absent-host",
+  });
+  await entered.promise;
+  const peer = { signal: new AbortController().signal };
+  const reconnect = controller.command(
+    { op: "storage_attach", executionId, profileId: "absent-host" },
+    peer,
+  );
+  const outcomes = Promise.allSettled([deletion, reconnect]);
+  await yieldTurn();
+  release.resolve();
+  let timer;
+  try {
+    const results = await Promise.race([
+      outcomes,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(Error("Profile recovery deadlocked")), 1000);
+      }),
+    ]);
+    assert.deepEqual(results[0], { status: "fulfilled", value: { deleted: true } });
+    assert.equal(results[1].status, "rejected");
+    assert.match(results[1].reason.message, /browser_execution_revoked/);
+  } finally {
+    clearTimeout(timer);
+    await controller.stop({ finalize: false });
+  }
+});
+
+test("an incompatible persisted worker protocol preserves a pending Profile save", async (t) => {
+  const f = await fixture(t);
+  const executionId = randomUUID(),
+    incarnation = randomUUID();
+  const worker = await f.backend.create({
+    executionId,
+    incarnation,
+    profileId: "pending-save",
+  });
+  const journal = await createExecutionJournal({
+    directory: f.directory,
+    installationId: "test",
+  });
+  await journal.create(executionId, {
+    phase: "finalizing",
+    incarnation,
+    profileId: "pending-save",
+    storageMode: "volume",
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+    workerId: worker.id,
+    workerProtocol: "browser-sandbox.worker/v2",
+  });
+  const original = await readFile(join(f.directory, `${executionId}.json`), "utf8");
+  const controller = await f.start({
+    reconciliationMs: 60000,
+    profileStore: { open: () => ({ close: async () => {} }) },
+  });
+  await controller.reconcile();
+  const status = await controller.command({ op: "controller_status", executionId });
+  assert.equal(status.execution.phase, "recovery-blocked");
+  assert.equal(status.execution.statusError, "browser_worker_protocol_unsupported");
+  assert.equal(f.resources.size, 1);
+  assert.equal(
+    await readFile(join(f.directory, `${executionId}.json`), "utf8"),
+    original,
+  );
+});

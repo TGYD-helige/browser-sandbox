@@ -297,3 +297,98 @@ test("a recovered worker connection can attach the new controller's automation c
   await runtime.request({ op: "status", executionId: "recovered" });
   assert.equal(paused, "recovered");
 });
+
+test("reconciliation cannot replace a worker channel while host finalization is in flight", {
+  timeout: 5000,
+}, async (t) => {
+  const { createController } = await import("../dist/controller.js");
+  const { randomUUID } = await import("node:crypto");
+  const entered = Promise.withResolvers(),
+    release = Promise.withResolvers();
+  const worker = createServer((_req, res) => res.end("fixture"));
+  let finalizing = false,
+    overlaps = 0,
+    resource;
+  const control = createNetworkHostControl({
+    server: worker,
+    dispatch: async (request) => {
+      if (request.op === "register")
+        return {
+          cdpUrl: `ws://127.0.0.1:${worker.address().port}/execution/${"a".repeat(64)}`,
+          viewerToken: "b".repeat(64),
+        };
+      if (request.op === "worker_status")
+        return {
+          protocol: "browser-sandbox.worker/v1",
+          session: { state: "unused", connectedClients: 0 },
+          takeover: "automation",
+          pendingAuth: 0,
+        };
+      finalizing = true;
+      entered.resolve();
+      await release.promise;
+      finalizing = false;
+      return { stopped: true };
+    },
+  });
+  await new Promise((resolve) => worker.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    control.close();
+    worker.closeAllConnections();
+    await new Promise((resolve) => worker.close(resolve));
+  });
+  const origin = `http://127.0.0.1:${worker.address().port}`;
+  const controller = await createController({
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      async create(placement) {
+        resource = {
+          ...placement,
+          id: "worker",
+          origin,
+          runtime: createControllerRuntime(origin),
+        };
+        return resource;
+      },
+      async list() {
+        if (finalizing) overlaps++;
+        return resource
+          ? [{ ...resource, runtime: createControllerRuntime(origin) }]
+          : [];
+      },
+      async remove() {
+        resource = undefined;
+      },
+    },
+  });
+  t.after(() => controller.stop());
+  const runtime = createControllerRuntime(controller.controlOrigin);
+  t.after(() => runtime.close());
+  const executionId = randomUUID();
+  const endpoint = await runtime.request({ op: "register", executionId });
+  await fetch(endpoint.wsEndpoint.replace("ws:", "http:") + "/files/test");
+  const finished = runtime.request({ op: "finalize", executionId }).then(
+    (value) => ({ value }),
+    (error) => ({ error }),
+  );
+  await entered.promise;
+  const pass = controller.reconcile();
+  try {
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      overlaps,
+      0,
+      "Background discovery overlapped the active finalization",
+    );
+    release.resolve();
+    const result = await finished;
+    assert.ifError(result.error);
+    assert.equal(result.value.stopped, true);
+    await pass;
+  } finally {
+    release.resolve();
+    await finished;
+    await pass.catch(() => {});
+  }
+});

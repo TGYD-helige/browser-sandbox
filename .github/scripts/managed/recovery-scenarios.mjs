@@ -298,7 +298,8 @@ try {
         "Failed save did not retain ownership",
         () => status(abandoned.handle.executionId),
         (value) =>
-          value.execution.phase === "finalizing" &&
+          value.execution.phase === "recovery-blocked" &&
+          value.execution.recoveryAttempts === 3 &&
           value.execution.statusError === "browser_profile_storage_unavailable",
         limits.maxExecutionMs + 60000,
       );
@@ -307,6 +308,7 @@ try {
       await assert.rejects(sessions.open(options), /browser_profile_busy/);
       assert.equal((await status()).workers, 1);
       failSave = false;
+      await abandoned.handle.finalize();
     }
     const completed = await wait(
       "Maximum lifetime did not finalize Profile",
