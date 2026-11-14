@@ -62,6 +62,7 @@ test("Kubernetes creates an owned single-execution Pod and fences deletion by UI
     installation: "trial",
     image: `amaster/browser-sandbox@sha256:${"a".repeat(64)}`,
     environment: { TIMEOUT: "10000", PRIVATE_SECRET: "never-project" },
+    maxExecutionMs: 20000,
     template: {
       securityContext: {
         seccompProfile: { type: "Localhost", localhostProfile: "browser-sandbox.json" },
@@ -76,7 +77,7 @@ test("Kubernetes creates an owned single-execution Pod and fences deletion by UI
   assert.equal(worker.origin, "http://10.42.1.4:8081");
   assert.equal(pod.spec.restartPolicy, "Never");
   assert.equal(pod.spec.automountServiceAccountToken, false);
-  assert(pod.spec.activeDeadlineSeconds >= 70);
+  assert.equal(pod.spec.activeDeadlineSeconds, 380);
   assert.deepEqual(pod.metadata.ownerReferences, [
     {
       apiVersion: "v1",
@@ -112,6 +113,10 @@ async function fixture(
     replacement: false,
     observed: undefined,
     podReads: 0,
+    listOwner: "release-uid",
+    listFailure: false,
+    statusOverride: undefined,
+    quota: false,
   };
   const server = createServer(async (request, response) => {
     const chunks = [];
@@ -130,11 +135,36 @@ async function fixture(
           },
         }),
       );
+    } else if (request.url.includes("/pods?")) {
+      if (state.listFailure) response.writeHead(503).end("{}");
+      else
+        response.end(
+          JSON.stringify({
+            metadata: {},
+            items: [
+              {
+                ...state.pod,
+                metadata: {
+                  ...state.pod.metadata,
+                  ownerReferences: state.pod.metadata.ownerReferences.map((owner) => ({
+                    ...owner,
+                    uid: state.listOwner,
+                  })),
+                },
+                status: { phase: "Running", podIP: "10.42.1.4" },
+              },
+            ],
+          }),
+        );
     } else if (request.method === "POST") {
-      if (createStatus) {
-        response
-          .writeHead(createStatus)
-          .end(JSON.stringify({ message: "private admission diagnostic" }));
+      if (createStatus || state.quota) {
+        response.writeHead(createStatus ?? 403).end(
+          JSON.stringify({
+            message: state.quota
+              ? "exceeded quota: test"
+              : "private admission diagnostic",
+          }),
+        );
         return;
       }
       state.pod = { ...body, metadata: { ...body.metadata, uid: "original" } };
@@ -156,7 +186,8 @@ async function fixture(
             uid: state.replacement ? "replacement" : "original",
           },
           status:
-            pending || waitingReason
+            state.statusOverride ??
+            (pending || waitingReason
               ? {
                   phase: "Pending",
                   containerStatuses: waitingReason
@@ -167,7 +198,7 @@ async function fixture(
                   phase: "Running",
                   podIP: "10.42.1.4",
                   conditions: [{ type: "Ready", status: "True" }],
-                },
+                }),
         }),
       );
       state.observed?.();
@@ -279,7 +310,7 @@ for (const reason of ["CreateContainerError", "RunContainerError"]) {
     const { backend, state } = await fixture(t, { waitingReason: reason });
     await assert.rejects(
       backend.create({ executionId, incarnation }, AbortSignal.timeout(1000)),
-      { message: "browser_worker_start_failed" },
+      { message: "browser_worker_configuration_invalid" },
     );
     assert.equal(state.deleted, true);
   });
@@ -371,4 +402,68 @@ test("Kubernetes discovery retains Profile ownership from labels and annotations
     backend.list(AbortSignal.timeout(5000)),
     /browser_worker_discovery_failed/,
   );
+});
+test("Kubernetes discovery recovers exact UID and rejects foreign release ownership or failed reads", async (t) => {
+  const { backend, state } = await fixture(t);
+  const original = await backend.create(
+    { executionId, incarnation },
+    AbortSignal.timeout(5000),
+  );
+  t.after(() => original.runtime.close());
+  const workers = await backend.list(AbortSignal.timeout(5000));
+  t.after(() => {
+    for (const worker of workers) worker.runtime.close();
+  });
+  assert.equal(workers[0].id, original.id);
+  assert.equal(workers[0].incarnation, incarnation);
+  state.listOwner = "foreign-release";
+  await assert.rejects(
+    backend.list(AbortSignal.timeout(5000)),
+    /browser_worker_discovery_failed/,
+  );
+  state.listFailure = true;
+  await assert.rejects(
+    backend.list(AbortSignal.timeout(5000)),
+    /browser_kubernetes_operation_failed/,
+  );
+  assert.equal(state.deleted, false);
+});
+
+test("unschedulable and image-pull failures return explicit errors after owned cleanup", async (t) => {
+  for (const [status, code] of [
+    [
+      {
+        phase: "Pending",
+        conditions: [
+          { type: "PodScheduled", status: "False", reason: "Unschedulable" },
+        ],
+      },
+      /browser_worker_unschedulable/,
+    ],
+    [
+      {
+        phase: "Pending",
+        containerStatuses: [{ state: { waiting: { reason: "ImagePullBackOff" } } }],
+      },
+      /browser_worker_image_unavailable/,
+    ],
+  ]) {
+    const { backend, state } = await fixture(t, { pending: true });
+    state.statusOverride = status;
+    await assert.rejects(
+      backend.create({ executionId, incarnation }, AbortSignal.timeout(5000)),
+      code,
+    );
+    assert.equal(state.deleted, true);
+  }
+});
+test("Kubernetes quota rejection reports the cause without allocating a Pod", async (t) => {
+  const { backend, state } = await fixture(t);
+  state.quota = true;
+  await assert.rejects(
+    backend.create({ executionId, incarnation }, AbortSignal.timeout(5000)),
+    /browser_worker_quota_exceeded/,
+  );
+  assert.equal(state.pod, undefined);
+  assert.equal(state.deleted, false);
 });

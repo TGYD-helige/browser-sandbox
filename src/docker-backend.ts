@@ -8,6 +8,7 @@ import {
   WORKER_ENVIRONMENT,
 } from "./managed-backend.js";
 import { createControllerRuntime } from "./network-control.js";
+import { WORKER_PROTOCOL } from "./worker-protocol.js";
 
 const prefix = "browser-sandbox.";
 export interface DockerBackendOptions {
@@ -37,10 +38,10 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
     throw error;
   };
   const labels = (executionId: string, incarnation: string, profileId = "") => ({
-    [prefix + "installation"]: options.installation,
-    [prefix + "execution"]: executionId,
-    [prefix + "incarnation"]: incarnation,
-    [prefix + "profile"]: profileId,
+    [`${prefix}installation`]: options.installation,
+    [`${prefix}execution`]: executionId,
+    [`${prefix}incarnation`]: incarnation,
+    [`${prefix}profile`]: profileId,
   });
   async function removeNetwork(
     network: string,
@@ -115,6 +116,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
           throw error;
         }
       };
+      let requestingImage = false;
       try {
         network = (
           await createResource("/networks/create", {
@@ -134,6 +136,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         const environment = WORKER_ENVIRONMENT.filter(
           (key) => options.environment?.[key] !== undefined,
         ).map((key) => `${key}=${options.environment[key]}`);
+        requestingImage = true;
         id = (
           await createResource(`/containers/create?name=${name}`, {
             Image: options.image,
@@ -142,13 +145,19 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
               ...environment,
               "CONCURRENT=1",
               "QUEUED=0",
+              `BROWSER_WORKER_PROTOCOL=${WORKER_PROTOCOL}`,
               `BROWSER_EXECUTION_ID=${placement.executionId}`,
               `BROWSER_WORKER_ORIGIN=http://${name}:8081`,
               ...(options.extensionsSource
                 ? ["BROWSER_EXTENSIONS_DIR=/browser-extensions"]
                 : []),
             ],
-            Labels: { ...expected, [prefix + "network"]: network },
+            Labels: {
+              ...expected,
+              [`${prefix}network`]: network,
+              [`${prefix}origin`]: `http://${name}:8081`,
+              [`${prefix}protocol`]: WORKER_PROTOCOL,
+            },
             HostConfig: {
               ...(options.extensionsSource
                 ? {
@@ -184,6 +193,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
             },
           })
         ).Id;
+        requestingImage = false;
         signal.throwIfAborted();
         await api(`/containers/${id}/start`, "POST", undefined, signal);
         const origin = `http://${name}:8081`;
@@ -226,50 +236,145 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         } catch (failure) {
           failures.push(failure);
         }
-        if (failures.length) throw new WorkerCleanupFailure(error, ...failures);
-        throw error;
+        const failure =
+          requestingImage && error.statusCode === 404
+            ? Error("browser_worker_image_unavailable", { cause: error })
+            : error;
+        if (failures.length) throw new WorkerCleanupFailure(failure, ...failures);
+        throw failure;
       }
     },
     async list(signal) {
-      const filters = encodeURIComponent(
-        JSON.stringify({ label: [prefix + "installation=" + options.installation] }),
+      const filter = encodeURIComponent(
+        JSON.stringify({ label: [`${prefix}installation=${options.installation}`] }),
       );
       const containers = await api(
-        `/containers/json?all=true&filters=${filters}`,
+        `/containers/json?all=true&filters=${filter}`,
         "GET",
         undefined,
         signal,
       );
-      if (!Array.isArray(containers)) throw Error("browser_worker_discovery_failed");
-      return containers.map((container) => {
-        const labels = container.Labels;
-        const executionId = labels?.[prefix + "execution"],
-          incarnation = labels?.[prefix + "incarnation"],
-          profileId = labels?.[prefix + "profile"];
-        if (
-          labels?.[prefix + "installation"] !== options.installation ||
-          !/^[a-f0-9-]{36}$/.test(executionId ?? "") ||
-          !/^[a-f0-9-]{36}$/.test(incarnation ?? "") ||
-          typeof profileId !== "string" ||
-          !/^[a-f0-9]{64}$/.test(container.Id ?? "")
-        )
-          throw Error("browser_worker_discovery_failed");
-        const origin = `http://bs-${incarnation}:8081`;
-        let runtime: ReturnType<typeof createControllerRuntime>;
-        return {
-          id: container.Id,
-          executionId,
-          incarnation,
-          profileId: profileId || undefined,
-          origin,
-          get runtime() {
-            return (runtime ??= createControllerRuntime(origin));
-          },
-        };
-      });
+      if (!Array.isArray(containers)) throw Error("browser_docker_response_invalid");
+      const controller = containers.length
+        ? await api(
+            `/containers/${options.controllerContainer}/json`,
+            "GET",
+            undefined,
+            signal,
+          )
+        : undefined;
+      const workers: ManagedWorker[] = [];
+      const accounted = new Set<string>();
+      try {
+        for (const item of containers) {
+          const state = await api(
+            `/containers/${item.Id}/json`,
+            "GET",
+            undefined,
+            signal,
+          );
+          const tags = state.Config?.Labels;
+          const executionId = tags?.[`${prefix}execution`],
+            incarnation = tags?.[`${prefix}incarnation`],
+            network = tags?.[`${prefix}network`],
+            profileId = tags?.[`${prefix}profile`] || undefined;
+          if (typeof tags?.[`${prefix}profile`] !== "string")
+            throw Error("browser_worker_discovery_failed");
+          if (
+            tags?.[`${prefix}installation`] !== options.installation ||
+            !/^[a-f0-9-]{36}$/.test(executionId ?? "") ||
+            !/^[a-f0-9-]{36}$/.test(incarnation ?? "") ||
+            !network
+          )
+            throw Error("browser_worker_ownership_mismatch");
+          const origin =
+            tags[`${prefix}origin`] ??
+            state.Config.Env?.find((value) =>
+              value.startsWith("BROWSER_WORKER_ORIGIN="),
+            )?.slice("BROWSER_WORKER_ORIGIN=".length);
+          if (!origin || !/^http:\/\/bs-[a-z0-9-]+:8081$/.test(origin))
+            throw Error("browser_worker_ownership_mismatch");
+          const net = await api(`/networks/${network}`, "GET", undefined, signal);
+          if (
+            !Object.entries(labels(executionId, incarnation, profileId)).every(
+              ([key, value]) => net.Labels?.[key] === value,
+            )
+          )
+            throw Error("browser_worker_ownership_mismatch");
+          if (!net.Containers?.[controller.Id])
+            await api(
+              `/networks/${network}/connect`,
+              "POST",
+              { Container: options.controllerContainer },
+              signal,
+            );
+          accounted.add(network);
+          networks.set(item.Id, network);
+          let runtime: ReturnType<typeof createControllerRuntime>;
+          workers.push({
+            id: item.Id,
+            executionId,
+            incarnation,
+            origin,
+            profileId,
+            get runtime() {
+              return (runtime ??= createControllerRuntime(origin));
+            },
+          });
+        }
+        const remaining = await api(
+          `/networks?filters=${filter}`,
+          "GET",
+          undefined,
+          signal,
+        );
+        if (!Array.isArray(remaining)) throw Error("browser_worker_discovery_failed");
+        for (const network of remaining) {
+          if (accounted.has(network.Id)) continue;
+          const tags = network.Labels;
+          const executionId = tags?.[`${prefix}execution`],
+            incarnation = tags?.[`${prefix}incarnation`],
+            profileId = tags?.[`${prefix}profile`] || undefined;
+          if (
+            tags?.[`${prefix}installation`] !== options.installation ||
+            !/^[a-f0-9-]{36}$/.test(executionId ?? "") ||
+            !/^[a-f0-9-]{36}$/.test(incarnation ?? "") ||
+            !/^[a-zA-Z0-9-]{1,128}$/.test(network.Id ?? "")
+          )
+            throw Error("browser_worker_ownership_mismatch");
+          workers.push({
+            id: `network/${network.Id}`,
+            executionId,
+            incarnation,
+            profileId,
+            origin: "",
+            infrastructureOnly: true,
+            runtime: {
+              request: async () => {
+                throw Error("browser_worker_unavailable");
+              },
+              attachStorage: async () => {
+                throw Error("browser_worker_unavailable");
+              },
+              close() {},
+            },
+          });
+        }
+        return workers;
+      } catch (error) {
+        for (const worker of workers) worker.runtime.close?.();
+        throw error;
+      }
     },
     async remove(worker: ManagedWorker, signal) {
       const expected = labels(worker.executionId, worker.incarnation, worker.profileId);
+      if (worker.infrastructureOnly) {
+        const [kind, network, extra] = worker.id.split("/");
+        if (kind !== "network" || extra || !/^[a-zA-Z0-9-]{1,128}$/.test(network ?? ""))
+          throw Error("browser_worker_ownership_mismatch");
+        await removeNetwork(network, expected, signal);
+        return;
+      }
       const state = await api(
         `/containers/${worker.id}/json`,
         "GET",

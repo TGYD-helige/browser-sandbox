@@ -524,6 +524,7 @@ for (const op of ["session", "storage_attach"]) {
       life.signal,
     );
     const rejected = assert.rejects(pending, /browser_control_timeout/);
+    await nextTurn();
     life.abort();
     await rejected;
     assert.equal(creationSignal.aborted, false);

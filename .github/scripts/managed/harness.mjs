@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { connectCdp } from "/project/dist/cdp.js";
 import { diagnoseScreenshot } from "./screenshot-diagnostics.mjs";
+import { selectScreenshotTab } from "./screenshot-tab.mjs";
 
 const home = await mkdtemp(join(tmpdir(), "managed-harness-"));
 const cli = join(
@@ -36,16 +37,18 @@ const call = async (...args) => {
         ],
         {
           env: { ...process.env, AGENT_BROWSER_SOCKET_DIR: home },
-          timeout: 30000,
+          // Let the native client's 30-second CDP deadline report its own failure.
+          timeout: 45000,
           maxBuffer: 2 * 1024 * 1024,
         },
       )
     ).stdout;
-  } catch {
+  } catch (error) {
     if (args[0] === "screenshot") {
       const report = await diagnoseScreenshot(
         process.env.BROWSER_WS_ENDPOINT,
         connectCdp,
+        error,
       ).catch(() => ({ error: "browser_screenshot_diagnostic_failed" }));
       console.error("managed_screenshot_diagnostics " + JSON.stringify(report));
     }
@@ -68,6 +71,7 @@ try {
   );
   await call("open", "data:text/html,<h1>Managed harness</h1>");
   await call("snapshot");
+  await selectScreenshotTab(call);
   const screenshot = join(home, "screenshot.png");
   await call("screenshot", screenshot);
   assert.equal(
