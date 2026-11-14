@@ -185,3 +185,90 @@ test("controller routes attached storage callbacks between the real host and wor
   await runtime.request({ op: "finalize", executionId });
   attachment.close();
 });
+
+test("duplicate attachment and repeated stale close preserve the current host adapter", async (t) => {
+  const server = createServer((_req, res) => res.end());
+  let attached = false;
+  const control = createNetworkHostControl({
+    server,
+    dispatch: async (request, peer, signal) => {
+      if (request.op === "storage_attach") {
+        if (attached) throw Error("browser_storage_already_attached");
+        attached = true;
+        return { attached: true };
+      }
+      if (request.op === "storage_detach") {
+        attached = false;
+        return { detached: true };
+      }
+      if (request.op === "probe")
+        return peer.callback("load", { executionId: "fixture" }, signal);
+      return {};
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    control.close();
+    return new Promise((resolve) => server.close(resolve));
+  });
+  const runtime = createControllerRuntime(`http://127.0.0.1:${server.address().port}`);
+  t.after(() => runtime.close());
+  const original = await runtime.attachStorage(
+    { executionId: "fixture" },
+    { load: async () => ({ marker: "original" }) },
+  );
+  await assert.rejects(
+    runtime.attachStorage(
+      { executionId: "fixture" },
+      { load: async () => ({ marker: "duplicate" }) },
+    ),
+    /browser_storage_already_attached/,
+  );
+  assert.deepEqual(await runtime.request({ op: "probe" }), { marker: "original" });
+  original.close();
+  await runtime.request({ op: "barrier" });
+  const next = await runtime.attachStorage(
+    { executionId: "fixture" },
+    { load: async () => ({ marker: "next" }) },
+  );
+  original.close();
+  assert.deepEqual(await runtime.request({ op: "probe" }), { marker: "next" });
+  next.close();
+});
+
+test("storage attachment cancellation reaches an in-flight worker handshake", {
+  timeout: 2000,
+}, async (t) => {
+  const entered = Promise.withResolvers(),
+    cancelled = Promise.withResolvers();
+  const server = createServer();
+  const control = createNetworkHostControl({
+    server,
+    dispatch: async (_request, _peer, signal) => {
+      entered.resolve();
+      await new Promise((resolve) =>
+        signal.addEventListener("abort", resolve, { once: true }),
+      );
+      cancelled.resolve();
+      signal.throwIfAborted();
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(async () => {
+    control.close();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const runtime = createControllerRuntime(`http://127.0.0.1:${server.address().port}`);
+  t.after(() => runtime.close());
+  const client = new AbortController();
+  const pending = runtime.attachStorage(
+    { executionId: "cancel" },
+    {},
+    { signal: client.signal },
+  );
+  const rejected = assert.rejects(pending, /browser_control_timeout/);
+  await entered.promise;
+  client.abort();
+  await rejected;
+  await cancelled.promise;
+});

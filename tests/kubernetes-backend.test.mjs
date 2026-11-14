@@ -264,3 +264,91 @@ test("matching labels and Pod UID cannot authorize deletion under a foreign owne
   );
   assert.equal(state.deleted, false);
 });
+
+test("Kubernetes discovery retains Profile ownership from labels and annotations without connecting", async (t) => {
+  let profileId = "account/a",
+    podIP = "10.42.1.4";
+  const server = createServer((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url.includes("/configmaps/")) {
+      res.end(
+        JSON.stringify({
+          metadata: {
+            uid: "owner",
+            labels: {
+              "app.kubernetes.io/name": "browser-sandbox",
+              "app.kubernetes.io/instance": "trial",
+            },
+          },
+        }),
+      );
+      return;
+    }
+    const query = new URL(req.url, "http://kubernetes").searchParams;
+    assert.equal(query.get("limit"), "100");
+    assert(
+      query.get("labelSelector").includes("browser-sandbox.io/installation=trial"),
+    );
+    res.end(
+      JSON.stringify({
+        metadata: {},
+        items: [
+          {
+            metadata: {
+              name: "owned-worker",
+              uid: "pod-uid",
+              annotations: { "browser-sandbox.io/profile-id": profileId },
+              labels: {
+                "app.kubernetes.io/name": "browser-sandbox",
+                "app.kubernetes.io/instance": "trial",
+                "app.kubernetes.io/component": "worker",
+                "browser-sandbox.io/installation": "trial",
+                "browser-sandbox.io/execution": executionId,
+                "browser-sandbox.io/incarnation": incarnation,
+                "browser-sandbox.io/profile":
+                  "6362e5401d83837484f78ac48a86da27a2bdddee9fb4cc5144f576c910cd33f",
+              },
+              ownerReferences: [
+                {
+                  apiVersion: "v1",
+                  kind: "ConfigMap",
+                  name: "trial-browser-workers",
+                  controller: true,
+                  uid: "owner",
+                },
+              ],
+            },
+            status: { podIP, phase: podIP ? "Running" : "Pending" },
+          },
+        ],
+      }),
+    );
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const backend = createKubernetesBackend({
+    apiServer: `http://127.0.0.1:${server.address().port}`,
+    namespace: "test",
+    ownerName: "trial-browser-workers",
+    installation: "trial",
+    image: `amaster/browser-sandbox@sha256:${"a".repeat(64)}`,
+    template: {
+      securityContext: {
+        seccompProfile: { type: "Localhost", localhostProfile: "browser-sandbox.json" },
+      },
+    },
+  });
+  const [worker] = await backend.list(AbortSignal.timeout(5000));
+  assert.equal(worker.profileId, "account/a");
+  assert.equal(worker.id, "owned-worker/pod-uid");
+  podIP = undefined;
+  const [pending] = await backend.list(AbortSignal.timeout(5000));
+  assert.equal(pending.profileId, "account/a");
+  assert.throws(() => pending.runtime, /browser_worker_not_ready/);
+  profileId = undefined;
+  await assert.rejects(
+    backend.list(AbortSignal.timeout(5000)),
+    /browser_worker_discovery_failed/,
+  );
+});

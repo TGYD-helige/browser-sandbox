@@ -60,7 +60,7 @@ flowchart LR
 
 ## Managed Docker workers
 
-For a controller that creates one private Docker worker per execution, see [managed Docker setup](./docs/managed-docker.md). Managed mode is an internal-only preview with temporary Profiles; local mode remains the default.
+For a controller that creates one private Docker worker per execution, see [managed Docker setup](./docs/managed-docker.md). Managed mode is an internal-only preview; it supports temporary Profiles and [persistent Profiles through host storage or a controller volume](./docs/profile-store.md). Local mode remains the default.
 
 ## Local Chrome extensions
 
@@ -143,4 +143,4 @@ The code in this repository is licensed under [MIT](./LICENSE). Browserless, Clo
 
 ## Kubernetes controller
 
-See [Kubernetes installation and operation](./docs/kubernetes.md) for the controller-only Helm chart, worker template, NetworkPolicy, drain and uninstall behavior. This backend builds on the controller/worker delivery and currently supports temporary Profiles; durable storage and restart binding recovery are separate slices.
+See [Kubernetes installation and operation](./docs/kubernetes.md) for the controller-only Helm chart, worker template, NetworkPolicy, drain and uninstall behavior. This backend supports temporary Profiles and an optional retained controller Profile-store PVC. Controller-wide Profile leases recover from worker metadata; live execution binding recovery and multi-controller operation remain separate concerns.

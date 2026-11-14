@@ -18,6 +18,7 @@ export interface BrowserRuntime {
   attachStorage(
     registration: Registration,
     adapter: StorageAdapter,
+    options?: { signal?: AbortSignal },
   ): ReturnType<typeof attachStorage>;
 }
 
@@ -40,8 +41,8 @@ export interface RuntimeProvider {
 export function createSocketRuntime(socketPath: string): BrowserRuntime {
   return {
     request: (request, options) => hostRequest(socketPath, request, options),
-    attachStorage: (registration, adapter) =>
-      attachStorage(socketPath, registration, adapter),
+    attachStorage: (registration, adapter, options) =>
+      attachStorage(socketPath, registration, adapter, options),
   };
 }
 
@@ -136,7 +137,9 @@ export function createBrowserSessions({
           registration.executorUid = takeUid();
         signal?.throwIfAborted();
         if (options.storage)
-          storage = await runtime.attachStorage(registration, options.storage);
+          storage = await runtime.attachStorage(registration, options.storage, {
+            signal,
+          });
         const { wsEndpoint } = await runtime.request<{ wsEndpoint: string }>(
           {
             op: "register",

@@ -237,16 +237,26 @@ export function createControllerRuntime(
   return {
     identity: "managed",
     request,
-    async attachStorage(registration: Registration, adapter: StorageAdapter) {
+    async attachStorage(
+      registration: Registration,
+      adapter: StorageAdapter,
+      options: { signal?: AbortSignal } = {},
+    ) {
+      if (storage.has(registration.executionId))
+        throw Error("browser_storage_already_attached");
       storage.set(registration.executionId, adapter);
       try {
-        await request({ op: "storage_attach", ...registration });
+        await request({ op: "storage_attach", ...registration }, options);
       } catch (error) {
         storage.delete(registration.executionId);
         throw error;
       }
+      let closed = false;
       return {
         close() {
+          if (closed) return;
+          closed = true;
+          if (storage.get(registration.executionId) !== adapter) return;
           storage.delete(registration.executionId);
           request({
             op: "storage_detach",

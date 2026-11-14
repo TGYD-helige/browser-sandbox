@@ -2,21 +2,23 @@ import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { release } from "node:os";
 import { createGateway } from "./gateway.js";
-import { attachStorage } from "./host-client.js";
 import { createBrowserLauncher } from "./launcher.js";
 import { createBrowserLimiter } from "./limiter.js";
 import { type ControlPeer, createNetworkHostControl } from "./network-control.js";
 import {
   installBrowserNetworkPolicy,
   installWorkerNetworkPolicy,
+  storageDestinations,
 } from "./network-policy.js";
 import { BROWSER_PRIVACY_ARGS } from "./privacy.js";
 import { verifyTarget } from "./probe.js";
+import { createWorkerStorage } from "./worker-storage.js";
 
 if (process.env.PORT !== "3001") throw Error("browser_internal_port_invalid");
 if (process.getuid() !== 0) throw Error("browser_provider_identity_required");
 installBrowserNetworkPolicy();
-if (process.argv[2] === "worker") installWorkerNetworkPolicy();
+if (process.argv[2] === "worker")
+  installWorkerNetworkPolicy(undefined, undefined, await storageDestinations());
 const [major, minor] = release().split(".").map(Number);
 if (major < 4 || (major === 4 && minor < 8)) throw Error("browser_kernel_unsupported");
 // Set before loading Browserless: the secret never enters execution environments.
@@ -125,6 +127,9 @@ try {
   await backend.stop();
   throw Error("browser_sandbox_probe_failed");
 }
+const workerStorage = createWorkerStorage(
+  process.env.BROWSER_CONTROL_SOCKET ?? "/run/browser-sandbox/control.sock",
+);
 const networkControl = workerExecutionId
   ? createNetworkHostControl({
       server: gateway.workerServer,
@@ -135,34 +140,8 @@ const networkControl = workerExecutionId
           controllerPeer = peer;
         if (request.op === "register")
           controllerAutomation = request.automation === true;
-        if (request.op === "storage_attach") {
-          const channel = await attachStorage(
-            process.env.BROWSER_CONTROL_SOCKET ?? "/run/browser-sandbox/control.sock",
-            { ...request, executorUid: 20001, existingOnly: true },
-            {
-              load: (callbackSignal) =>
-                peer.callback(
-                  "load",
-                  { executionId: workerExecutionId },
-                  callbackSignal,
-                ),
-              save: (callbackSignal) =>
-                peer.callback(
-                  "save",
-                  { executionId: workerExecutionId },
-                  callbackSignal,
-                ),
-              commit: (payload, callbackSignal) =>
-                peer.callback(
-                  "commit",
-                  { executionId: workerExecutionId, payload },
-                  callbackSignal,
-                ),
-            },
-          );
-          peer.signal.addEventListener("abort", () => channel.close(), { once: true });
-          return { attached: true };
-        }
+        const storageResult = await workerStorage(request, peer, signal);
+        if (storageResult) return storageResult;
         return gateway.workerCommand(request, signal);
       },
     })

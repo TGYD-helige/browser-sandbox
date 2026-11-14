@@ -80,12 +80,16 @@ export async function attachStorage(
   socketPath: string,
   registration: Registration,
   adapter: StorageAdapter,
+  options: { signal?: AbortSignal } = {},
 ) {
+  options.signal?.throwIfAborted();
   const socket = connect(socketPath + ".auth");
   const life = new AbortController();
   let input = "";
   const decoder = new StringDecoder("utf8");
   let ready = false;
+  const cancelAttachment = () => socket.destroy();
+  options.signal?.addEventListener("abort", cancelAttachment, { once: true });
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       socket.destroy();
@@ -165,7 +169,7 @@ export async function attachStorage(
           );
       }
     });
-  });
+  }).finally(() => options.signal?.removeEventListener("abort", cancelAttachment));
   return {
     close() {
       life.abort();

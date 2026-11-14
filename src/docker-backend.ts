@@ -36,10 +36,11 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
     if (error.statusCode === 404) return undefined;
     throw error;
   };
-  const labels = (executionId: string, incarnation: string) => ({
+  const labels = (executionId: string, incarnation: string, profileId = "") => ({
     [prefix + "installation"]: options.installation,
     [prefix + "execution"]: executionId,
     [prefix + "incarnation"]: incarnation,
+    [prefix + "profile"]: profileId,
   });
   async function removeNetwork(
     network: string,
@@ -85,7 +86,11 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
   return {
     async create(placement, signal) {
       const name = `bs-${placement.incarnation}`;
-      const expected = labels(placement.executionId, placement.incarnation);
+      const expected = labels(
+        placement.executionId,
+        placement.incarnation,
+        placement.profileId,
+      );
       let network: string, id: string;
       try {
         network = (
@@ -182,6 +187,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
           executionId: placement.executionId,
           incarnation: placement.incarnation,
           origin,
+          profileId: placement.profileId,
           runtime: createControllerRuntime(origin, {
             automation: placement.automation,
           }),
@@ -203,8 +209,46 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         throw error;
       }
     },
+    async list(signal) {
+      const filters = encodeURIComponent(
+        JSON.stringify({ label: [prefix + "installation=" + options.installation] }),
+      );
+      const containers = await api(
+        `/containers/json?all=true&filters=${filters}`,
+        "GET",
+        undefined,
+        signal,
+      );
+      if (!Array.isArray(containers)) throw Error("browser_worker_discovery_failed");
+      return containers.map((container) => {
+        const labels = container.Labels;
+        const executionId = labels?.[prefix + "execution"],
+          incarnation = labels?.[prefix + "incarnation"],
+          profileId = labels?.[prefix + "profile"];
+        if (
+          labels?.[prefix + "installation"] !== options.installation ||
+          !/^[a-f0-9-]{36}$/.test(executionId ?? "") ||
+          !/^[a-f0-9-]{36}$/.test(incarnation ?? "") ||
+          typeof profileId !== "string" ||
+          !/^[a-f0-9]{64}$/.test(container.Id ?? "")
+        )
+          throw Error("browser_worker_discovery_failed");
+        const origin = `http://bs-${incarnation}:8081`;
+        let runtime: ReturnType<typeof createControllerRuntime>;
+        return {
+          id: container.Id,
+          executionId,
+          incarnation,
+          profileId: profileId || undefined,
+          origin,
+          get runtime() {
+            return (runtime ??= createControllerRuntime(origin));
+          },
+        };
+      });
+    },
     async remove(worker: ManagedWorker, signal) {
-      const expected = labels(worker.executionId, worker.incarnation);
+      const expected = labels(worker.executionId, worker.incarnation, worker.profileId);
       const state = await api(
         `/containers/${worker.id}/json`,
         "GET",

@@ -36,6 +36,24 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+    {{- if .Values.profileStore.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "browser-sandbox.labels" . | nindent 14 }}
+              app.kubernetes.io/component: controller
+      ports:
+        - protocol: TCP
+          port: 8083
+    {{- end }}
+    {{- range .Values.networkPolicy.storageEgress }}
+    - to:
+        - ipBlock:
+            cidr: {{ printf "%s/%s" .address (ternary "128" "32" (contains ":" .address)) | quote }}
+      ports:
+        - protocol: TCP
+          port: {{ .port }}
+    {{- end }}
 
 ---
 apiVersion: networking.k8s.io/v1

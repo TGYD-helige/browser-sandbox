@@ -7,6 +7,7 @@ import {
   KubernetesError,
 } from "./kubernetes-api.js";
 import { WorkerCleanupFailure } from "./lifecycle-errors.js";
+import { validProfileId } from "./local-profiles.js";
 import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
 import { WORKER_ENVIRONMENT } from "./managed-backend.js";
 import { createControllerRuntime } from "./network-control.js";
@@ -74,13 +75,18 @@ export function createKubernetesBackend(
     throw Error("browser_kubernetes_configuration_invalid");
   const api = createKubernetesClient(options);
   const base = `/api/v1/namespaces/${options.namespace}`;
-  const labels = (executionId: string, incarnation: string) => ({
+  const profileLabel = (profileId?: string) =>
+    profileId
+      ? createHash("sha256").update(profileId).digest("hex").slice(0, 63)
+      : "temporary";
+  const labels = (executionId: string, incarnation: string, profileId?: string) => ({
     "app.kubernetes.io/name": "browser-sandbox",
     "app.kubernetes.io/instance": options.installation,
     "app.kubernetes.io/component": "worker",
     [prefix + "installation"]: options.installation,
     [prefix + "execution"]: executionId,
     [prefix + "incarnation"]: incarnation,
+    [prefix + "profile"]: profileLabel(profileId),
   });
   const owned = (
     pod: any,
@@ -168,7 +174,11 @@ export function createKubernetesBackend(
         callerSignal,
         AbortSignal.timeout(creationTimeoutMs),
       ]);
-      const expected = labels(placement.executionId, placement.incarnation);
+      const expected = labels(
+        placement.executionId,
+        placement.incarnation,
+        placement.profileId,
+      );
       const name = `bs-${options.installation.slice(0, 30)}-${createHash("sha256").update(placement.incarnation).digest("hex").slice(0, 20)}`;
       const ownerUid = await readOwner(signal);
       let attempted = false;
@@ -198,17 +208,8 @@ export function createKubernetesBackend(
             kind: "Pod",
             metadata: {
               name,
-              labels: {
-                ...expected,
-                ...(placement.profileId
-                  ? {
-                      [prefix + "profile"]: createHash("sha256")
-                        .update(placement.profileId)
-                        .digest("hex")
-                        .slice(0, 63),
-                    }
-                  : {}),
-              },
+              labels: expected,
+              annotations: { [prefix + "profile-id"]: placement.profileId ?? "" },
               ownerReferences: [
                 {
                   apiVersion: "v1",
@@ -336,6 +337,7 @@ export function createKubernetesBackend(
               executionId: placement.executionId,
               incarnation: placement.incarnation,
               origin,
+              profileId: placement.profileId,
               runtime: createControllerRuntime(origin, {
                 automation: placement.automation,
               }),
@@ -373,6 +375,72 @@ export function createKubernetesBackend(
         throw error;
       }
     },
+    async list(signal) {
+      const ownerUid = await readOwner(signal);
+      const selector = encodeURIComponent(
+        `browser-sandbox.io/installation=${options.installation},app.kubernetes.io/component=worker`,
+      );
+      const workers: ManagedWorker[] = [];
+      const cursors = new Set<string>();
+      let cursor = "";
+      do {
+        const page = await api(
+          `${base}/pods?labelSelector=${selector}&limit=100&continue=${encodeURIComponent(cursor)}`,
+          "GET",
+          undefined,
+          signal,
+        );
+        if (
+          !Array.isArray(page.items) ||
+          page.items.length > 100 ||
+          workers.length + page.items.length > 10000
+        )
+          throw Error("browser_worker_discovery_failed");
+        for (const pod of page.items) {
+          const executionId = pod.metadata?.labels?.[prefix + "execution"],
+            incarnation = pod.metadata?.labels?.[prefix + "incarnation"];
+          const profileId = pod.metadata?.annotations?.[prefix + "profile-id"];
+          if (
+            !identity(executionId) ||
+            !identity(incarnation) ||
+            typeof profileId !== "string" ||
+            (profileId && !validProfileId(profileId)) ||
+            !dnsName(pod.metadata.name) ||
+            !pod.metadata.uid ||
+            !pod.metadata.ownerReferences?.some((item) => item.uid === ownerUid)
+          )
+            throw Error("browser_worker_discovery_failed");
+          owned(pod, labels(executionId, incarnation, profileId), ownerUid);
+          const ip = pod.status?.podIP;
+          const origin = () => {
+            if (!isIP(ip)) throw Error("browser_worker_not_ready");
+            return `http://${isIP(ip) === 6 ? `[${ip}]` : ip}:8081`;
+          };
+          let runtime: ReturnType<typeof createControllerRuntime>;
+          workers.push({
+            id: `${pod.metadata.name}/${pod.metadata.uid}`,
+            executionId,
+            incarnation,
+            profileId: profileId || undefined,
+            get origin() {
+              return origin();
+            },
+            get runtime() {
+              return (runtime ??= createControllerRuntime(origin()));
+            },
+          });
+        }
+        cursor = page.metadata?.continue ?? "";
+        if (
+          typeof cursor !== "string" ||
+          cursor.length > 8192 ||
+          (cursor && cursors.has(cursor))
+        )
+          throw Error("browser_worker_discovery_failed");
+        cursors.add(cursor);
+      } while (cursor);
+      return workers;
+    },
     async remove(worker: ManagedWorker, callerSignal) {
       const [name, uid, extra] = worker.id.split("/");
       if (
@@ -385,7 +453,7 @@ export function createKubernetesBackend(
         throw Error("browser_worker_ownership_mismatch");
       await removeOwned(
         name,
-        labels(worker.executionId, worker.incarnation),
+        labels(worker.executionId, worker.incarnation, worker.profileId),
         AbortSignal.any([callerSignal, AbortSignal.timeout((grace + 10) * 1000)]),
         uid,
       );

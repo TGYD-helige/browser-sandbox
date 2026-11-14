@@ -22,6 +22,7 @@ assert(kubeconfig, "An isolated KUBECONFIG is required for an existing test clus
 const environment = { ...process.env, KUBECONFIG: kubeconfig };
 let stage = "cluster setup";
 let installed = false;
+let hostStorageAddress;
 let clusterAttempted = false;
 let cordoned;
 let heldFinalizer;
@@ -97,6 +98,34 @@ const client = async (action = "functional", executionId) =>
       },
     ),
   );
+const profileClient = async (phase = "roundtrip", executionId) => {
+  stage = `persistent Profiles: ${phase}`;
+  await controllerReady();
+  return JSON.parse(
+    await run(
+      "kubectl",
+      [
+        "-n",
+        namespace,
+        "exec",
+        "-i",
+        "client",
+        "--",
+        "env",
+        `TEST_CONTROL_ORIGIN=http://${deployment}-host.${namespace}.svc:8082`,
+        `BROWSER_HOST_ARCHIVE_URL=http://${hostStorageAddress}:9083/archive`,
+        `BROWSER_PROFILE_PHASE=${phase}`,
+        ...(executionId ? [`BROWSER_TEST_EXECUTION_ID=${executionId}`] : []),
+        "node",
+        "--input-type=module",
+      ],
+      {
+        input: await readFile(".github/scripts/managed/profiles-client.mjs", "utf8"),
+        timeout: 600000,
+      },
+    ),
+  );
+};
 const wait = async (description, predicate, timeout = 90000) => {
   const deadline = Date.now() + timeout;
   while (!(await predicate())) {
@@ -104,6 +133,26 @@ const wait = async (description, predicate, timeout = 90000) => {
     await delay(100);
   }
 };
+const controllerReady = async () =>
+  wait(
+    "Controller Service was not ready from the client",
+    async () => {
+      try {
+        await kubectl(
+          "exec",
+          "client",
+          "--",
+          "node",
+          "-e",
+          `fetch('http://${deployment}.${namespace}.svc:8080/health',{signal:AbortSignal.timeout(2000)}).then(r=>{if(!r.ok)process.exit(1)},()=>process.exit(1))`,
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    30000,
+  );
 await mkdir("managed-results", { recursive: true });
 try {
   if (!process.env.TEST_K3D_CLUSTER) {
@@ -188,12 +237,43 @@ try {
     env: { PROBE_IMAGE: pinned },
     timeout: 240000,
   });
+  await run("kubectl", ["create", "namespace", namespace]);
+  await kubectl(
+    "run",
+    "host-storage",
+    `--image=${clientImage}`,
+    "--labels=browser-sandbox-test-storage=true",
+    "--restart=Never",
+    "--overrides=" +
+      JSON.stringify({
+        spec: {
+          automountServiceAccountToken: false,
+          containers: [
+            {
+              name: "host-storage",
+              image: clientImage,
+              command: [
+                "node",
+                "/opt/browser-sandbox/.github/scripts/managed/host-storage.mjs",
+              ],
+              readinessProbe: { tcpSocket: { port: 9083 }, periodSeconds: 1 },
+            },
+          ],
+        },
+      }),
+  );
+  await kubectl("wait", "--for=condition=Ready", "pod/host-storage", "--timeout=120s");
+  hostStorageAddress = JSON.parse(
+    await kubectl("get", "pod/host-storage", "-o", "json"),
+  ).status.podIP;
   const values = join(directory, "values.json");
   await writeFile(
     values,
     JSON.stringify({
       image: { repository, digest },
+      profileStore: { enabled: true },
       networkPolicy: {
+        storageEgress: [{ address: hostStorageAddress, port: 9083 }],
         apiServerCidrs: [
           "10.43.0.1/32",
           ...nodes.map(
@@ -225,6 +305,8 @@ try {
     "--wait",
     "--timeout",
     "120s",
+    "--set",
+    "profileStore.enabled=false",
   ]);
   const controllerStartupMs = performance.now() - installStarted;
   await kubectl(
@@ -244,6 +326,155 @@ try {
     "setInterval(()=>{},1000)",
   );
   await kubectl("wait", "--for=condition=Ready", "pod/client", "--timeout=120s");
+  const missingStorage = await profileClient("missing-storage");
+  assert.equal((await pods()).length, 0);
+  await run("helm", [
+    "upgrade",
+    release,
+    "charts/browser-sandbox",
+    "-n",
+    namespace,
+    "-f",
+    values,
+    "--wait",
+    "--timeout",
+    "120s",
+  ]);
+  stage = "persistent Profiles";
+  const profileReport = { ...(await profileClient()), ...missingStorage };
+  await writeFile(
+    "managed-results/profiles-kubernetes.json",
+    JSON.stringify(profileReport, null, 2) + "\n",
+  );
+  await profileClient("restart-seed");
+  const persistent = await profileClient("lease-hold");
+  const leasedPod = (await pods()).find(
+    (pod) =>
+      pod.metadata.labels["browser-sandbox.io/execution"] === persistent.executionId,
+  );
+  assert(leasedPod, "Persistent worker was not created");
+  await kubectl("rollout", "restart", `deployment/${deployment}`);
+  await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
+  await profileClient("lease-check");
+  await profileClient("restart-restore");
+  // Test-only cleanup of the deliberately orphaned empty Profile; production recovery is explicit.
+  await kubectl(
+    "delete",
+    "pod",
+    leasedPod.metadata.name,
+    "--wait=true",
+    "--timeout=90s",
+  );
+  await profileClient("lease-reuse");
+  stage = "interrupted Profile upload";
+  await profileClient("interrupt-seed");
+  const digestCode =
+    "const fs=require('node:fs'),crypto=require('node:crypto');const index=JSON.parse(fs.readFileSync('/var/lib/browser-sandbox/profiles/index.json'));process.stdout.write(index.profiles[crypto.createHash('sha256').update('managed-upload-interrupt').digest('hex')].archive.sha256)";
+  const confirmedDigest = await kubectl(
+    "exec",
+    `deployment/${deployment}`,
+    "--",
+    "node",
+    "-e",
+    digestCode,
+  );
+  const interrupted = await profileClient("interrupt-hold");
+  const interruptedPod = (await pods()).find(
+    (pod) =>
+      pod.metadata.labels["browser-sandbox.io/execution"] === interrupted.executionId,
+  );
+  assert(interruptedPod);
+  await kubectl(
+    "exec",
+    interruptedPod.metadata.name,
+    "--",
+    "iptables",
+    "-w",
+    "-I",
+    "OUTPUT",
+    "-p",
+    "tcp",
+    "--dport",
+    "8083",
+    "-m",
+    "owner",
+    "--uid-owner",
+    "0",
+    "-m",
+    "statistic",
+    "--mode",
+    "nth",
+    "--every",
+    "8",
+    "--packet",
+    "7",
+    "-j",
+    "REJECT",
+    "--reject-with",
+    "tcp-reset",
+  );
+  await profileClient("interrupt-finish", interrupted.executionId);
+  assert.equal(
+    await kubectl("exec", `deployment/${deployment}`, "--", "node", "-e", digestCode),
+    confirmedDigest,
+  );
+  // Simulate loss of this test-owned failed worker after checking the durable predecessor.
+  await kubectl(
+    "delete",
+    "pod",
+    interruptedPod.metadata.name,
+    "--grace-period=0",
+    "--force",
+    "--wait=true",
+  );
+  await kubectl("rollout", "restart", `deployment/${deployment}`);
+  await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
+  await profileClient("interrupt-restore");
+  stage = "persistent Profile PVC retention";
+  assert.equal((await pods()).length, 0, "Profile checks left a worker");
+  await run(
+    "helm",
+    ["uninstall", release, "-n", namespace, "--wait", "--timeout", "300s"],
+    { timeout: 330000 },
+  );
+  installed = false;
+  const retainedStore = JSON.parse(
+    await kubectl("get", "pvc", `${deployment}-profiles`, "-o", "json"),
+  );
+  assert.equal(retainedStore.metadata.annotations["helm.sh/resource-policy"], "keep");
+  const reusedValues = JSON.parse(await readFile(values, "utf8"));
+  reusedValues.profileStore.existingClaim = `${deployment}-profiles`;
+  await writeFile(values, JSON.stringify(reusedValues));
+  installed = true;
+  await run("helm", [
+    "install",
+    release,
+    "charts/browser-sandbox",
+    "-n",
+    namespace,
+    "-f",
+    values,
+    "--wait",
+    "--timeout",
+    "120s",
+  ]);
+  await profileClient("restart-restore");
+  await writeFile(
+    "managed-results/profiles-kubernetes.json",
+    JSON.stringify(
+      {
+        ...profileReport,
+        controllerRestartRestored: true,
+        recoveredLeaseRejected: true,
+        recoveredLeaseReleased: true,
+        interruptedUploadPreserved: true,
+        helmUninstallRetainedAndRestoredPvc: true,
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+  await controllerReady();
   stage = "functional client";
   const functional = await client();
   assert.equal(
@@ -380,6 +611,10 @@ try {
   heldFinalizer = undefined;
   await uninstalling;
   installed = false;
+  const retainedPvc = JSON.parse(
+    await kubectl("get", "pvc", `${deployment}-profiles`, "-o", "json"),
+  );
+  assert.equal(retainedPvc.metadata.annotations["helm.sh/resource-policy"], "keep");
   await wait(
     "Helm uninstall left worker Pods",
     async () => (await pods()).length === 0,
@@ -391,6 +626,7 @@ try {
     drainWithoutForce: true,
     pdbBlockedDrain: true,
     uninstallRemovedWorkers: true,
+    uninstallRetainedProfileStore: true,
     heldArchitecture: held.architecture,
   };
   await writeFile(
@@ -428,10 +664,10 @@ try {
     JSON.stringify({
       kubernetesFailed: true,
       stage,
-      diagnostic: String(error.actual?.message ?? error.message)
+      diagnostic: String(error.actual?.message || error.errors || error.message)
         .replace(/(?:https?|wss?):\/\/[^\s]+/g, "<url>")
         .replace(/[a-f0-9]{64}/g, "<digest>")
-        .slice(0, 2000),
+        .slice(-2000),
       codes: [...new Set(String(error).match(/\bbrowser_[a-z_]+\b/g) ?? [])],
       diagnostics,
     }),

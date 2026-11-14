@@ -62,6 +62,9 @@ export async function drainKubernetesWorkers(
       )
     )
       throw Error("browser_worker_ownership_mismatch");
+    const persistent = (pod) =>
+      pod.metadata?.labels?.["browser-sandbox.io/profile"] !== "temporary";
+    if ((await list("worker")).some(persistent)) throw Error("browser_profile_busy");
     const scalePath = `/apis/apps/v1/namespaces/${options.namespace}/deployments/${options.controllerName}/scale`;
     const scale = await api(scalePath, "GET", undefined, signal);
     if (
@@ -99,6 +102,8 @@ export async function drainKubernetesWorkers(
           )
         )
           throw Error("browser_worker_ownership_mismatch");
+        // A Profile admitted between preflight and controller exit still keeps its recovery copy.
+        if (persistent(pod)) throw Error("browser_profile_busy");
         if (!pod.metadata.deletionTimestamp) {
           await api(
             `${base}/pods/${pod.metadata.name}`,
