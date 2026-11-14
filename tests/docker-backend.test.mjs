@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rename, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -259,3 +259,71 @@ test("an unobserved Docker create outcome remains fenced even when cleanup sees 
     },
   );
 });
+
+for (const outage of ["ECONNREFUSED", "ENOENT"]) {
+  test(`Docker creation retries after pre-send ${outage}`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "docker-retry-"));
+    const socketPath = join(root, "docker.sock");
+    let server, worker;
+    t.after(async () => {
+      worker?.runtime.close();
+      if (server) await new Promise((resolve) => server.close(resolve));
+      await rm(root, { recursive: true, force: true });
+    });
+    if (outage === "ECONNREFUSED") {
+      const stale = createServer();
+      const original = join(root, "active.sock");
+      await new Promise((resolve) => stale.listen(original, resolve));
+      await rename(original, socketPath);
+      await new Promise((resolve) => stale.close(resolve));
+    }
+    const backend = createDockerBackend({
+      installation: "test",
+      controllerContainer: "controller",
+      image: "sha256:" + "a".repeat(64),
+      socketPath,
+      seccomp: {},
+    });
+    const placement = { executionId: "execution", incarnation: "incarnation" };
+    await assert.rejects(
+      backend.create(placement, AbortSignal.timeout(1000)),
+      (error) => {
+        assert(
+          !(error instanceof AggregateError),
+          "A request that never connected must remain retryable",
+        );
+        assert.equal(error.message, "browser_docker_unavailable");
+        assert.equal(error.cause.code, outage);
+        return true;
+      },
+    );
+    await rm(socketPath, { force: true });
+    const labels = {
+      "browser-sandbox.installation": "test",
+      "browser-sandbox.execution": "execution",
+      "browser-sandbox.incarnation": "incarnation",
+      "browser-sandbox.network": "network",
+    };
+    server = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        if (req.url === "/v1.47/networks/create")
+          res.end(JSON.stringify({ Id: "network" }));
+        else if (req.url.startsWith("/v1.47/containers/create?"))
+          res.end(JSON.stringify({ Id: "worker" }));
+        else if (req.url === "/v1.47/containers/worker/json")
+          res.end(
+            JSON.stringify({ State: { Running: true }, Config: { Labels: labels } }),
+          );
+        else res.end("{}");
+      });
+    });
+    await new Promise((resolve) => server.listen(socketPath, resolve));
+    t.mock.method(globalThis, "fetch", async (url) => {
+      assert.equal(String(url), "http://bs-incarnation:8081/health");
+      return new Response(null, { status: 204 });
+    });
+    worker = await backend.create(placement, AbortSignal.timeout(1000));
+    assert.equal(worker.id, "worker");
+  });
+}

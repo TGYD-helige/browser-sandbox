@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { setImmediate as nextTurn } from "node:timers/promises";
-import WebSocket from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import { createController } from "../dist/controller.js";
 import { createControllerRuntime } from "../dist/network-control.js";
 
@@ -22,6 +22,7 @@ async function fixture(t, options = {}) {
     req.resume();
     req.on("end", () => res.end("fixture"));
   });
+  if (options.workerUpgrade) worker.on("upgrade", options.workerUpgrade);
   await new Promise((resolve) => worker.listen(0, "127.0.0.1", resolve));
   const origin = `http://127.0.0.1:${worker.address().port}`;
   const makeWorker = (placement) => ({
@@ -44,6 +45,7 @@ async function fixture(t, options = {}) {
     remove = async () => {},
     cleanupMayFail = false,
     workerResponse: _workerResponse,
+    workerUpgrade: _workerUpgrade,
     ...config
   } = options;
   const controller = await createController({
@@ -364,9 +366,10 @@ test("unconfirmed creation cleanup fences replacement and cannot finalize as an 
   assert.equal(f.controller.bindings.size, 1);
 });
 
-async function viewer(t, controller, token) {
+async function viewer(t, controller, token, options = {}) {
   const client = new WebSocket(
     controller.origin.replace("http:", "ws:") + "/view/socket",
+    options,
   );
   client.on("error", () => {});
   t.after(() => client.terminate());
@@ -445,19 +448,13 @@ for (const authenticated of [false, true]) {
       clients.push(await viewer(t, f.controller, token));
     }
     if (authenticated) await admitted.promise;
-    const excess = new WebSocket(
+    const rejection = await rejectedUpgrade(
       f.controller.origin.replace("http:", "ws:") + "/view/socket",
     );
-    excess.on("error", () => {});
-    t.after(() => excess.terminate());
-    const status = await new Promise((resolve) => {
-      excess.once("open", () => resolve(101));
-      excess.once("unexpected-response", (_req, response) => {
-        response.resume();
-        resolve(response.statusCode);
-      });
+    assert.equal(rejection.status, 503);
+    assert.deepEqual(JSON.parse(rejection.body), {
+      error: "browser_viewer_capacity_exceeded",
     });
-    assert.equal(status, 403);
     const closed = once(clients[0], "close");
     clients[0].terminate();
     await closed;
@@ -619,3 +616,95 @@ test("finalization cancels storage attachment during creation", {
   await browser;
   assert.equal(removed, 1);
 });
+
+for (const op of ["access_revoke", "finalize"]) {
+  for (const route of ["HTTP", "CDP"]) {
+    test(`${op} during ${route} worker creation wait returns 403`, async (t) => {
+      const entered = barrier(),
+        release = barrier();
+      t.after(() => release.resolve());
+      const f = await fixture(t, {
+        create: async (placement, _signal, makeWorker) => {
+          entered.resolve();
+          await release.promise;
+          return makeWorker(placement);
+        },
+      });
+      const response =
+        route === "HTTP"
+          ? fetch(f.url).then(async (res) => ({
+              status: res.status,
+              body: await res.text(),
+            }))
+          : rejectedUpgrade(
+              f.url.replace("http:", "ws:").replace("/files/test.txt", ""),
+            );
+      await entered.promise;
+      const revoked = f.controller.command({ op, executionId: f.executionId });
+      release.resolve();
+      await revoked;
+      const result = await response;
+      assert.equal(result.status, 403);
+      assert.deepEqual(JSON.parse(result.body), { error: "browser_execution_revoked" });
+    });
+  }
+}
+
+for (const silent of ["client", "worker", "neither"]) {
+  test(`tunnel heartbeat handles ${silent} missing pong and releases control slots`, {
+    timeout: 2000,
+  }, async (t) => {
+    t.mock.timers.enable({ apis: ["setInterval"] });
+    const workerSockets = new WebSocketServer({
+      noServer: true,
+      autoPong: silent !== "worker",
+    });
+    let workerPeer;
+    const f = await fixture(t, {
+      workerUpgrade: (req, socket, head) =>
+        workerSockets.handleUpgrade(req, socket, head, (peer) => {
+          workerPeer = peer;
+          peer.on("error", () => {});
+          peer.on("message", (raw) => {
+            if (JSON.parse(String(raw)).type === "authenticate") peer.send("ready");
+            else peer.send(raw);
+          });
+        }),
+    });
+    t.after(async () => {
+      for (const peer of workerSockets.clients) peer.terminate();
+      await new Promise((resolve) => workerSockets.close(resolve));
+    });
+    const grant = await f.controller.command({
+      op: "access_create",
+      executionId: f.executionId,
+      control: true,
+    });
+    const token = new URL(grant.viewerUrl).hash.slice(1);
+    const client = await viewer(t, f.controller, token, {
+      autoPong: silent !== "client",
+    });
+    assert.equal(String((await once(client, "message"))[0]), "ready");
+    const barrierRoundTrip = async () => {
+      const echoed = once(client, "message");
+      client.send(JSON.stringify({ type: "fixture" }));
+      await echoed;
+    };
+    for (let i = 0; i < 2; i++) {
+      const pinged = once(silent === "worker" ? workerPeer : client, "ping");
+      t.mock.timers.tick(30000);
+      await pinged;
+      await barrierRoundTrip();
+      if (silent !== "neither") break;
+    }
+    if (silent === "neither") {
+      assert.equal(client.readyState, WebSocket.OPEN);
+      return;
+    }
+    const closed = once(client, "close");
+    t.mock.timers.tick(30000);
+    await closed;
+    const replacement = await viewer(t, f.controller, token);
+    assert.equal(String((await once(replacement, "message"))[0]), "ready");
+  });
+}

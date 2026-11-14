@@ -94,6 +94,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
   }
   return {
     async create(placement, signal) {
+      signal.throwIfAborted();
       const name = `bs-${placement.incarnation}`;
       const expected = labels(placement.executionId, placement.incarnation);
       let network: string, id: string;
@@ -103,7 +104,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
           // Observe mutation completion before cancellation can confirm resource absence.
           return await api(path, "POST", body, AbortSignal.timeout(30000));
         } catch (error) {
-          if (error.message === "browser_docker_unavailable")
+          if (error.message === "browser_docker_unavailable" && error.requestSent)
             throw new WorkerCleanupFailure(
               error,
               Error("browser_worker_cleanup_unconfirmed"),
@@ -208,6 +209,7 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
           }),
         };
       } catch (error) {
+        if (!network && error.requestSent === false) throw error;
         const cleanup = AbortSignal.timeout(30000);
         const failures: unknown[] = [];
         try {
@@ -261,6 +263,13 @@ export function createDockerClient(socketPath = "/var/run/docker.sock") {
     signal = AbortSignal.timeout(30000),
   ): Promise<any> =>
     new Promise((resolve, reject) => {
+      let requestSent = false;
+      const unavailable = (cause: Error) =>
+        reject(
+          Object.assign(Error("browser_docker_unavailable", { cause }), {
+            requestSent,
+          }),
+        );
       const request = httpRequest(
         {
           socketPath,
@@ -270,6 +279,7 @@ export function createDockerClient(socketPath = "/var/run/docker.sock") {
           signal,
         },
         (response) => {
+          requestSent = true;
           const chunks: Buffer[] = [];
           let size = 0;
           response.on("data", (chunk) => {
@@ -277,7 +287,7 @@ export function createDockerClient(socketPath = "/var/run/docker.sock") {
             if (size > 1048576) request.destroy();
             else chunks.push(chunk);
           });
-          response.on("error", () => reject(Error("browser_docker_unavailable")));
+          response.on("error", unavailable);
           response.on("end", () => {
             if (response.statusCode < 200 || response.statusCode >= 300) {
               reject(
@@ -295,7 +305,10 @@ export function createDockerClient(socketPath = "/var/run/docker.sock") {
           });
         },
       );
-      request.on("error", () => reject(Error("browser_docker_unavailable")));
+      request.once("finish", () => {
+        requestSent = true;
+      });
+      request.on("error", unavailable);
       request.end(body ? JSON.stringify(body) : undefined);
     });
 }

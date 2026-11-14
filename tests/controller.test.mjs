@@ -97,7 +97,7 @@ test("revocation during first use fences readiness and deletes the late worker",
   const finishing = controller.command({ op: "finalize", executionId });
   release();
   await finishing;
-  assert.equal((await request).status, 502);
+  assert.equal((await request).status, 403);
   assert.equal(removed, 1);
   assert.equal(controller.bindings.size, 0);
 });

@@ -108,6 +108,7 @@ export async function createController(options: ControllerOptions) {
     res.once("close", () => {
       if (!res.writableEnded) life.abort();
     });
+    let grant: Access;
     try {
       res.setHeader("cache-control", "no-store");
       res.setHeader("referrer-policy", "no-referrer");
@@ -134,7 +135,7 @@ export async function createController(options: ControllerOptions) {
         /^\/execution\/([a-f0-9]{64})(\/(?:session|auth|files\/[^/?]+))$/.exec(
           req.url ?? "",
         );
-      const grant = match && (await access(match[1], "cdp", req));
+      grant = match && (await access(match[1], "cdp", req));
       if (!grant) {
         res.writeHead(403).end();
         return;
@@ -209,12 +210,12 @@ export async function createController(options: ControllerOptions) {
           pipeline(response, res, () => {});
         },
       );
-      upstream.on("error", () => {
+      upstream.on("error", (error) => {
         if (res.writableEnded) return;
         if (!res.headersSent)
           res
-            .writeHead(502)
-            .end(JSON.stringify({ error: "browser_worker_unavailable" }));
+            .writeHead(errorStatus(error, grant))
+            .end(JSON.stringify({ error: errorCode(error, grant) }));
         else res.destroy();
       });
       if (fileRoute) {
@@ -248,8 +249,8 @@ export async function createController(options: ControllerOptions) {
     } catch (error) {
       if (!res.headersSent)
         res
-          .writeHead(errorStatus(error))
-          .end(JSON.stringify({ error: errorCode(error) }));
+          .writeHead(errorStatus(error, grant))
+          .end(JSON.stringify({ error: errorCode(error, grant) }));
       else res.destroy();
     }
   });
@@ -699,7 +700,24 @@ export async function createController(options: ControllerOptions) {
       decodeStrings: false,
       highWaterMark: 1,
     });
+    const alive = new Set([client, upstream]);
+    const clientPong = () => alive.add(client);
+    const upstreamPong = () => alive.add(upstream);
+    client.on("pong", clientPong);
+    upstream.on("pong", upstreamPong);
+    const heartbeat = setInterval(() => {
+      for (const peer of [client, upstream]) {
+        if (peer.readyState !== WebSocket.OPEN) continue;
+        if (!alive.delete(peer)) return close();
+        peer.ping();
+      }
+    }, 30000);
+    heartbeat.unref();
     const close = () => {
+      clearInterval(heartbeat);
+      client.off("pong", clientPong);
+      upstream.off("pong", upstreamPong);
+      alive.clear();
       grant.connections.delete(connection);
       downstream.destroy();
       incoming.destroy();
@@ -720,10 +738,12 @@ export async function createController(options: ControllerOptions) {
   server.on("upgrade", async (req, socket, head) => {
     const life = new AbortController();
     socket.once("close", () => life.abort());
+    let grant: Access;
     try {
       if (req.url === "/view/socket" && allowedOrigin(req)) {
-        if (waiting >= 64 || viewers.clients.size >= 64 || closing)
-          throw Error("browser_access_denied");
+        if (closing) throw Error("browser_execution_revoked");
+        if (waiting >= 64 || viewers.clients.size >= 64)
+          throw Error("browser_viewer_capacity_exceeded");
         viewers.handleUpgrade(req, socket, head, (client) => {
           waiting++;
           let authenticated = false;
@@ -775,10 +795,10 @@ export async function createController(options: ControllerOptions) {
               client.resume();
             } catch (error) {
               client.resume();
-              const status = errorStatus(error);
+              const status = errorStatus(error, grant);
               client.close(
                 status === 403 ? 1008 : status === 503 ? 1013 : 1011,
-                errorCode(error).slice(0, 123),
+                errorCode(error, grant).slice(0, 123),
               );
             } finally {
               grant?.connections.delete(reservation);
@@ -788,7 +808,7 @@ export async function createController(options: ControllerOptions) {
         return;
       }
       const match = /^\/execution\/([a-f0-9]{64})$/.exec(req.url ?? "");
-      const grant = match && (await access(match[1], "cdp", req));
+      grant = match && (await access(match[1], "cdp", req));
       if (!grant) throw Error("browser_access_denied");
       await ensureWorker(
         grant.binding,
@@ -800,8 +820,8 @@ export async function createController(options: ControllerOptions) {
         tunnel(client, grant.binding.endpoint.cdpUrl, grant),
       );
     } catch (error) {
-      const status = errorStatus(error);
-      const body = JSON.stringify({ error: errorCode(error) });
+      const status = errorStatus(error, grant);
+      const body = JSON.stringify({ error: errorCode(error, grant) });
       const reason =
         status === 403
           ? "Forbidden"
@@ -866,14 +886,16 @@ export async function createController(options: ControllerOptions) {
     },
   };
 }
-function errorCode(error: any) {
+function errorCode(error: any, grant?: Access) {
+  if (grant?.life.signal.aborted || grant?.binding.revoked)
+    return "browser_execution_revoked";
   return /^browser_[a-z_]+$/.test(error?.message)
     ? error.message
     : "browser_worker_unavailable";
 }
 
-function errorStatus(error: unknown) {
-  const code = errorCode(error);
-  if (code === "browser_access_denied") return 403;
+function errorStatus(error: unknown, grant?: Access) {
+  const code = errorCode(error, grant);
+  if (["browser_access_denied", "browser_execution_revoked"].includes(code)) return 403;
   return /_(capacity_exceeded|overloaded)$/.test(code) ? 503 : 502;
 }
