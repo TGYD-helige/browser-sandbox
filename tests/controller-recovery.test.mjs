@@ -1677,3 +1677,84 @@ test("temporary backends without discovery still finalize a known revoked worker
   assert.equal(f.resources.size, 0);
   assert.equal(controller.capacity().workers, 0);
 });
+
+test("finish recovers the previous published revision after its immediate reread also failed", async (t) => {
+  const f = await fixture(t);
+  const controller = await f.start({ reconciliationMs: 60000 });
+  const executionId = randomUUID();
+  const endpoint = await controller.command({ op: "register", executionId });
+  await fetch(fileUrl(controller, endpoint));
+  const directory = await open(f.directory, "r");
+  const prototype = Object.getPrototypeOf(directory);
+  await directory.close();
+  const sync = prototype.sync,
+    read = prototype.readFile;
+  let inject = true,
+    failRead = false;
+  const syncMock = t.mock.method(prototype, "sync", async function () {
+    if (inject && (await this.stat()).isDirectory()) {
+      inject = false;
+      failRead = true;
+      throw Object.assign(Error("Injected published write failure"), { code: "EIO" });
+    }
+    return sync.call(this);
+  });
+  const readMock = t.mock.method(prototype, "readFile", async function (...args) {
+    if (failRead) {
+      failRead = false;
+      throw Object.assign(Error("Injected recovery read failure"), { code: "EIO" });
+    }
+    return read.apply(this, args);
+  });
+  try {
+    await assert.rejects(controller.command({ op: "endpoint", executionId }), {
+      code: "EIO",
+    });
+    await assert.rejects(
+      controller.command({ op: "finish", executionId }),
+      /browser_execution_record_changed/,
+    );
+    await controller.command({ op: "finish", executionId });
+    assert.equal(controller.capacity().workers, 0);
+    assert.equal(f.resources.size, 0);
+  } finally {
+    syncMock.mock.restore();
+    readMock.mock.restore();
+    await controller.stop({ finalize: false }).catch(() => {});
+  }
+});
+
+for (const failure of [null, Error("browser_profile_save_failed")]) {
+  test(`idle finalization preserves ${failure === null ? "a non-Error rejection" : "its error when journaling fails"}`, async (t) => {
+    const f = await fixture(t);
+    const controller = await f.start({ reconciliationMs: 60000 });
+    const executionId = randomUUID();
+    const endpoint = await controller.command({ op: "register", executionId });
+    await fetch(fileUrl(controller, endpoint));
+    const worker = [...f.resources.values()][0];
+    const request = worker.runtime.request;
+    worker.runtime.request = async (input) => {
+      if (input.op === "finalize" && input.ifIdle) throw failure;
+      return request(input);
+    };
+    const directory = await open(f.directory, "r");
+    const prototype = Object.getPrototypeOf(directory);
+    await directory.close();
+    const sync = prototype.sync;
+    const mock = t.mock.method(prototype, "sync", async function () {
+      if (failure !== null && (await this.stat()).isDirectory())
+        throw Object.assign(Error("Injected idle journal failure"), { code: "EIO" });
+      return sync.call(this);
+    });
+    try {
+      await assert.rejects(
+        controller.command({ op: "finalize", executionId, ifIdle: true }),
+        (error) => error === failure,
+      );
+      assert.equal((await fetch(fileUrl(controller, endpoint))).status, 403);
+    } finally {
+      mock.mock.restore();
+      worker.runtime.request = request;
+    }
+  });
+}

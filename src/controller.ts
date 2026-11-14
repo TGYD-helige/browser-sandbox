@@ -46,6 +46,7 @@ export interface ExecutionBinding {
   phase: string;
   revision: number;
   persisted?: Promise<void>;
+  pendingRecordData?: Record<string, unknown>;
   slot?: WorkerSlot;
   creation?: { abort: AbortController; waiters: number };
   creationFailure?: unknown;
@@ -284,11 +285,23 @@ export async function createController(options: ControllerOptions) {
           ? await journal.update(binding.executionId, binding.revision, recordData)
           : await journal.create(binding.executionId, recordData);
         binding.revision = record.revision;
+        binding.pendingRecordData = undefined;
       } catch (error) {
+        const pending = binding.pendingRecordData;
+        if (errorCode(error) !== "browser_execution_record_changed")
+          binding.pendingRecordData = recordData;
         try {
           const record = await journal.read(binding.executionId);
-          if (isDeepStrictEqual(record.data, JSON.parse(JSON.stringify(recordData))))
+          if (
+            [recordData, pending].some(
+              (data) =>
+                data &&
+                isDeepStrictEqual(record.data, JSON.parse(JSON.stringify(data))),
+            )
+          ) {
             binding.revision = record.revision;
+            binding.pendingRecordData = undefined;
+          }
         } catch {
           // Unknown disk state cannot confirm this write.
         }
@@ -1088,12 +1101,14 @@ export async function createController(options: ControllerOptions) {
           binding.stopConfirmed = true;
         } catch (error) {
           if (
-            !["browser_worker_not_idle", "browser_session_lost"].includes(error.message)
+            !["browser_worker_not_idle", "browser_session_lost"].includes(
+              errorCode(error),
+            )
           ) {
             revokeExecution(binding);
             binding.phase = "finalizing";
             binding.reclaimReason ??= "host-finish";
-            await persist(binding);
+            await persist(binding).catch(() => {});
           }
           throw error;
         }
