@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { setImmediate as yieldTurn } from "node:timers/promises";
 import { createController } from "../dist/controller.js";
+import { createExecutionJournal } from "../dist/execution-journal.js";
 
 async function fixture(t) {
   const directory = await mkdtemp(join(tmpdir(), "controller-recovery-"));
@@ -546,4 +547,42 @@ test("restart retries deletion of an unregistered partial worker without runtime
   assert.equal(f.resources.size, 0);
   assert.equal(second.capacity().workers, 0);
   assert.equal(finalized, 0);
+});
+
+test("revoked recovered bindings do not consume the live access grant quota", async (t) => {
+  const f = await fixture(t);
+  const journal = await createExecutionJournal({
+    directory: f.directory,
+    installationId: "test",
+  });
+  for (let index = 0; index < 21; index++) {
+    await journal.create(randomUUID(), {
+      incarnation: randomUUID(),
+      allowedDomains: [],
+      registeredAt: Date.now(),
+      lastActivityAt: Date.now(),
+      phase: "cleanup-pending",
+      stopConfirmed: true,
+      finalResult: { stopped: true, used: false },
+      grants: Array.from({ length: 100 }, () => ({
+        token: randomBytes(32).toString("hex"),
+        kind: "cdp",
+        control: false,
+        resize: false,
+      })),
+    });
+  }
+  const controller = await f.start();
+  const endpoint = await controller.command({
+    op: "register",
+    executionId: randomUUID(),
+  });
+  assert.equal(
+    (
+      await fetch(
+        `${controller.origin + new URL(endpoint.wsEndpoint).pathname}/session`,
+      )
+    ).status,
+    200,
+  );
 });
