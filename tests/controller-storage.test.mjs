@@ -12,8 +12,10 @@ import { createControllerRuntime } from "../dist/network-control.js";
 import { createProfileStore } from "../dist/profile-store.js";
 import { createProfileArchive } from "../dist/profiles.js";
 
-for (const mode of ["host", "volume"])
-  test(`controller ${mode} storage preserves native Profile state across worker instances`, async (t) => {
+for (const [mode, failure] of ["host", "volume"].flatMap((mode) =>
+  ["removal", "response", "unconfirmed response"].map((failure) => [mode, failure]),
+))
+  test(`controller ${mode} storage preserves native Profile state after ${failure} failure`, async (t) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "controller-storage-"));
     t.after(() => fs.rm(root, { recursive: true, force: true }));
     const host = await archiveFixture(root);
@@ -37,7 +39,10 @@ for (const mode of ["host", "volume"])
     const workers = new Map();
     let removed = 0,
       finalizations = 0,
-      failRemoval = false;
+      finalizeRequests = 0,
+      skipCommit = false,
+      failRemoval = false,
+      dropResponse = false;
     const backend = {
       async list() {
         return [...workers.values()];
@@ -55,6 +60,7 @@ for (const mode of ["host", "volume"])
         let adapter;
         let closed = false;
         let restored = false;
+        let finalized = false;
         const server = createServer(async (req, res) => {
           if (!restored) {
             await archive.restore(
@@ -106,16 +112,25 @@ for (const mode of ["host", "volume"])
                 };
               }
               assert.equal(request.op, "finalize");
+              finalizeRequests++;
+              if (finalized) return { status: "absent" };
               finalizations++;
               const result = await archive.save(
                 entry,
                 await adapter.save(AbortSignal.timeout(5000)),
                 AbortSignal.timeout(5000),
               );
-              assert.equal(
-                (await adapter.commit(result, AbortSignal.timeout(5000))).confirmedSha,
-                result.archive.sha256,
-              );
+              if (!skipCommit)
+                assert.equal(
+                  (await adapter.commit(result, AbortSignal.timeout(5000)))
+                    .confirmedSha,
+                  result.archive.sha256,
+                );
+              finalized = true;
+              if (dropResponse) {
+                dropResponse = false;
+                throw Error("browser_control_disconnected");
+              }
               return { ...result, stopped: true };
             },
           },
@@ -142,7 +157,9 @@ for (const mode of ["host", "volume"])
     });
     t.after(async () => {
       try {
-        await controller.stop();
+        await controller.stop({
+          preserveWorkers: failure === "unconfirmed response",
+        });
       } finally {
         for (const worker of workers.values()) {
           worker.server.closeAllConnections();
@@ -202,13 +219,44 @@ for (const mode of ["host", "volume"])
       await assert.rejects(open(), /browser_profile_busy/);
       failCommit = false;
     }
-    failRemoval = true;
+    failRemoval = failure === "removal";
+    dropResponse = failure !== "removal";
+    skipCommit = failure === "unconfirmed response";
     await assert.rejects(
       runtime.request({ op: "finalize", executionId: first.executionId }),
-      /browser_synthetic_worker_removal_failed/,
+      failure === "removal"
+        ? /browser_synthetic_worker_removal_failed/
+        : /browser_control_disconnected/,
     );
     const saves = finalizations;
     await assert.rejects(open(), /browser_profile_busy/);
+    if (skipCommit) {
+      const request = { op: "finalize", executionId: first.executionId };
+      await assert.rejects(
+        runtime.request(request),
+        /browser_profile_finalization_lost/,
+      );
+      const requests = finalizeRequests;
+      await assert.rejects(
+        runtime.request(request),
+        /browser_profile_finalization_lost/,
+      );
+      assert.equal(
+        finalizeRequests,
+        requests,
+        "Terminal failure must not retry the worker",
+      );
+      assert.equal(removed, 0);
+      await assert.rejects(open(), /browser_profile_busy/);
+      assert.equal(
+        await fs.readFile(
+          path.join([...workers.values()][0].entry.profileDir, "state"),
+          "utf8",
+        ),
+        "confirmed native data",
+      );
+      return;
+    }
     const saved = await runtime.request({
       op: "finalize",
       executionId: first.executionId,

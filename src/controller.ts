@@ -32,6 +32,7 @@ export interface ExecutionBinding {
   life: AbortController;
   revoked: boolean;
   finishing?: Promise<any>;
+  confirmedCommit?: { incarnation: string; result: Record<string, unknown> };
   stopConfirmed?: boolean;
   finalResult?: Record<string, unknown>;
   host?: ControlPeer;
@@ -387,7 +388,31 @@ export async function createController(options: ControllerOptions) {
       });
     } catch {}
   };
+  function workerStorage(
+    binding: ExecutionBinding,
+    worker: ManagedWorker,
+    adapter: StorageAdapter,
+  ): StorageAdapter {
+    return {
+      load: (signal) => adapter.load(signal),
+      save: (signal) => adapter.save(signal),
+      async commit(result, signal) {
+        const confirmation = await adapter.commit(result, signal);
+        const archive = result.archive as { sha256?: unknown } | undefined;
+        if (
+          /^[a-f0-9]{64}$/.test(confirmation?.confirmedSha) &&
+          confirmation.confirmedSha === archive?.sha256 &&
+          bindings.get(binding.executionId) === binding &&
+          binding.incarnation === worker.incarnation &&
+          binding.worker === worker
+        )
+          binding.confirmedCommit = { incarnation: worker.incarnation, result };
+        return confirmation;
+      },
+    };
+  }
   async function attachWorkerStorage(
+    binding: ExecutionBinding,
     worker: ManagedWorker,
     attachment: StorageAttachment,
     signal: AbortSignal,
@@ -395,12 +420,12 @@ export async function createController(options: ControllerOptions) {
     const executionId = attachment.registration.executionId;
     const channel = await worker.runtime.attachStorage(
       attachment.registration,
-      {
+      workerStorage(binding, worker, {
         load: (signal) => attachment.peer.callback("load", { executionId }, signal),
         save: (signal) => attachment.peer.callback("save", { executionId }, signal),
         commit: (payload, signal) =>
           attachment.peer.callback("commit", { executionId, payload }, signal),
-      },
+      }),
       AbortSignal.any([signal, attachment.life.signal]),
     );
     if (attachment.peer.signal.aborted || storage.get(executionId) !== attachment) {
@@ -487,7 +512,8 @@ export async function createController(options: ControllerOptions) {
           );
           creationSignal.throwIfAborted();
           const attachment = storage.get(binding.executionId);
-          if (attachment) await attachWorkerStorage(worker, attachment, creationSignal);
+          if (attachment)
+            await attachWorkerStorage(binding, worker, attachment, creationSignal);
           if (binding.storage)
             binding.storageConnection = await worker.runtime.attachStorage(
               {
@@ -496,7 +522,7 @@ export async function createController(options: ControllerOptions) {
                 allowedDomains: binding.allowedDomains,
                 storage: true,
               },
-              binding.storage,
+              workerStorage(binding, worker, binding.storage),
               creationSignal,
             );
 
@@ -607,7 +633,7 @@ export async function createController(options: ControllerOptions) {
           const worker = await waitForControl(binding.starting, signal);
           signal.throwIfAborted();
           if (!attachment.channel)
-            await attachWorkerStorage(worker, attachment, signal);
+            await attachWorkerStorage(binding, worker, attachment, signal);
         }
         return { attached: true };
       } catch (error) {
@@ -734,6 +760,11 @@ export async function createController(options: ControllerOptions) {
               event(current, "removed", { error: errorCode(error) });
               throw Error("browser_worker_finalization_failed");
             }
+            if (current.profileId && result.status === "absent") {
+              if (current.confirmedCommit?.incarnation !== current.incarnation)
+                throw Error("browser_profile_finalization_lost");
+              result = { ...current.confirmedCommit.result, stopped: true };
+            }
             if (result.stopped !== true) throw Error("browser_worker_stop_unconfirmed");
             current.stopConfirmed = true;
             current.finalResult = result;
@@ -753,7 +784,9 @@ export async function createController(options: ControllerOptions) {
         event(current, "removed");
         return result;
       })().catch((error) => {
-        current.finishing = undefined;
+        // Absence without a confirmed commit is terminal; retain ownership for recovery.
+        if (error.message !== "browser_profile_finalization_lost")
+          current.finishing = undefined;
         throw error;
       });
       return current.finishing;
