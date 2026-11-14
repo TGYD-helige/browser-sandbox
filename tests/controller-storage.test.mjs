@@ -21,7 +21,9 @@ for (const [mode, failure] of ["host", "volume"].flatMap((mode) =>
     "restart without witness",
   ].map((failure) => [mode, failure]),
 ))
-  test(`controller ${mode} storage preserves native Profile state after ${failure} failure`, async (t) => {
+  test(`controller ${mode} storage preserves native Profile state after ${failure} failure`, {
+    timeout: 10000,
+  }, async (t) => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "controller-storage-"));
     t.after(() => fs.rm(root, { recursive: true, force: true }));
     const host = await archiveFixture(root);
