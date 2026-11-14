@@ -6,6 +6,8 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { promisify } from "node:util";
+import { connectCdp } from "/project/dist/cdp.js";
+import { diagnoseScreenshot } from "./screenshot-diagnostics.mjs";
 
 const home = await mkdtemp(join(tmpdir(), "managed-harness-"));
 const cli = join(
@@ -40,6 +42,13 @@ const call = async (...args) => {
       )
     ).stdout;
   } catch {
+    if (args[0] === "screenshot") {
+      const report = await diagnoseScreenshot(
+        process.env.BROWSER_WS_ENDPOINT,
+        connectCdp,
+      ).catch(() => ({ error: "browser_screenshot_diagnostic_failed" }));
+      console.error("managed_screenshot_diagnostics " + JSON.stringify(report));
+    }
     throw Error(`managed_harness_${args[0]}_failed`);
   }
   const result = JSON.parse(output);

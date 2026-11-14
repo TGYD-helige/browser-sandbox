@@ -23,6 +23,7 @@ export { attachStorage, hostRequest } from "./host-client.js";
 export {
   BrowserCleanupUnconfirmed,
   VerifiedBrowserCheckpointFailure,
+  WorkerCleanupFailure,
 } from "./lifecycle-errors.js";
 export { createLocalProfiles, validProfileId } from "./local-profiles.js";
 export type { ManagedBackend, ManagedWorker } from "./managed-backend.js";

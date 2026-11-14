@@ -10,7 +10,7 @@ export interface ManagedWorker {
   runtime: BrowserRuntime & { close?(): void };
 }
 
-/** Optional platform adapter; create must clean up partial resources on failure/cancellation. */
+/** Optional platform adapter; create cleans partial resources or throws WorkerCleanupFailure when cleanup is unconfirmed. */
 export interface ManagedBackend {
   create(
     placement: Placement & {

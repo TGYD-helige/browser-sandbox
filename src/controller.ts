@@ -201,11 +201,16 @@ export async function createController(options: ControllerOptions) {
         target,
         { method: req.method, headers, signal },
         (response) => {
+          if (res.writableEnded || res.destroyed) {
+            response.destroy();
+            return;
+          }
           res.writeHead(response.statusCode, response.headers);
           pipeline(response, res, () => {});
         },
       );
       upstream.on("error", () => {
+        if (res.writableEnded) return;
         if (!res.headersSent)
           res
             .writeHead(502)
@@ -222,8 +227,8 @@ export async function createController(options: ControllerOptions) {
               exceeded = true;
               req.unpipe(limit);
               req.resume();
-              res.once("finish", () => req.destroy());
-              res.writeHead(413, { connection: "close" }).end();
+              if (!res.headersSent) res.writeHead(413, { connection: "close" }).end();
+              else res.destroy();
               done(Error("browser_file_too_large"));
               return;
             }
@@ -360,6 +365,8 @@ export async function createController(options: ControllerOptions) {
   async function ensureWorker(binding: ExecutionBinding, signal: AbortSignal) {
     signal.throwIfAborted();
     if (binding.revoked) throw Error("browser_execution_revoked");
+    if (binding.creationFailure instanceof WorkerCleanupFailure)
+      throw binding.creationFailure;
     if (binding.worker && !binding.endpoint)
       throw binding.creationFailure ?? Error("browser_worker_cleanup_unconfirmed");
     if (!binding.starting) {
@@ -543,6 +550,8 @@ export async function createController(options: ControllerOptions) {
         for (const grant of [...grants.values()])
           if (grant.binding === current) revoke(grant);
         await current.starting?.catch(() => {});
+        if (!current.worker && current.creationFailure instanceof WorkerCleanupFailure)
+          throw current.creationFailure;
         let result = { used: false, stopped: true };
         if (current.worker) {
           try {

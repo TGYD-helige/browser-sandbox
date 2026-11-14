@@ -16,6 +16,8 @@ function barrier() {
 }
 async function fixture(t, options = {}) {
   const worker = createServer((req, res) => {
+    req.on("error", () => {});
+    if (options.workerResponse) return options.workerResponse(req, res);
     req.resume();
     req.on("end", () => res.end("fixture"));
   });
@@ -40,6 +42,7 @@ async function fixture(t, options = {}) {
     create = async (placement) => makeWorker(placement),
     remove = async () => {},
     cleanupMayFail = false,
+    workerResponse: _workerResponse,
     ...config
   } = options;
   const controller = await createController({
@@ -307,4 +310,55 @@ test("files reject a chunked body over the shared file limit", async (t) => {
     ),
   });
   assert.equal(response.status, 413);
+});
+
+test("an oversized file body after response headers only terminates that transfer", async (t) => {
+  const { url, controller } = await fixture(t, {
+    workerResponse: (req, res) => {
+      req.resume();
+      res.writeHead(200);
+      res.write("started");
+      req.on("end", () => res.end("complete"));
+    },
+  });
+  const { request } = await import("node:http");
+  await new Promise((resolve, reject) => {
+    const req = request(
+      url,
+      { method: "GET", headers: { "transfer-encoding": "chunked" } },
+      (res) => {
+        res.once("data", () => req.end(Buffer.alloc(16 * 1024 * 1024 + 1)));
+        res.once("aborted", resolve);
+        res.once("error", () => {});
+        res.once("end", () => reject(Error("oversized transfer completed")));
+      },
+    );
+    req.on("error", () => {});
+    req.write("prefix");
+  });
+  assert.equal((await fetch(controller.origin + "/health")).status, 204);
+});
+
+test("unconfirmed creation cleanup fences replacement and cannot finalize as an unused execution", async (t) => {
+  const { WorkerCleanupFailure } = await import("../dist/lifecycle-errors.js");
+  let count = 0;
+  const failure = new WorkerCleanupFailure(
+    Error("browser_worker_start_failed"),
+    Error("browser_docker_unavailable"),
+  );
+  const f = await fixture(t, {
+    cleanupMayFail: true,
+    create: async () => {
+      count++;
+      throw failure;
+    },
+  });
+  assert.equal((await fetch(f.url)).status, 502);
+  assert.equal((await fetch(f.url)).status, 502);
+  assert.equal(count, 1);
+  await assert.rejects(
+    f.controller.command({ op: "finalize", executionId: f.executionId }),
+    (error) => error === failure,
+  );
+  assert.equal(f.controller.bindings.size, 1);
 });

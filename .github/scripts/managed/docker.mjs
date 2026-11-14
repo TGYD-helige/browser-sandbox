@@ -103,6 +103,11 @@ try {
       ".github/scripts/managed/harness.mjs",
       `${agent}:/project/managed-harness.mjs`,
     );
+    await docker(
+      "cp",
+      ".github/scripts/managed/screenshot-diagnostics.mjs",
+      `${agent}:/project/screenshot-diagnostics.mjs`,
+    );
     const output = await docker("start", "-a", agent);
     assert.equal(
       JSON.parse(await docker("inspect", agent))[0].State.ExitCode,
