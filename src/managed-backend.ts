@@ -19,6 +19,8 @@ export interface ManagedWorker {
 
 /** Optional platform adapter; create cleans partial resources or throws WorkerCleanupFailure when cleanup is unconfirmed. */
 export interface ManagedBackend {
+  /** Preserve published workers on controller exit; the backend owns their lifetime backstop. */
+  readonly preserveWorkersOnShutdown?: boolean;
   create(
     placement: Placement & {
       incarnation: string;

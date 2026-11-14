@@ -840,7 +840,11 @@ export async function createController(options: ControllerOptions) {
     origin,
     command,
     bindings,
-    async stop({ preserveWorkers = false }: { preserveWorkers?: boolean } = {}) {
+    async stop({
+      preserveWorkers = options.backend.preserveWorkersOnShutdown ?? false,
+    }: {
+      preserveWorkers?: boolean;
+    } = {}) {
       closing = true;
       let failure: unknown;
       if (preserveWorkers) {
@@ -852,6 +856,8 @@ export async function createController(options: ControllerOptions) {
       for (const binding of bindings.values()) {
         try {
           if (preserveWorkers) {
+            if (binding.creationFailure instanceof WorkerCleanupFailure)
+              throw binding.creationFailure;
             if (!binding.endpoint) {
               await binding.starting?.catch((error) => {
                 if (

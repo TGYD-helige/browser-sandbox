@@ -67,6 +67,7 @@ try {
     "worker",
     "agent",
     "other-worker",
+    "host",
   ].entries()) {
     apply({
       apiVersion: "v1",
@@ -78,6 +79,7 @@ try {
           "app.kubernetes.io/name": "browser-sandbox",
           "app.kubernetes.io/instance": "probe",
           "app.kubernetes.io/component": role === "other-worker" ? "worker" : role,
+          ...(role === "host" ? { "browser-sandbox.io/host-control": "true" } : {}),
         },
       },
       spec: {
@@ -92,7 +94,7 @@ try {
             command: [
               "node",
               "-e",
-              "const server=require('node:http').createServer((q,s)=>s.end('ok')).listen(8080,'0.0.0.0');process.on('SIGTERM',()=>{server.closeAllConnections();server.close(()=>process.exit(0))})",
+              "const http=require('node:http');const servers=[8080,8082].map(port=>http.createServer((q,s)=>s.end('ok')).listen(port,'0.0.0.0'));process.on('SIGTERM',()=>{for(const server of servers){server.closeAllConnections();server.close()}})",
             ],
             readinessProbe: { tcpSocket: { port: 8080 }, periodSeconds: 1 },
             securityContext: {
@@ -109,6 +111,8 @@ try {
   const controller = address("controller");
   const other = address("other-worker");
   await expectConnection("agent", worker, 8080, true);
+  await expectConnection("agent", controller, 8082, true);
+  await expectConnection("host", controller, 8082, true);
   await expectConnection("worker", controller, 8080, true);
   await expectConnection("worker", other, 8080, true);
   const api = JSON.parse(
@@ -141,6 +145,9 @@ try {
   );
   apply(policy);
   await expectConnection("agent", worker, 8080, false);
+  await expectConnection("agent", controller, 8080, true);
+  await expectConnection("agent", controller, 8082, false);
+  await expectConnection("host", controller, 8082, true);
   await expectConnection("controller", worker, 8080, true);
   await expectConnection("worker", controller, 8080, false);
   await expectConnection("worker", other, 8080, false);
@@ -148,7 +155,7 @@ try {
   await expectConnection("worker", apiNode, 6443, false);
   await expectConnection("worker", "169.254.169.254", 80, false);
   console.log(
-    "NetworkPolicy enforced across nodes: agent ingress, management, peer workers, API, metadata denied; controller ingress allowed",
+    "NetworkPolicy enforced: agent worker/control ingress, worker management/peer/API/metadata egress denied; trusted host control and agent access allowed",
   );
 } finally {
   if (created) {
