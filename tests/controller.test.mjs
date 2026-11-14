@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { setMaxListeners } from "node:events";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { createController } from "../dist/controller.js";
@@ -474,4 +475,32 @@ test("registration cannot replace a live storage callback owner", async (t) => {
   assert.equal(controller.bindings.get(registration.executionId).storagePeer, peer);
   life.abort();
   await controller.command({ ...registration, op: "storage_attach" }, other);
+});
+
+test("host storage attachments keep their bounded quota and release it on disconnect", async (t) => {
+  const controller = await createController({
+    port: 0,
+    backend: { async remove() {} },
+  });
+  t.after(() => controller.stop());
+  const life = new AbortController();
+  setMaxListeners(0, life.signal);
+  const peer = { signal: life.signal, callback: async () => ({}) };
+  for (let i = 0; i < 2000; i++)
+    await controller.command({ op: "storage_attach", executionId: randomUUID() }, peer);
+  await assert.rejects(
+    controller.command({ op: "storage_attach", executionId: randomUUID() }, peer),
+    /browser_access_capacity_exceeded/,
+  );
+  assert.equal(
+    (await controller.command({ op: "controller_status" })).executions,
+    2000,
+  );
+  life.abort();
+  const next = new AbortController();
+  t.after(() => next.abort());
+  await controller.command(
+    { op: "storage_attach", executionId: randomUUID() },
+    { signal: next.signal },
+  );
 });

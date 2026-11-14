@@ -215,9 +215,9 @@ try {
   const lostWorker = await workerIds();
   await docker("kill", lostWorker);
   results.push(await run("lost"));
-  assert.equal(
-    await workerIds(),
-    lostWorker,
+  const survivingWorker = await workerIds();
+  assert(
+    survivingWorker === "" || survivingWorker === lostWorker,
     "Loss silently allocated a replacement worker",
   );
   results.push(await run("finish-lost"));

@@ -215,8 +215,12 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         } catch (failure) {
           failures.push(failure);
         }
-        if (failures.length) throw new WorkerCleanupFailure(error, ...failures);
-        throw error;
+        const failure =
+          requestingImage && error.statusCode === 404
+            ? Error("browser_worker_image_unavailable", { cause: error })
+            : error;
+        if (failures.length) throw new WorkerCleanupFailure(failure, ...failures);
+        throw failure;
       }
     },
     async list(signal) {
@@ -230,6 +234,14 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         signal,
       );
       if (!Array.isArray(containers)) throw Error("browser_docker_response_invalid");
+      const controller = containers.length
+        ? await api(
+            `/containers/${options.controllerContainer}/json`,
+            "GET",
+            undefined,
+            signal,
+          )
+        : undefined;
       const workers: ManagedWorker[] = [];
       const accounted = new Set<string>();
       try {
@@ -245,6 +257,8 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
             incarnation = tags?.[`${prefix}incarnation`],
             network = tags?.[`${prefix}network`],
             profileId = tags?.[`${prefix}profile`] || undefined;
+          if (typeof tags?.[`${prefix}profile`] !== "string")
+            throw Error("browser_worker_discovery_failed");
           if (
             tags?.[`${prefix}installation`] !== options.installation ||
             !/^[a-f0-9-]{36}$/.test(executionId ?? "") ||
@@ -266,12 +280,6 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
             )
           )
             throw Error("browser_worker_ownership_mismatch");
-          const controller = await api(
-            `/containers/${options.controllerContainer}/json`,
-            "GET",
-            undefined,
-            signal,
-          );
           if (!net.Containers?.[controller.Id])
             await api(
               `/networks/${network}/connect`,
@@ -281,13 +289,16 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
             );
           accounted.add(network);
           networks.set(item.Id, network);
+          let runtime: ReturnType<typeof createControllerRuntime>;
           workers.push({
             id: item.Id,
             executionId,
             incarnation,
             origin,
             profileId,
-            runtime: createControllerRuntime(origin),
+            get runtime() {
+              return (runtime ??= createControllerRuntime(origin));
+            },
           });
         }
         const remaining = await api(

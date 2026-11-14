@@ -2,6 +2,8 @@ export interface WorkerSlot {
   /** Aborts creation only; the controller retains the slot until owned cleanup completes. */
   signal: AbortSignal;
   ready(): void;
+  /** Creation has stopped, but unconfirmed infrastructure still owns capacity. */
+  retain(): void;
   release(): void;
 }
 
@@ -42,6 +44,7 @@ export function createWorkerAdmission({
       return {
         signal: new AbortController().signal,
         ready() {},
+        retain() {},
         release() {
           if (released) return;
           released = true;
@@ -67,6 +70,7 @@ export function createWorkerAdmission({
           abort.abort(
             signal?.aborted ? signal.reason : Error("browser_worker_creation_timeout"),
           );
+          detach();
           if (started) return;
           const index = queue.indexOf(start);
           if (index >= 0) queue.splice(index, 1);
@@ -77,16 +81,20 @@ export function createWorkerAdmission({
           started = true;
           workers++;
           pending++;
+          const retain = () => {
+            if (!creating || released) return;
+            creating = false;
+            pending--;
+            detach();
+            drain();
+          };
           resolve({
             signal: abort.signal,
             ready() {
               abort.signal.throwIfAborted();
-              if (!creating || released) return;
-              creating = false;
-              pending--;
-              detach();
-              drain();
+              retain();
             },
+            retain,
             release() {
               if (released) return;
               released = true;

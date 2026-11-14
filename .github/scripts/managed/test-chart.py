@@ -36,24 +36,21 @@ class ChartTest(unittest.TestCase):
         self.assertEqual(len(owners), 1)
         self.assertNotIn("ownerReferences", owners[0]["metadata"])
 
-    def test_controller_state_and_optional_profiles_share_a_retained_private_volume(self):
-        resources = render("--set", "profileStore.enabled=true")
-        claims = [item for item in resources if item["kind"] == "PersistentVolumeClaim"]
-        self.assertEqual(len(claims), 1)
-        self.assertEqual(claims[0]["metadata"]["annotations"]["helm.sh/resource-policy"], "keep")
-        self.assertEqual(claims[0]["spec"]["accessModes"], ["ReadWriteOnce"])
+    def test_controller_journal_has_its_own_retained_private_volume(self):
+        resources = render()
+        claim = next(item for item in resources if item["kind"] == "PersistentVolumeClaim")
+        self.assertTrue(claim["metadata"]["name"].endswith("-data"))
+        self.assertEqual(claim["metadata"]["annotations"]["helm.sh/resource-policy"], "keep")
+        self.assertEqual(claim["spec"]["accessModes"], ["ReadWriteOnce"])
         deployment = next(item for item in resources if item["kind"] == "Deployment")
         self.assertEqual(deployment["spec"]["strategy"]["type"], "Recreate")
         pod = deployment["spec"]["template"]["spec"]
         self.assertEqual(pod["securityContext"]["fsGroup"], 20000)
-        env = {item["name"]: item.get("value") for item in pod["containers"][0]["env"]}
+        controller = pod["containers"][0]
+        env = {item["name"]: item.get("value") for item in controller["env"]}
         self.assertEqual(env["BROWSER_CONTROLLER_STATE"], "/controller-data/executions")
-        self.assertEqual(env["BROWSER_PROFILE_STORE_ROOT"], "/controller-data/profiles")
-        self.assertIn("-storage.browser-test.svc:8082", env["BROWSER_PROFILE_STORE_ORIGIN"])
-        storage = next(item for item in resources if item["kind"] == "Service" and item["metadata"]["name"].endswith("-storage"))
-        self.assertEqual(storage["spec"]["ports"][0]["port"], 8082)
-        policy = next(item for item in resources if item["kind"] == "NetworkPolicy" and item["metadata"]["name"].endswith("-controller-storage"))
-        self.assertEqual(policy["spec"]["ingress"][1]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"], "worker")
+        self.assertNotIn("BROWSER_PROFILE_STORE_ROOT", env)
+        self.assertIn({"name": "controller-data", "mountPath": "/controller-data"}, controller["volumeMounts"])
         self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in render("--set", "controllerData.existingClaim=retained")))
 
     def test_worker_network_is_private_and_internet_excludes_internal_ranges(self):
@@ -74,7 +71,7 @@ class ChartTest(unittest.TestCase):
 
     def test_profile_store_is_private_retained_and_mounted_only_by_controller(self):
         resources = render("--set", "profileStore.enabled=true")
-        claims = [item for item in resources if item["kind"] == "PersistentVolumeClaim"]
+        claims = [item for item in resources if item["kind"] == "PersistentVolumeClaim" and item["metadata"]["name"].endswith("-profiles")]
         self.assertEqual(len(claims), 1)
         self.assertEqual(claims[0]["metadata"]["annotations"]["helm.sh/resource-policy"], "keep")
         self.assertEqual(claims[0]["spec"]["accessModes"], ["ReadWriteOnce"])
@@ -89,9 +86,9 @@ class ChartTest(unittest.TestCase):
         storage = next(item for item in resources if item["kind"] == "Service" and item["metadata"]["name"].endswith("-storage"))
         self.assertEqual(storage["spec"]["type"], "ClusterIP")
         self.assertEqual(storage["spec"]["ports"][0]["port"], 8083)
-        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in render()))
+        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" and item["metadata"]["name"].endswith("-profiles") for item in render()))
         adopted = render("--set", "profileStore.enabled=true", "--set", "profileStore.existingClaim=retained")
-        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in adopted))
+        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" and item["metadata"]["name"].endswith("-profiles") for item in adopted))
         configuration = next(item for item in resources if item["kind"] == "ConfigMap" and item["metadata"]["name"].endswith("-config"))
         self.assertNotIn("profile-store", configuration["data"]["worker-template.json"])
         private = [item for item in resources if item["kind"] == "NetworkPolicy" and item["metadata"]["name"].endswith("-storage")]

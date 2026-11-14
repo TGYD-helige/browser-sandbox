@@ -28,7 +28,10 @@ export async function readKubernetesAccess(): Promise<KubernetesAccess> {
 }
 
 export class KubernetesError extends Error {
-  constructor(public status: number) {
+  constructor(
+    public status: number,
+    public quotaExceeded = false,
+  ) {
     super("browser_kubernetes_operation_failed");
   }
 }
@@ -87,7 +90,16 @@ export function createKubernetesClient(options: KubernetesAccess) {
           response.on("error", () => reject(Error("browser_kubernetes_unavailable")));
           response.on("end", () => {
             if (response.statusCode < 200 || response.statusCode >= 300) {
-              reject(new KubernetesError(response.statusCode));
+              let quotaExceeded = false;
+              if (response.statusCode === 403) {
+                try {
+                  const failure = JSON.parse(Buffer.concat(chunks).toString());
+                  quotaExceeded =
+                    typeof failure.message === "string" &&
+                    /\bexceeded quota\b/i.test(failure.message);
+                } catch {}
+              }
+              reject(new KubernetesError(response.statusCode, quotaExceeded));
               return;
             }
             try {

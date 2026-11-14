@@ -143,7 +143,7 @@ const recoveryCases = async (phase) => {
         "--",
         "env",
         `TEST_CONTROL_ORIGIN=http://${deployment}-host.${namespace}.svc:8082`,
-        `BROWSER_HOST_ARCHIVE_URL=http://host-storage.${namespace}.svc:9083/archive`,
+        `BROWSER_HOST_ARCHIVE_URL=http://${hostStorageAddress}:9083/archive`,
         `TEST_RECOVERY_PHASE=${phase}`,
         "node",
         "--input-type=module",
@@ -514,7 +514,12 @@ try {
     await kubectl("get", "pvc", `${deployment}-profiles`, "-o", "json"),
   );
   assert.equal(retainedStore.metadata.annotations["helm.sh/resource-policy"], "keep");
+  const retainedJournal = JSON.parse(
+    await kubectl("get", "pvc", `${deployment}-data`, "-o", "json"),
+  );
+  assert.equal(retainedJournal.metadata.annotations["helm.sh/resource-policy"], "keep");
   const reusedValues = JSON.parse(await readFile(values, "utf8"));
+  reusedValues.controllerData = { existingClaim: `${deployment}-data` };
   reusedValues.profileStore.existingClaim = `${deployment}-profiles`;
   await writeFile(values, JSON.stringify(reusedValues));
   installed = true;
@@ -818,7 +823,11 @@ try {
   await client("finish", deadlineHeld.executionId);
   stage = "functional client";
   const functional = await client();
-  assert.equal(functional.architecture, process.arch, "Client image must match the native runner architecture");
+  assert.equal(
+    functional.architecture,
+    process.arch,
+    "Client image must match the native runner architecture",
+  );
   assert.equal((await pods()).length, 0, "Temporary worker was not removed");
   stage = "safe uninstall";
   await client("hold");
@@ -864,6 +873,11 @@ try {
     await kubectl("get", "pvc", `${deployment}-profiles`, "-o", "json"),
   );
   assert.equal(retainedPvc.metadata.annotations["helm.sh/resource-policy"], "keep");
+  const finalJournal = JSON.parse(
+    await kubectl("get", "pvc", `${deployment}-data`, "-o", "json"),
+  );
+  assert.equal(finalJournal.metadata.uid, retainedJournal.metadata.uid);
+  assert.equal(finalJournal.metadata.annotations["helm.sh/resource-policy"], "keep");
   await wait(
     "Helm uninstall left worker Pods",
     async () => (await pods()).length === 0,

@@ -155,7 +155,13 @@ async function fixture(t, { pending = false, deleteRace = false, createStatus } 
         );
     } else if (request.method === "POST") {
       if (createStatus || state.quota) {
-        response.writeHead(createStatus ?? 403).end(JSON.stringify({ message: state.quota ? "exceeded quota: test" : "private admission diagnostic" }));
+        response.writeHead(createStatus ?? 403).end(
+          JSON.stringify({
+            message: state.quota
+              ? "exceeded quota: test"
+              : "private admission diagnostic",
+          }),
+        );
         return;
       }
       state.pod = { ...body, metadata: { ...body.metadata, uid: "original" } };
@@ -394,7 +400,7 @@ test("Kubernetes discovery recovers exact UID and rejects foreign release owners
   state.listOwner = "foreign-release";
   await assert.rejects(
     backend.list(AbortSignal.timeout(5000)),
-    /browser_worker_ownership_mismatch/,
+    /browser_worker_discovery_failed/,
   );
   state.listFailure = true;
   await assert.rejects(

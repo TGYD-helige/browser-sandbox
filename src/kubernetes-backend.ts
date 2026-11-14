@@ -399,6 +399,8 @@ export function createKubernetesBackend(
               ? "browser_worker_creation_cancelled"
               : "browser_worker_creation_timeout",
           );
+        if (error instanceof KubernetesError && error.quotaExceeded)
+          throw Error("browser_worker_quota_exceeded", { cause: error });
         throw error;
       }
     },

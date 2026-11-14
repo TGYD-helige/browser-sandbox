@@ -149,24 +149,36 @@ test("Docker discovery recovers Profile labels without connecting to workers and
   const executionId = "11111111-1111-4111-8111-111111111111";
   const incarnation = "22222222-2222-4222-8222-222222222222";
   const server = createServer((req, res) => {
-    assert(req.url.startsWith("/v1.47/containers/json?all=true&filters="));
-    const filters = JSON.parse(
-      new URL(req.url, "http://docker").searchParams.get("filters"),
-    );
-    assert.deepEqual(filters, { label: ["browser-sandbox.installation=test"] });
-    res.end(
-      JSON.stringify([
-        {
-          Id: "a".repeat(64),
-          Labels: {
-            "browser-sandbox.installation": "test",
-            "browser-sandbox.execution": executionId,
-            "browser-sandbox.incarnation": incarnation,
-            ...(known ? { "browser-sandbox.profile": "account/a" } : {}),
+    const labels = {
+      "browser-sandbox.installation": "test",
+      "browser-sandbox.execution": executionId,
+      "browser-sandbox.incarnation": incarnation,
+      ...(known ? { "browser-sandbox.profile": "account/a" } : {}),
+    };
+    if (req.url.startsWith("/v1.47/containers/json?all=true&filters=")) {
+      const filters = JSON.parse(
+        new URL(req.url, "http://docker").searchParams.get("filters"),
+      );
+      assert.deepEqual(filters, { label: ["browser-sandbox.installation=test"] });
+      res.end(JSON.stringify([{ Id: "a".repeat(64), Labels: labels }]));
+    } else if (req.url === "/v1.47/containers/controller/json")
+      res.end(JSON.stringify({ Id: "controller" }));
+    else if (req.url === `/v1.47/containers/${"a".repeat(64)}/json`)
+      res.end(
+        JSON.stringify({
+          Config: {
+            Labels: {
+              ...labels,
+              "browser-sandbox.network": "network",
+              "browser-sandbox.origin": `http://bs-${incarnation}:8081`,
+            },
           },
-        },
-      ]),
-    );
+        }),
+      );
+    else if (req.url === "/v1.47/networks/network")
+      res.end(JSON.stringify({ Labels: labels, Containers: { controller: {} } }));
+    else if (req.url.startsWith("/v1.47/networks?")) res.end("[]");
+    else assert.fail(`Unexpected Docker request ${req.method} ${req.url}`);
   });
   await new Promise((resolve) => server.listen(socketPath, resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
@@ -186,4 +198,59 @@ test("Docker discovery recovers Profile labels without connecting to workers and
     backend.list(AbortSignal.timeout(1000)),
     /browser_worker_discovery_failed/,
   );
+});
+
+test("missing Docker image reports its cause after confirmed network cleanup", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "docker-image-"));
+  const socketPath = join(root, "docker.sock");
+  let removed = false;
+  const labels = {
+    "browser-sandbox.installation": "test",
+    "browser-sandbox.execution": "execution",
+    "browser-sandbox.incarnation": "incarnation",
+    "browser-sandbox.profile": "",
+  };
+  const server = createServer((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/v1.47/networks/create")
+      res.end(JSON.stringify({ Id: "network" }));
+    else if (req.url.startsWith("/v1.47/containers/create?"))
+      res.writeHead(404).end("{}");
+    else if (req.url === "/v1.47/networks/network" && req.method === "GET")
+      res.end(
+        JSON.stringify({
+          Labels: labels,
+          Containers: { controller: { Name: "controller" } },
+        }),
+      );
+    else if (req.url === "/v1.47/networks/network" && req.method === "DELETE") {
+      removed = true;
+      res.writeHead(204).end();
+    } else res.end("{}");
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  });
+  const backend = createDockerBackend({
+    installation: "test",
+    controllerContainer: "controller",
+    image: `sha256:${"a".repeat(64)}`,
+    socketPath,
+    seccomp: {},
+  });
+  await assert.rejects(
+    backend.create(
+      { executionId: "execution", incarnation: "incarnation" },
+      AbortSignal.timeout(1000),
+    ),
+    (error) => {
+      assert.equal(error.message, "browser_worker_image_unavailable");
+      assert.equal(error.cause.statusCode, 404);
+      return true;
+    },
+  );
+  assert.equal(removed, true);
 });

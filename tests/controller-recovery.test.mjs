@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -368,6 +368,7 @@ test("unconfirmed partial creation retains capacity until successful discovery p
   const response = await fetch(fileUrl(controller, endpoint));
   assert.equal(response.status, 502);
   assert.equal(controller.capacity().workers, 1);
+  assert.equal(controller.capacity().pending, 0);
   const list = f.backend.list;
   f.backend.list = async () => {
     throw Error("browser_worker_discovery_failed");
@@ -750,4 +751,153 @@ test("late protocol mismatch preserves the original endpoint through compatible 
   const third = await f.start({ reconciliationMs: 60000 });
   assert.equal(await (await fetch(fileUrl(third, endpoint))).text(), "same-worker");
   assert.equal(f.created, 1);
+});
+
+test("a cancelled creation can retry the same registered execution", {
+  timeout: 5000,
+}, async (t) => {
+  const f = await fixture(t);
+  const entered = Promise.withResolvers();
+  const create = f.backend.create;
+  let attempts = 0,
+    failed = false;
+  f.backend.create = async (placement, signal) => {
+    if (++attempts === 1) {
+      await new Promise((_, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        entered.resolve();
+      });
+    }
+    return create(placement, signal);
+  };
+  const controller = await f.start({
+    maxWorkers: 1,
+    onWorkerEvent: (event) => {
+      if (event.type === "failed") failed = true;
+    },
+  });
+  const endpoint = await controller.command({
+    op: "register",
+    executionId: randomUUID(),
+  });
+  const caller = new AbortController();
+  const first = fetch(fileUrl(controller, endpoint), { signal: caller.signal });
+  const cancelled = assert.rejects(first);
+  await entered.promise;
+  caller.abort();
+  await cancelled;
+  await until(() => failed);
+  assert.equal(controller.capacity().workers, 0);
+  assert.equal(
+    await (await fetch(fileUrl(controller, endpoint))).text(),
+    "same-worker",
+  );
+  assert.equal(attempts, 2);
+  assert.equal(f.resources.size, 1);
+});
+
+test("a failed recovery journal write does not stop reclamation of other executions", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: 1000 });
+  const f = await fixture(t);
+  const first = await f.start({ reconciliationMs: 60000 });
+  const executionId = randomUUID();
+  const endpoint = await first.command({ op: "register", executionId });
+  await fetch(fileUrl(first, endpoint));
+  await first.stop();
+  const worker = [...f.resources.values()][0];
+  const request = worker.runtime.request;
+  worker.runtime.request = async (input) => {
+    if (input.op === "worker_status") throw Error("browser_control_disconnected");
+    return request(input);
+  };
+  const second = await f.start({ reconciliationMs: 60000, idleRegistrationMs: 100 });
+  const unused = randomUUID();
+  await second.command({ op: "register", executionId: unused });
+  const parked = `${f.directory}-unavailable`;
+  await rename(f.directory, parked);
+  try {
+    for (let i = 0; i < 3; i++) await second.reconcile();
+  } finally {
+    await rename(parked, f.directory);
+    worker.runtime.request = request;
+    t.after(async () => {
+      await second.stop({ finalize: false }).catch(() => {});
+    });
+  }
+  assert.equal(
+    (await second.command({ op: "controller_status", executionId })).execution.phase,
+    "recovery-blocked",
+  );
+  t.mock.timers.tick(100);
+  await second.reconcile();
+  assert.equal(
+    (await second.command({ op: "controller_status", executionId: unused })).execution
+      .phase,
+    "finished",
+  );
+  await assert.rejects(second.stop({ finalize: false }), { code: "ENOENT" });
+});
+
+test("discovered Pending workers retain capacity without preventing controller startup", async (t) => {
+  const f = await fixture(t);
+  const first = await f.start({ reconciliationMs: 60000 });
+  const executionId = randomUUID();
+  const endpoint = await first.command({ op: "register", executionId });
+  await fetch(fileUrl(first, endpoint));
+  await first.stop();
+  const worker = [...f.resources.values()][0];
+  f.backend.list = async () =>
+    f.resources.has(worker.id)
+      ? [
+          {
+            ...worker,
+            get runtime() {
+              throw Error("browser_worker_not_ready");
+            },
+          },
+        ]
+      : [];
+  const second = await f.start({ reconciliationMs: 60000 });
+  assert.equal(second.capacity().workers, 1);
+  for (let i = 0; i < 3; i++) await second.reconcile();
+  assert.equal(second.capacity().workers, 0);
+  assert.equal(
+    (await second.command({ op: "controller_status", executionId })).execution.phase,
+    "finished",
+  );
+});
+
+test("automatic temporary cleanup preserves status and deletion failures and closes its channel", async (t) => {
+  const f = await fixture(t);
+  const first = await f.start({ reconciliationMs: 60000 });
+  const executionId = randomUUID();
+  const endpoint = await first.command({ op: "register", executionId });
+  await fetch(fileUrl(first, endpoint));
+  await first.stop();
+  const worker = [...f.resources.values()][0];
+  const request = worker.runtime.request,
+    remove = f.backend.remove;
+  let closed = 0;
+  worker.runtime.close = () => {
+    closed++;
+  };
+  worker.runtime.request = async () => {
+    throw Error("browser_control_disconnected");
+  };
+  f.backend.remove = async () => {
+    throw Error("browser_docker_unavailable");
+  };
+  try {
+    const second = await f.start({ reconciliationMs: 60000 });
+    for (let i = 0; i < 3; i++) await second.reconcile();
+    const status = await second.command({ op: "controller_status", executionId });
+    assert.equal(status.execution.phase, "recovery-blocked");
+    assert.match(status.execution.statusError, /browser_control_disconnected/);
+    assert.match(status.execution.statusError, /browser_docker_unavailable/);
+    assert.equal(closed, 1);
+    assert.equal(second.capacity().workers, 1);
+  } finally {
+    worker.runtime.request = request;
+    f.backend.remove = remove;
+  }
 });

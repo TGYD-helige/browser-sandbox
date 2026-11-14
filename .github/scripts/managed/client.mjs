@@ -343,8 +343,12 @@ try {
           await runtime.request({ op: "register", executionId: secondId })
         ).wsEndpoint;
         const second = await connectCdp(secondEndpoint);
+        let secondIp;
         try {
           await second.call("Browser.getVersion");
+          const secondWorker = await workerFor(secondId);
+          const secondDetails = await api(`/containers/${secondWorker.Id}/json`);
+          secondIp = Object.values(secondDetails.NetworkSettings.Networks)[0].IPAddress;
           await sessionRequest(secondEndpoint, "retain", 100);
         } finally {
           second.close();
@@ -362,10 +366,6 @@ try {
           sessionRequest(secondEndpoint, "renew", 10000),
           /browser_session_lost/,
         );
-        const secondWorker = await workerFor(secondId);
-        const secondDetails = await api(`/containers/${secondWorker.Id}/json`);
-        const secondIp = Object.values(secondDetails.NetworkSettings.Networks)[0]
-          .IPAddress;
         assert((await fetch(`${workerOrigin}/health`)).ok);
         const checks = await execWorker(
           primaryWorker.Id,
