@@ -28,6 +28,9 @@ async function fixture(t) {
         id: randomUUID(),
         origin,
         runtime: {
+          async attachStorage() {
+            return { close() {} };
+          },
           async request(request) {
             if (request.op === "register")
               return {
@@ -587,20 +590,30 @@ test("revoked recovered bindings do not consume the live access grant quota", as
   );
 });
 
-test("recovery finalizes an execution when discovery confirms its worker disappeared", async (t) => {
+test("recovery releases the Profile lease when discovery confirms its worker disappeared", async (t) => {
   const f = await fixture(t);
-  const first = await f.start({ reconciliationMs: 60000 });
+  const profileStore = { open: () => ({ close: async () => {} }) };
+  const first = await f.start({ profileStore, reconciliationMs: 60000 });
   const executionId = randomUUID();
-  const endpoint = await first.command({ op: "register", executionId });
+  const endpoint = await first.command({
+    op: "register",
+    executionId,
+    profileId: "absent-profile",
+  });
   await fetch(fileUrl(first, endpoint));
   await first.stop();
   f.resources.clear();
-  const second = await f.start({ reconciliationMs: 60000 });
+  const second = await f.start({ profileStore, reconciliationMs: 60000 });
   await second.reconcile();
   const status = await second.command({ op: "controller_status", executionId });
   assert.equal(status.execution.phase, "finished");
   assert.equal(second.capacity().workers, 0);
   assert.equal(f.created, 1);
+  await second.command({
+    op: "register",
+    executionId: randomUUID(),
+    profileId: "absent-profile",
+  });
 });
 
 test("unreachable temporary recovery retries before deleting its infrastructure", async (t) => {
@@ -634,12 +647,6 @@ test("unreachable temporary recovery retries before deleting its infrastructure"
 test("unconfirmed persistent recovery becomes visible and retains its lease until explicit finish", async (t) => {
   const f = await fixture(t);
   const profileStore = { open: () => ({ close: async () => {} }) };
-  const create = f.backend.create;
-  f.backend.create = async (...args) => {
-    const worker = await create(...args);
-    worker.runtime.attachStorage = async () => ({ close() {} });
-    return worker;
-  };
   const first = await f.start({ profileStore, reconciliationMs: 60000 });
   const executionId = randomUUID();
   const endpoint = await first.command({
