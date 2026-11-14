@@ -10,7 +10,7 @@ import { WorkerCleanupFailure } from "./lifecycle-errors.js";
 import { validProfileId } from "./local-profiles.js";
 import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
 import { WORKER_ENVIRONMENT } from "./managed-backend.js";
-import { createControllerRuntime } from "./network-control.js";
+import { CONTROL_TIMEOUT_MS, createControllerRuntime } from "./network-control.js";
 
 export interface KubernetesWorkerTemplate {
   resources?: object;
@@ -38,6 +38,7 @@ export interface KubernetesBackendOptions extends KubernetesAccess {
   environment?: Record<string, string>;
   template: KubernetesWorkerTemplate;
   creationTimeoutMs?: number;
+  maxExecutionMs?: number;
 }
 
 const identity = (value: string) => /^[a-f0-9-]{36}$/.test(value);
@@ -50,12 +51,16 @@ export function createKubernetesBackend(
   const template = options.template;
   const grace = template.terminationGracePeriodSeconds ?? 60;
   const creationTimeoutMs = options.creationTimeoutMs ?? 120000;
+  const maxExecutionMs = options.maxExecutionMs ?? 3600000;
   const hardTimeoutMs = Number(options.environment?.TIMEOUT ?? 1800000);
   if (
     !dnsName(options.namespace) ||
     !dnsName(options.installation) ||
     !dnsName(options.ownerName) ||
     !/^[^\s]+@sha256:[a-f0-9]{64}$/.test(options.image) ||
+    !Number.isSafeInteger(maxExecutionMs) ||
+    maxExecutionMs < 1 ||
+    maxExecutionMs > 2147483647 ||
     !Number.isSafeInteger(hardTimeoutMs) ||
     hardTimeoutMs < 1 ||
     hardTimeoutMs > 2147483647 ||
@@ -226,7 +231,12 @@ export function createKubernetesBackend(
               automountServiceAccountToken: false,
               enableServiceLinks: false,
               activeDeadlineSeconds:
-                Math.ceil((hardTimeoutMs + creationTimeoutMs) / 1000) + grace,
+                Math.ceil(
+                  (Math.max(hardTimeoutMs, maxExecutionMs) +
+                    creationTimeoutMs +
+                    CONTROL_TIMEOUT_MS) /
+                    1000,
+                ) + grace,
               terminationGracePeriodSeconds: grace,
               imagePullSecrets: template.imagePullSecrets ?? [],
               nodeSelector: template.nodeSelector ?? {},

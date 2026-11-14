@@ -768,6 +768,18 @@ try {
   await client("replay", losing.executionId);
   await run("kubectl", ["uncordon", workerNode]);
   cordoned = undefined;
+  await run("helm", [
+    "upgrade",
+    release,
+    "charts/browser-sandbox",
+    "-n",
+    namespace,
+    "-f",
+    values,
+    "--set",
+    "capacity.maxExecutionMs=180000",
+    "--wait",
+  ]);
   const deadlineHeld = await client("hold");
   const deadlinePod = (await pods()).find(
     (pod) =>

@@ -4,6 +4,8 @@ import { type AutomationCoordinator, waitForControl } from "./automation-control
 import type { Registration, StorageAdapter } from "./host-client.js";
 import type { BrowserRuntime } from "./runtime-provider.js";
 
+export const CONTROL_TIMEOUT_MS = 180000;
+
 const code = (error: any) =>
   /^browser_[a-z_]+$/.test(error?.message) ? error.message : "browser_control_failed";
 
@@ -73,7 +75,7 @@ function connectPeer(
         const signal = AbortSignal.any([
           life.signal,
           controller.signal,
-          AbortSignal.timeout(180000),
+          AbortSignal.timeout(CONTROL_TIMEOUT_MS),
         ]);
         try {
           send({
@@ -102,7 +104,7 @@ function connectPeer(
       const signal = AbortSignal.any([
         life.signal,
         ...(options.signal ? [options.signal] : []),
-        AbortSignal.timeout(options.timeoutMs ?? 180000),
+        AbortSignal.timeout(options.timeoutMs ?? CONTROL_TIMEOUT_MS),
       ]);
       signal.throwIfAborted();
       const id = ++sequence;
@@ -231,7 +233,7 @@ export function createControllerRuntime(
     if (rpc.signal.aborted) throw Error("browser_control_disconnected");
     const signal = AbortSignal.any([
       ...(options?.signal ? [options.signal] : []),
-      AbortSignal.timeout(options?.timeoutMs ?? 180000),
+      AbortSignal.timeout(options?.timeoutMs ?? CONTROL_TIMEOUT_MS),
     ]);
     await waitForControl(ready, signal);
     return rpc.call<T>({ ...input, automation: !!automation }, { ...options, signal });

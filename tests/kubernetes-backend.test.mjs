@@ -62,6 +62,7 @@ test("Kubernetes creates an owned single-execution Pod and fences deletion by UI
     installation: "trial",
     image: `amaster/browser-sandbox@sha256:${"a".repeat(64)}`,
     environment: { TIMEOUT: "10000", PRIVATE_SECRET: "never-project" },
+    maxExecutionMs: 20000,
     template: {
       securityContext: {
         seccompProfile: { type: "Localhost", localhostProfile: "browser-sandbox.json" },
@@ -76,7 +77,7 @@ test("Kubernetes creates an owned single-execution Pod and fences deletion by UI
   assert.equal(worker.origin, "http://10.42.1.4:8081");
   assert.equal(pod.spec.restartPolicy, "Never");
   assert.equal(pod.spec.automountServiceAccountToken, false);
-  assert(pod.spec.activeDeadlineSeconds >= 70);
+  assert.equal(pod.spec.activeDeadlineSeconds, 380);
   assert.deepEqual(pod.metadata.ownerReferences, [
     {
       apiVersion: "v1",

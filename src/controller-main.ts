@@ -6,6 +6,7 @@ const root = process.env.BROWSER_PROFILE_STORE_ROOT;
 if (root)
   process.env.BROWSER_PROFILE_STORE_ORIGIN ??= `http://${process.env.BROWSER_CONTROLLER_CONTAINER ?? process.env.HOSTNAME}:8083`;
 else delete process.env.BROWSER_PROFILE_STORE_ORIGIN;
+const maxExecutionMs = Number(process.env.BROWSER_MAX_EXECUTION_MS ?? 3600000);
 const backendName = process.env.BROWSER_BACKEND ?? "docker";
 let backend: import("./managed-backend.js").ManagedBackend;
 if (backendName === "kubernetes") {
@@ -26,6 +27,7 @@ if (backendName === "kubernetes") {
     ),
     environment: process.env,
     creationTimeoutMs: Number(process.env.BROWSER_WORKER_CREATION_TIMEOUT ?? 90000),
+    maxExecutionMs,
   });
 } else if (backendName === "docker") {
   const { createDockerBackend, createDockerClient, readDockerSeccomp } = await import(
@@ -85,7 +87,7 @@ const controller = await createController({
   maxPending: Number(process.env.BROWSER_MAX_PENDING ?? 2),
   maxQueued: Number(process.env.BROWSER_MAX_QUEUED ?? 32),
   creationTimeoutMs: Number(process.env.BROWSER_WORKER_CREATION_TIMEOUT ?? 90000),
-  maxExecutionMs: Number(process.env.BROWSER_MAX_EXECUTION_MS ?? 3600000),
+  maxExecutionMs,
   idleRegistrationMs: Number(process.env.BROWSER_IDLE_REGISTRATION_MS ?? 900000),
   port: Number(process.env.BROWSER_CONTROLLER_PORT ?? 8080),
   host: process.env.BROWSER_CONTROLLER_HOST ?? "0.0.0.0",
