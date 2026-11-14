@@ -62,6 +62,45 @@ class ChartTest(unittest.TestCase):
         self.assertEqual(policy["egress"][1]["ports"], [
             {"protocol": "UDP", "port": 53}, {"protocol": "TCP", "port": 53}])
 
+    def test_profile_store_is_private_retained_and_mounted_only_by_controller(self):
+        resources = render("--set", "profileStore.enabled=true")
+        claims = [item for item in resources if item["kind"] == "PersistentVolumeClaim"]
+        self.assertEqual(len(claims), 1)
+        self.assertEqual(claims[0]["metadata"]["annotations"]["helm.sh/resource-policy"], "keep")
+        self.assertEqual(claims[0]["spec"]["accessModes"], ["ReadWriteOnce"])
+        deployment = next(item for item in resources if item["kind"] == "Deployment")
+        self.assertEqual(deployment["spec"]["strategy"]["type"], "Recreate")
+        pod = deployment["spec"]["template"]["spec"]
+        self.assertEqual(pod["securityContext"]["fsGroup"], 20000)
+        controller = pod["containers"][0]
+        environment = {item["name"]: item.get("value") for item in controller["env"]}
+        self.assertEqual(environment["BROWSER_PROFILE_STORE_ROOT"], "/var/lib/browser-sandbox/profiles")
+        self.assertTrue(environment["BROWSER_PROFILE_STORE_ORIGIN"].endswith(":8083"))
+        storage = next(item for item in resources if item["kind"] == "Service" and item["metadata"]["name"].endswith("-storage"))
+        self.assertEqual(storage["spec"]["type"], "ClusterIP")
+        self.assertEqual(storage["spec"]["ports"][0]["port"], 8083)
+        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in render()))
+        adopted = render("--set", "profileStore.enabled=true", "--set", "profileStore.existingClaim=retained")
+        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in adopted))
+        configuration = next(item for item in resources if item["kind"] == "ConfigMap" and item["metadata"]["name"].endswith("-config"))
+        self.assertNotIn("profile-store", configuration["data"]["worker-template.json"])
+        private = [item for item in resources if item["kind"] == "NetworkPolicy" and item["metadata"]["name"].endswith("-storage")]
+        self.assertEqual(len(private), 1)
+        allowed = private[0]["spec"]["ingress"]
+        self.assertEqual(allowed[0]["ports"], [{"protocol": "TCP", "port": 8083}])
+        self.assertEqual(allowed[0]["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"], "worker")
+
+    def test_host_storage_egress_matches_runtime_exact_destination(self):
+        resources = render("--set", "networkPolicy.storageEgress[0].address=10.42.1.2", "--set", "networkPolicy.storageEgress[0].port=9083")
+        deployment = next(item for item in resources if item["kind"] == "Deployment")
+        environment = {item["name"]: item.get("value") for item in deployment["spec"]["template"]["spec"]["containers"][0]["env"]}
+        self.assertEqual(environment["BROWSER_STORAGE_EGRESS"], '[{"address":"10.42.1.2","port":9083}]')
+        policy = next(item for item in resources if item["kind"] == "NetworkPolicy")
+        self.assertEqual(policy["spec"]["egress"][-1], {
+            "to": [{"ipBlock": {"cidr": "10.42.1.2/32"}}],
+            "ports": [{"protocol": "TCP", "port": 9083}],
+        })
+
     def test_worker_template_upgrade_rolls_controller_with_cleanup_budget(self):
         original = next(item for item in render() if item["kind"] == "Deployment")
         changed = next(item for item in render("--set", "worker.shmSize=1Gi") if item["kind"] == "Deployment")

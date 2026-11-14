@@ -242,6 +242,8 @@ export function createControllerRuntime(
       adapter: StorageAdapter,
       signal?: AbortSignal,
     ) {
+      if (storage.has(registration.executionId))
+        throw Error("browser_storage_already_attached");
       storage.set(registration.executionId, adapter);
       try {
         await request({ op: "storage_attach", ...registration }, { signal });
@@ -249,8 +251,12 @@ export function createControllerRuntime(
         storage.delete(registration.executionId);
         throw error;
       }
+      let closed = false;
       return {
         close() {
+          if (closed) return;
+          closed = true;
+          if (storage.get(registration.executionId) !== adapter) return;
           storage.delete(registration.executionId);
           request({
             op: "storage_detach",

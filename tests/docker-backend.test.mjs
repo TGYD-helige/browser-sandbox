@@ -69,6 +69,7 @@ test("Docker creation failure removes a network before the controller was attach
     "browser-sandbox.installation": "test",
     "browser-sandbox.execution": "execution",
     "browser-sandbox.incarnation": "incarnation",
+    "browser-sandbox.profile": "",
   };
   const server = createServer((req, res) => {
     res.setHeader("content-type", "application/json");
@@ -257,5 +258,52 @@ test("an unobserved Docker create outcome remains fenced even when cleanup sees 
       assert.equal(error.errors[0].message, "browser_docker_unavailable");
       return true;
     },
+  );
+});
+
+test("Docker discovery recovers Profile labels without connecting to workers and rejects unknown metadata", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "docker-profiles-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const socketPath = join(root, "docker.sock");
+  let known = true;
+  const executionId = "11111111-1111-4111-8111-111111111111";
+  const incarnation = "22222222-2222-4222-8222-222222222222";
+  const server = createServer((req, res) => {
+    assert(req.url.startsWith("/v1.47/containers/json?all=true&filters="));
+    const filters = JSON.parse(
+      new URL(req.url, "http://docker").searchParams.get("filters"),
+    );
+    assert.deepEqual(filters, { label: ["browser-sandbox.installation=test"] });
+    res.end(
+      JSON.stringify([
+        {
+          Id: "a".repeat(64),
+          Labels: {
+            "browser-sandbox.installation": "test",
+            "browser-sandbox.execution": executionId,
+            "browser-sandbox.incarnation": incarnation,
+            ...(known ? { "browser-sandbox.profile": "account/a" } : {}),
+          },
+        },
+      ]),
+    );
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const backend = createDockerBackend({
+    installation: "test",
+    controllerContainer: "controller",
+    image: "sha256:" + "a".repeat(64),
+    socketPath,
+    seccomp: {},
+  });
+  const [worker] = await backend.list(AbortSignal.timeout(1000));
+  assert.equal(worker.profileId, "account/a");
+  assert.equal(worker.executionId, executionId);
+  assert.equal(worker.incarnation, incarnation);
+  known = false;
+  await assert.rejects(
+    backend.list(AbortSignal.timeout(1000)),
+    /browser_worker_discovery_failed/,
   );
 });

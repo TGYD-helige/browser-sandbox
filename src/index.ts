@@ -32,6 +32,8 @@ export {
   createControllerRuntime,
   createNetworkHostControl,
 } from "./network-control.js";
+export type { ProfileStoreOptions } from "./profile-store.js";
+export { createProfileStore } from "./profile-store.js";
 export { createProfileArchive } from "./profiles.js";
 export type {
   BrowserRuntime,

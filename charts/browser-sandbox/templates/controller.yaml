@@ -35,6 +35,10 @@ spec:
         runAsNonRoot: true
         runAsUser: 20000
         runAsGroup: 20000
+        {{- if .Values.profileStore.enabled }}
+        fsGroup: 20000
+        fsGroupChangePolicy: OnRootMismatch
+        {{- end }}
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -63,6 +67,26 @@ spec:
               value: {{ .Values.hostControl.port | quote }}
             - name: BROWSER_CONTROLLER_ORIGIN
               value: {{ default (printf "http://%s.%s.svc:%v" (include "browser-sandbox.name" .) .Release.Namespace .Values.service.port) .Values.controller.publicOrigin | quote }}
+            - name: BROWSER_STORAGE_EGRESS
+              value: {{ .Values.networkPolicy.storageEgress | toJson | quote }}
+            {{- if .Values.profileStore.enabled }}
+            - name: BROWSER_PROFILE_STORE_ROOT
+              value: /var/lib/browser-sandbox/profiles
+            - name: BROWSER_PROFILE_STORE_ORIGIN
+              value: {{ printf "http://%s-storage.%s.svc:8083" (include "browser-sandbox.name" .) .Release.Namespace | quote }}
+            - name: BROWSER_PROFILE_MAX_COUNT
+              value: {{ .Values.profileStore.maxProfiles | quote }}
+            - name: BROWSER_PROFILE_MAX_BYTES
+              value: {{ .Values.profileStore.maxBytes | quote }}
+            - name: BROWSER_PROFILE_MAX_STAGED_BYTES
+              value: {{ .Values.profileStore.maxStagedBytes | quote }}
+            - name: BROWSER_PROFILE_MAX_TRANSFERS
+              value: {{ .Values.profileStore.maxTransfers | quote }}
+            {{- if .Values.profileStore.idleTtlMs }}
+            - name: BROWSER_PROFILE_IDLE_TTL_MS
+              value: {{ .Values.profileStore.idleTtlMs | quote }}
+            {{- end }}
+            {{- end }}
             {{- range $name, $value := .Values.runtime }}
             - name: {{ $name }}
               value: {{ $value | quote }}
@@ -77,6 +101,10 @@ spec:
               containerPort: {{ .Values.service.port }}
             - name: host-control
               containerPort: {{ .Values.hostControl.port }}
+            {{- if .Values.profileStore.enabled }}
+            - name: storage
+              containerPort: 8083
+            {{- end }}
           readinessProbe:
             tcpSocket:
               port: access
@@ -87,7 +115,16 @@ spec:
             - name: configuration
               mountPath: /etc/browser-sandbox
               readOnly: true
+            {{- if .Values.profileStore.enabled }}
+            - name: profile-store
+              mountPath: /var/lib/browser-sandbox
+            {{- end }}
       volumes:
         - name: configuration
           configMap:
             name: {{ include "browser-sandbox.name" . }}-config
+        {{- if .Values.profileStore.enabled }}
+        - name: profile-store
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-profiles" (include "browser-sandbox.name" .)) .Values.profileStore.existingClaim }}
+        {{- end }}
