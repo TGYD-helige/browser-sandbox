@@ -3,6 +3,7 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import test from "node:test";
 import { createKubernetesBackend } from "../dist/kubernetes-backend.js";
+import { WorkerCleanupFailure } from "../dist/lifecycle-errors.js";
 
 const executionId = "11111111-1111-4111-8111-111111111111";
 const incarnation = "22222222-2222-4222-8222-222222222222";
@@ -101,12 +102,13 @@ test("Kubernetes creates an owned single-execution Pod and fences deletion by UI
   assert.deepEqual(deleted.preconditions, { uid: "pod-uid" });
 });
 
-async function fixture(t, { pending = false, deleteRace = false } = {}) {
+async function fixture(t, { pending = false, deleteRace = false, createStatus } = {}) {
   const state = {
     pod: undefined,
     deleted: false,
     replacement: false,
     observed: undefined,
+    podReads: 0,
   };
   const server = createServer(async (request, response) => {
     const chunks = [];
@@ -126,14 +128,23 @@ async function fixture(t, { pending = false, deleteRace = false } = {}) {
         }),
       );
     } else if (request.method === "POST") {
+      if (createStatus) {
+        response
+          .writeHead(createStatus)
+          .end(JSON.stringify({ message: "private admission diagnostic" }));
+        return;
+      }
       state.pod = { ...body, metadata: { ...body.metadata, uid: "original" } };
       response.end(JSON.stringify(state.pod));
     } else if (request.method === "DELETE") {
       state.deleted = true;
       if (deleteRace) response.writeHead(404);
       response.end("{}");
-    } else if (state.deleted) response.writeHead(404).end("{}");
-    else {
+    } else if (state.deleted || !state.pod) {
+      state.podReads++;
+      response.writeHead(404).end("{}");
+    } else {
+      state.podReads++;
       response.end(
         JSON.stringify({
           ...state.pod,
@@ -209,4 +220,47 @@ test("cleanup is idempotent when eviction removes the Pod immediately before DEL
   );
   t.after(() => worker.runtime.close());
   await backend.remove(worker, AbortSignal.timeout(5000));
+});
+
+for (const status of [400, 401, 403, 404, 409, 422, 429]) {
+  test(`rejected Pod creation (${status}) reports the API failure without cleanup`, async (t) => {
+    const { backend, state } = await fixture(t, { createStatus: status });
+    await assert.rejects(
+      backend.create({ executionId, incarnation }, AbortSignal.timeout(5000)),
+      (error) => {
+        assert.equal(error.message, "browser_kubernetes_operation_failed");
+        assert.equal(error.status, status);
+        return true;
+      },
+    );
+    assert.equal(state.podReads, 0);
+    assert.equal(state.deleted, false);
+  });
+}
+
+test("an ambiguous Pod create failure retains the unconfirmed-cleanup contract", async (t) => {
+  const { backend } = await fixture(t, { createStatus: 500 });
+  await assert.rejects(
+    backend.create({ executionId, incarnation }, AbortSignal.timeout(5000)),
+    (error) => {
+      assert(error instanceof WorkerCleanupFailure);
+      assert.equal(error.errors[0].message, "browser_kubernetes_operation_failed");
+      return true;
+    },
+  );
+});
+
+test("matching labels and Pod UID cannot authorize deletion under a foreign owner UID", async (t) => {
+  const { backend, state } = await fixture(t);
+  const worker = await backend.create(
+    { executionId, incarnation },
+    AbortSignal.timeout(5000),
+  );
+  t.after(() => worker.runtime.close());
+  state.pod.metadata.ownerReferences[0].uid = "foreign-owner";
+  await assert.rejects(
+    backend.remove(worker, AbortSignal.timeout(5000)),
+    /browser_worker_ownership_mismatch/,
+  );
+  assert.equal(state.deleted, false);
 });

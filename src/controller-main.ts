@@ -53,7 +53,7 @@ const controller = await createController({
 for (const signal of ["SIGINT", "SIGTERM"])
   process.once(signal, async () => {
     try {
-      await controller.stop({ preserveWorkers: backendName === "kubernetes" });
+      await controller.stop();
       process.exit(0);
     } catch {
       process.exit(1);

@@ -29,15 +29,15 @@ class ChartTest(unittest.TestCase):
         self.assertEqual(controller["image"], "amaster/browser-sandbox@sha256:" + "a" * 64)
         self.assertEqual(controller["securityContext"]["capabilities"]["drop"], ["ALL"])
         roles = [item for item in resources if item["kind"] == "Role"]
-        self.assertEqual(len(roles), 1)
-        self.assertFalse(any("*" in rule.get("resources", []) for rule in roles[0]["rules"]))
+        self.assertEqual(len(roles), 2)
+        self.assertFalse(any("*" in rule.get("resources", []) for role in roles for rule in role["rules"]))
         owners = [item for item in resources if item["kind"] == "ConfigMap" and
                   item["metadata"]["name"].endswith("-workers")]
         self.assertEqual(len(owners), 1)
         self.assertNotIn("ownerReferences", owners[0]["metadata"])
 
     def test_worker_network_is_private_and_internet_excludes_internal_ranges(self):
-        policies = [item for item in render() if item["kind"] == "NetworkPolicy"]
+        policies = [item for item in render() if item["kind"] == "NetworkPolicy" and item["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "worker"]
         self.assertEqual(len(policies), 1)
         policy = policies[0]["spec"]
         self.assertEqual(policy["policyTypes"], ["Ingress", "Egress"])
@@ -71,6 +71,42 @@ class ChartTest(unittest.TestCase):
         self.assertEqual(container["command"], ["node", "/opt/browser-sandbox/dist/kubernetes-drain-main.js"])
         self.assertEqual(container["securityContext"]["capabilities"]["drop"], ["ALL"])
         self.assertGreater(hook["spec"]["activeDeadlineSeconds"], 180)
+
+    def test_runtime_cannot_override_controller_owned_environment(self):
+        for name in ["BROWSER_IMAGE", "BROWSER_BACKEND", "BROWSER_INSTALLATION", "BROWSER_HOST_CONTROL_HOST", "KUBERNETES_SERVICE_HOST", "NODE_OPTIONS"]:
+            with self.subTest(name=name):
+                with self.assertRaises(subprocess.CalledProcessError) as error:
+                    render("--set-string", f"runtime.{name}=override")
+                self.assertNotEqual(error.exception.returncode, 0)
+
+    def test_drain_and_controller_have_separate_least_privilege_roles(self):
+        resources = render()
+        deployment = next(item for item in resources if item["kind"] == "Deployment")
+        hook = next(item for item in resources if item["kind"] == "Job")
+        controller_sa = deployment["spec"]["template"]["spec"]["serviceAccountName"]
+        drain_sa = hook["spec"]["template"]["spec"]["serviceAccountName"]
+        self.assertNotEqual(controller_sa, drain_sa)
+        bindings = {item["subjects"][0]["name"]: item["roleRef"]["name"] for item in resources if item["kind"] == "RoleBinding"}
+        roles = {item["metadata"]["name"]: item["rules"] for item in resources if item["kind"] == "Role"}
+        controller_rules = roles[bindings[controller_sa]]
+        drain_rules = roles[bindings[drain_sa]]
+        self.assertFalse(any("watch" in rule["verbs"] or "deployments/scale" in rule["resources"] for rule in controller_rules))
+        self.assertFalse(any("create" in rule["verbs"] or "watch" in rule["verbs"] for rule in drain_rules))
+        scale = next(rule for rule in drain_rules if "deployments/scale" in rule["resources"])
+        self.assertEqual(scale["resourceNames"], [deployment["metadata"]["name"]])
+        self.assertEqual(set(scale["verbs"]), {"get", "patch"})
+
+    def test_host_control_is_private_and_separate_from_agent_service(self):
+        resources = render()
+        services = {item["metadata"]["name"]: item["spec"] for item in resources if item["kind"] == "Service"}
+        self.assertEqual([port["port"] for port in services["trial-browser"]["ports"]], [8080])
+        self.assertEqual(services["trial-browser-host"]["type"], "ClusterIP")
+        self.assertEqual([port["port"] for port in services["trial-browser-host"]["ports"]], [8082])
+        policy = next(item["spec"] for item in resources if item["kind"] == "NetworkPolicy" and item["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "controller")
+        access = next(rule for rule in policy["ingress"] if rule["ports"][0]["port"] == 8080)
+        host = next(rule for rule in policy["ingress"] if rule["ports"][0]["port"] == 8082)
+        self.assertNotIn("from", access)
+        self.assertEqual(host["from"], [{"podSelector": {"matchLabels": {"browser-sandbox.io/host-control": "true"}}}])
 
 
 if __name__ == "__main__":
