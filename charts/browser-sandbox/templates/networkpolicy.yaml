@@ -36,3 +36,25 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-controller
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "browser-sandbox.labels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+    {{- if .Values.hostControl.allowedPeers }}
+    - from: {{ .Values.hostControl.allowedPeers | toJson }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.hostControl.port }}
+    {{- end }}

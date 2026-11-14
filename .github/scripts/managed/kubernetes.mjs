@@ -85,7 +85,7 @@ const client = async (action = "functional", executionId) =>
         "client",
         "--",
         "env",
-        `TEST_CONTROLLER_ORIGIN=http://${deployment}.${namespace}.svc:8080`,
+        `TEST_CONTROL_ORIGIN=http://${deployment}-host.${namespace}.svc:8082`,
         `TEST_ACTION=${action}`,
         ...(executionId ? [`TEST_EXECUTION_ID=${executionId}`] : []),
         "node",
@@ -116,6 +116,11 @@ try {
   }
   const nodes = JSON.parse(await kubectl("get", "nodes", "-o", "json")).items;
   assert(nodes.length >= 3, "A three-node cluster is required");
+  const expectedArchitecture = process.arch === "x64" ? "amd64" : process.arch;
+  assert(
+    nodes.every((node) => node.status.nodeInfo.architecture === expectedArchitecture),
+    "Cluster nodes must match the native runner architecture",
+  );
   const server = nodes.find(
     (node) =>
       node.metadata.labels["node-role.kubernetes.io/control-plane"] !== undefined,
@@ -225,6 +230,7 @@ try {
   await kubectl(
     "run",
     "client",
+    "--labels=browser-sandbox.io/host-control=true",
     `--image=${clientImage}`,
     "--restart=Never",
     "--overrides=" +
@@ -240,6 +246,11 @@ try {
   await kubectl("wait", "--for=condition=Ready", "pod/client", "--timeout=120s");
   stage = "functional client";
   const functional = await client();
+  assert.equal(
+    functional.architecture,
+    process.arch,
+    "Client image must match the native runner architecture",
+  );
   assert.equal((await pods()).length, 0, "Temporary worker was not removed");
   stage = "rollout and drain";
   const held = await client("hold");

@@ -1,3 +1,8 @@
+{{- range $name, $_ := .Values.runtime }}
+{{- if not (has $name (list "TIMEOUT" "TZ" "BROWSER_STARTUP_TIMEOUT" "LANG")) }}
+{{- fail (printf "runtime.%s is not a shared worker setting; controller environment is managed by the chart" $name) }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -52,6 +57,10 @@ spec:
               value: {{ include "browser-sandbox.name" . }}-workers
             - name: BROWSER_CONTROLLER_PORT
               value: {{ .Values.service.port | quote }}
+            - name: BROWSER_HOST_CONTROL_HOST
+              value: "0.0.0.0"
+            - name: BROWSER_HOST_CONTROL_PORT
+              value: {{ .Values.hostControl.port | quote }}
             - name: BROWSER_CONTROLLER_ORIGIN
               value: {{ default (printf "http://%s.%s.svc:%v" (include "browser-sandbox.name" .) .Release.Namespace .Values.service.port) .Values.controller.publicOrigin | quote }}
             {{- range $name, $value := .Values.runtime }}
@@ -66,6 +75,8 @@ spec:
           ports:
             - name: access
               containerPort: {{ .Values.service.port }}
+            - name: host-control
+              containerPort: {{ .Values.hostControl.port }}
           readinessProbe:
             tcpSocket:
               port: access

@@ -34,3 +34,18 @@ spec:
                 port:
                   name: access
 {{- end }}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-host
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "browser-sandbox.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+  ports:
+    - name: host-control
+      port: {{ .Values.hostControl.port }}
+      targetPort: host-control

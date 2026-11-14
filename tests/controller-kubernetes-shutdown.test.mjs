@@ -10,6 +10,7 @@ test("Kubernetes rollout disconnects clients while preserving an allocated worke
   const controller = await createController({
     port: 0,
     backend: {
+      preserveWorkersOnShutdown: true,
       async create(placement) {
         return {
           ...placement,
@@ -39,7 +40,7 @@ test("Kubernetes rollout disconnects clients while preserving an allocated worke
     const endpoint = await controller.command({ op: "register", executionId });
     await fetch(endpoint.wsEndpoint.replace("ws:", "http:") + "/files/test");
   } finally {
-    await controller.stop({ preserveWorkers: true });
+    await controller.stop();
   }
   assert.equal(removed, 0);
   assert.equal(finalized, 0);
@@ -79,3 +80,27 @@ for (const code of [
     await assert.rejects(controller.stop({ preserveWorkers: true }), new RegExp(code));
     await request;
   });
+
+test("backend-preserving shutdown reports an earlier unconfirmed creation failure", async () => {
+  const { WorkerCleanupFailure } = await import("../dist/lifecycle-errors.js");
+  const failure = new WorkerCleanupFailure(
+    Error("browser_kubernetes_operation_failed"),
+    Error("browser_worker_cleanup_unconfirmed"),
+  );
+  const controller = await createController({
+    port: 0,
+    backend: {
+      preserveWorkersOnShutdown: true,
+      async create() {
+        throw failure;
+      },
+      async remove() {},
+    },
+  });
+  const { wsEndpoint } = await controller.command({
+    op: "register",
+    executionId: randomUUID(),
+  });
+  await fetch(`${wsEndpoint.replace("ws:", "http:")}/files/test`);
+  await assert.rejects(controller.stop(), (error) => error === failure);
+});

@@ -9,9 +9,16 @@ export interface KubernetesAccess {
   ca?: Buffer;
   tokenFile?: string;
 }
+function defaultApiServer(): string {
+  const host = process.env.KUBERNETES_SERVICE_HOST;
+  if (!host) throw Error("browser_kubernetes_api_host_required");
+  return `https://${isIP(host) === 6 ? `[${host}]` : host}:${process.env.KUBERNETES_SERVICE_PORT_HTTPS ?? 443}`;
+}
 export async function readKubernetesAccess(): Promise<KubernetesAccess> {
+  const apiServer = defaultApiServer();
   const directory = "/var/run/secrets/kubernetes.io/serviceaccount";
   return {
+    apiServer,
     namespace:
       process.env.BROWSER_KUBERNETES_NAMESPACE ??
       (await readFile(`${directory}/namespace`, "utf8")).trim(),
@@ -22,18 +29,12 @@ export async function readKubernetesAccess(): Promise<KubernetesAccess> {
 
 export class KubernetesError extends Error {
   constructor(public status: number) {
-    super(
-      status === 404 ? "browser_worker_lost" : "browser_kubernetes_operation_failed",
-    );
+    super("browser_kubernetes_operation_failed");
   }
 }
 
 export function createKubernetesClient(options: KubernetesAccess) {
-  const host = process.env.KUBERNETES_SERVICE_HOST;
-  const server = new URL(
-    options.apiServer ??
-      `https://${isIP(host) === 6 ? `[${host}]` : host}:${process.env.KUBERNETES_SERVICE_PORT_HTTPS ?? 443}`,
-  );
+  const server = new URL(options.apiServer ?? defaultApiServer());
   if (
     server.username ||
     server.password ||

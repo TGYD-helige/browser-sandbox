@@ -19,7 +19,7 @@ spec:
         app.kubernetes.io/component: maintenance
     spec:
       restartPolicy: Never
-      serviceAccountName: {{ include "browser-sandbox.name" . }}
+      serviceAccountName: {{ include "browser-sandbox.name" . }}-drain
       imagePullSecrets: {{ .Values.imagePullSecrets | toJson }}
       nodeSelector: {{ .Values.controller.nodeSelector | toJson }}
       tolerations: {{ .Values.controller.tolerations | toJson }}

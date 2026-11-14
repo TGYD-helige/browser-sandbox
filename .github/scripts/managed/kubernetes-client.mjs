@@ -12,7 +12,7 @@ const { connectCdp } = await import(`${root}/dist/cdp.js`);
 const { createControllerRuntime, sessionRequest } = await import(
   `${root}/dist/index.js`
 );
-const runtime = createControllerRuntime(process.env.TEST_CONTROLLER_ORIGIN);
+const runtime = createControllerRuntime(process.env.TEST_CONTROL_ORIGIN);
 const executionId = process.env.TEST_EXECUTION_ID ?? randomUUID();
 const action = process.env.TEST_ACTION ?? "functional";
 let cdp;

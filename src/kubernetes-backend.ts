@@ -6,6 +6,7 @@ import {
   type KubernetesAccess,
   KubernetesError,
 } from "./kubernetes-api.js";
+import { WorkerCleanupFailure } from "./lifecycle-errors.js";
 import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
 import { WORKER_ENVIRONMENT } from "./managed-backend.js";
 import { createControllerRuntime } from "./network-control.js";
@@ -81,7 +82,12 @@ export function createKubernetesBackend(
     [prefix + "execution"]: executionId,
     [prefix + "incarnation"]: incarnation,
   });
-  const owned = (pod: any, expected: Record<string, string>, uid?: string) => {
+  const owned = (
+    pod: any,
+    expected: Record<string, string>,
+    ownerUid: string,
+    uid?: string,
+  ) => {
     if (
       (uid && pod.metadata.uid !== uid) ||
       !Object.entries(expected).every(
@@ -89,13 +95,30 @@ export function createKubernetesBackend(
       ) ||
       !pod.metadata.ownerReferences?.some(
         (owner) =>
+          owner.apiVersion === "v1" &&
           owner.kind === "ConfigMap" &&
           owner.name === options.ownerName &&
+          owner.uid === ownerUid &&
           owner.controller === true,
       )
     )
       throw Error("browser_worker_ownership_mismatch");
   };
+  async function readOwner(signal: AbortSignal): Promise<string> {
+    const owner = await api(
+      `${base}/configmaps/${options.ownerName}`,
+      "GET",
+      undefined,
+      signal,
+    );
+    if (
+      owner.metadata?.labels?.["app.kubernetes.io/instance"] !== options.installation ||
+      owner.metadata.labels["app.kubernetes.io/name"] !== "browser-sandbox" ||
+      !owner.metadata.uid
+    )
+      throw Error("browser_worker_ownership_mismatch");
+    return owner.metadata.uid;
+  }
   async function getPod(name: string, signal: AbortSignal) {
     try {
       return await api(`${base}/pods/${name}`, "GET", undefined, signal);
@@ -116,7 +139,7 @@ export function createKubernetesBackend(
       if (requirePresent) throw Error("browser_worker_cleanup_unconfirmed");
       return;
     }
-    owned(pod, expected, uid);
+    owned(pod, expected, await readOwner(signal), uid);
     await api(
       `${base}/pods/${name}`,
       "DELETE",
@@ -137,6 +160,7 @@ export function createKubernetesBackend(
     }
   }
   return {
+    preserveWorkersOnShutdown: true,
     async create(placement, callerSignal) {
       if (!identity(placement.executionId) || !identity(placement.incarnation))
         throw Error("browser_identity_invalid");
@@ -146,19 +170,7 @@ export function createKubernetesBackend(
       ]);
       const expected = labels(placement.executionId, placement.incarnation);
       const name = `bs-${options.installation.slice(0, 30)}-${createHash("sha256").update(placement.incarnation).digest("hex").slice(0, 20)}`;
-      const owner = await api(
-        `${base}/configmaps/${options.ownerName}`,
-        "GET",
-        undefined,
-        signal,
-      );
-      if (
-        owner.metadata?.labels?.["app.kubernetes.io/instance"] !==
-          options.installation ||
-        owner.metadata.labels["app.kubernetes.io/name"] !== "browser-sandbox" ||
-        !owner.metadata.uid
-      )
-        throw Error("browser_worker_ownership_mismatch");
+      const ownerUid = await readOwner(signal);
       let attempted = false;
       let uid: string;
       try {
@@ -202,7 +214,7 @@ export function createKubernetesBackend(
                   apiVersion: "v1",
                   kind: "ConfigMap",
                   name: options.ownerName,
-                  uid: owner.metadata.uid,
+                  uid: ownerUid,
                   controller: true,
                   blockOwnerDeletion: false,
                 },
@@ -289,7 +301,7 @@ export function createKubernetesBackend(
         while (true) {
           const state = await getPod(name, signal);
           if (!state) throw Error("browser_worker_lost");
-          owned(state, expected, uid);
+          owned(state, expected, ownerUid, uid);
           if (
             state.metadata.deletionTimestamp ||
             ["Failed", "Succeeded"].includes(state.status?.phase)
@@ -332,10 +344,14 @@ export function createKubernetesBackend(
           await delay(100, undefined, { signal });
         }
       } catch (error) {
-        if (
-          attempted &&
-          !(error instanceof KubernetesError && error.status === 409 && !uid)
-        ) {
+        const rejected =
+          !uid &&
+          error instanceof KubernetesError &&
+          error.status >= 400 &&
+          error.status < 500 &&
+          error.status !== 408 &&
+          error.status !== 499;
+        if (attempted && !rejected) {
           try {
             await removeOwned(
               name,
@@ -344,11 +360,11 @@ export function createKubernetesBackend(
               uid,
               !uid,
             );
-          } catch {
-            throw Error("browser_worker_cleanup_unconfirmed");
+          } catch (cleanup) {
+            throw new WorkerCleanupFailure(error, cleanup);
           }
         }
-        if (signal.aborted)
+        if (signal.aborted && !rejected)
           throw Error(
             callerSignal.aborted
               ? "browser_worker_creation_cancelled"
