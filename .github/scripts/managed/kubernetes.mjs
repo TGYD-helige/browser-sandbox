@@ -313,6 +313,7 @@ try {
       JSON.stringify({
         spec: {
           automountServiceAccountToken: false,
+          nodeName: server,
           containers: [
             {
               name: "host-storage",
