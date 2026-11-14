@@ -35,7 +35,9 @@ for (const mode of ["host", "volume"])
       browserVersion: async () => "Google Chrome 146.0.7680.177",
     });
     const workers = new Map();
-    let removed = 0;
+    let removed = 0,
+      finalizations = 0,
+      failRemoval = false;
     const backend = {
       async list() {
         return [...workers.values()];
@@ -51,6 +53,7 @@ for (const mode of ["host", "volume"])
           gid: process.getgid(),
         };
         let adapter;
+        let closed = false;
         let restored = false;
         const server = createServer(async (req, res) => {
           if (!restored) {
@@ -90,7 +93,11 @@ for (const mode of ["host", "volume"])
               adapter = storage;
               return { close() {} };
             },
+            close() {
+              closed = true;
+            },
             async request(request) {
+              if (closed) throw Error("browser_control_disconnected");
               if (request.op === "register") {
                 return {
                   cdpUrl:
@@ -99,6 +106,7 @@ for (const mode of ["host", "volume"])
                 };
               }
               assert.equal(request.op, "finalize");
+              finalizations++;
               const result = await archive.save(
                 entry,
                 await adapter.save(AbortSignal.timeout(5000)),
@@ -116,6 +124,10 @@ for (const mode of ["host", "volume"])
         return worker;
       },
       async remove(worker) {
+        if (failRemoval) {
+          failRemoval = false;
+          throw Error("browser_synthetic_worker_removal_failed");
+        }
         removed++;
         worker.server.closeAllConnections();
         await new Promise((resolve) => worker.server.close(resolve));
@@ -129,7 +141,14 @@ for (const mode of ["host", "volume"])
       profileStore: store,
     });
     t.after(async () => {
-      await controller.stop();
+      try {
+        await controller.stop();
+      } finally {
+        for (const worker of workers.values()) {
+          worker.server.closeAllConnections();
+          await new Promise((resolve) => worker.server.close(resolve));
+        }
+      }
     });
     const runtime = createControllerRuntime(controller.controlOrigin);
     t.after(() => runtime.close());
@@ -183,7 +202,25 @@ for (const mode of ["host", "volume"])
       await assert.rejects(open(), /browser_profile_busy/);
       failCommit = false;
     }
-    await runtime.request({ op: "finalize", executionId: first.executionId });
+    failRemoval = true;
+    await assert.rejects(
+      runtime.request({ op: "finalize", executionId: first.executionId }),
+      /browser_synthetic_worker_removal_failed/,
+    );
+    const saves = finalizations;
+    await assert.rejects(open(), /browser_profile_busy/);
+    const saved = await runtime.request({
+      op: "finalize",
+      executionId: first.executionId,
+    });
+    assert.equal(saved.stopped, true);
+    assert.equal(saved.used, true);
+    assert.match(saved.archive.sha256, /^[a-f0-9]{64}$/);
+    assert.equal(
+      finalizations,
+      saves,
+      "Cleanup retry must not repeat a confirmed save",
+    );
     const next = await open();
     assert.equal(await (await fetch(next.url)).text(), "confirmed native data");
     await runtime.request({ op: "finalize", executionId: next.executionId });

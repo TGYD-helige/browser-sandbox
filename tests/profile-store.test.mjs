@@ -378,12 +378,16 @@ test("failed metadata durability never lets adapter cleanup delete the last conf
     saved.archive.sha256,
   );
   const open = fs.open.bind(fs);
+  let directorySyncs = 0;
   t.mock.method(fs, "open", async (filename, ...args) => {
     const handle = await open(filename, ...args);
-    if (filename === f.root)
+    if (filename === f.root) {
+      const sync = handle.sync.bind(handle);
       t.mock.method(handle, "sync", async () => {
-        throw Error("synthetic_directory_sync_failed");
+        if (++directorySyncs === 2) throw Error("synthetic_directory_sync_failed");
+        await sync();
       });
+    }
     return handle;
   });
   await assert.rejects(
@@ -449,4 +453,73 @@ test("archive GET fails before publishing success when its file cannot open", as
   const { seed } = await adapter.load(signal());
   await fs.unlink(path.join(f.root, `${saved.archive.objectKey}.archive`));
   assert.equal((await fetch(seed.url)).status, 503);
+});
+
+test("a failed adapter close can retry cleanup and release its Profile", async (t) => {
+  const f = await fixture(t);
+  const adapter = f.store.open("account");
+  const first = await upload(adapter, Buffer.from("old archive"));
+  await adapter.commit(first, signal());
+  const next = await upload(
+    adapter,
+    Buffer.from("confirmed archive"),
+    first.archive.sha256,
+  );
+  await adapter.commit(next, signal());
+  const unlink = fs.unlink.bind(fs);
+  let failed = false;
+  t.mock.method(fs, "unlink", async (filename) => {
+    if (
+      !failed &&
+      filename === path.join(f.root, `${first.archive.objectKey}.archive`)
+    ) {
+      failed = true;
+      throw Object.assign(Error("synthetic cleanup failure"), { code: "EIO" });
+    }
+    return unlink(filename);
+  });
+  await assert.rejects(adapter.close(), /synthetic cleanup failure/);
+  assert.throws(() => f.store.open("account"), /browser_profile_busy/);
+  await adapter.close();
+  const replacement = f.store.open("account");
+  const { seed } = await replacement.load(signal());
+  assert.equal(await (await fetch(seed.url)).text(), "confirmed archive");
+  await adapter.close();
+  assert.throws(() => f.store.open("account"), /browser_profile_busy/);
+  await replacement.close();
+});
+
+test("archive directory entries are durable before publishing the referencing index", async (t) => {
+  const f = await fixture(t);
+  const events = [];
+  const open = fs.open.bind(fs),
+    rename = fs.rename.bind(fs);
+  t.mock.method(fs, "open", async (filename, ...args) => {
+    const handle = await open(filename, ...args);
+    if (filename === f.root) {
+      const sync = handle.sync.bind(handle);
+      t.mock.method(handle, "sync", async () => {
+        await sync();
+        events.push("directory synced");
+      });
+    }
+    return handle;
+  });
+  t.mock.method(fs, "rename", async (source, target) => {
+    await rename(source, target);
+    events.push(target.endsWith(".archive") ? "archive renamed" : "index renamed");
+  });
+  const adapter = f.store.open("account");
+  await adapter.commit(await upload(adapter, Buffer.from("archive")), signal());
+  const archive = events.indexOf("archive renamed"),
+    index = events.indexOf("index renamed");
+  assert(archive >= 0 && index > archive);
+  assert(
+    events.slice(archive + 1, index).includes("directory synced"),
+    "Archive rename must be durable before index rename",
+  );
+  assert(
+    events.slice(index + 1).includes("directory synced"),
+    "Index rename must also be durable before confirmation",
+  );
 });

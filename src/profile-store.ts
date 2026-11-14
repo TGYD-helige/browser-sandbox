@@ -202,6 +202,14 @@ export async function createProfileStore({
     await fs.unlink(filename);
     diskBytes -= bytes.size;
   }
+  async function syncDirectory() {
+    const directory = await fs.open(root, "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  }
   async function publish(next: Record<string, StoredProfile>, signal?: AbortSignal) {
     check(signal);
     const temporary = path.join(root, `${randomBytes(32).toString("hex")}.index`);
@@ -216,16 +224,12 @@ export async function createProfileStore({
       } finally {
         await handle.close();
       }
+      await syncDirectory();
       check(signal);
       await fs.rename(temporary, indexFile);
       // A failed durability barrier is unknown state; stop admission until restart.
       try {
-        const directory = await fs.open(root, "r");
-        try {
-          await directory.sync();
-        } finally {
-          await directory.close();
-        }
+        await syncDirectory();
       } catch (error) {
         poisoned = true;
         throw error;
@@ -386,7 +390,10 @@ export async function createProfileStore({
               }
             }, true);
             if (sessions.get(profileId) === session) sessions.delete(profileId);
-          })());
+          })().catch((error) => {
+            closing = undefined;
+            throw error;
+          }));
         },
       };
     },

@@ -404,8 +404,8 @@ for (const mode of ["volume", "host", "host-disconnect"])
           origin: "http://127.0.0.1:9",
           runtime: {
             request: async () => ({ cdpUrl: "ws://127.0.0.1:9", viewerToken: "token" }),
-            attachStorage: async (_registration, _adapter, options) => {
-              setupSignal = options?.signal;
+            attachStorage: async (_registration, _adapter, signal) => {
+              setupSignal = signal;
               entered.resolve();
               await Promise.race([
                 release.promise,
