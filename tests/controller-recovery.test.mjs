@@ -602,3 +602,31 @@ test("recovery finalizes an execution when discovery confirms its worker disappe
   assert.equal(second.capacity().workers, 0);
   assert.equal(f.created, 1);
 });
+
+test("unreachable temporary recovery retries before deleting its infrastructure", async (t) => {
+  const f = await fixture(t);
+  const first = await f.start({ reconciliationMs: 60000 });
+  const executionId = randomUUID();
+  const endpoint = await first.command({ op: "register", executionId });
+  await fetch(fileUrl(first, endpoint));
+  await first.stop();
+  const worker = [...f.resources.values()][0];
+  const request = worker.runtime.request;
+  worker.runtime.request = async () => {
+    throw Error("browser_control_disconnected");
+  };
+  const second = await f.start({ reconciliationMs: 60000 });
+  t.after(() => {
+    worker.runtime.request = request;
+  });
+  await second.reconcile();
+  await second.reconcile();
+  assert.equal(f.resources.size, 1);
+  await second.reconcile();
+  assert.equal(f.resources.size, 0);
+  assert.equal(second.capacity().workers, 0);
+  assert.equal(
+    (await second.command({ op: "controller_status", executionId })).execution.phase,
+    "finished",
+  );
+});
