@@ -9,6 +9,9 @@ import { promisify } from "node:util";
 
 const root = process.env.BROWSER_PACKAGE_ROOT ?? "/project";
 const { connectCdp } = await import(`${root}/dist/cdp.js`);
+const { selectScreenshotTab } = await import(
+  `${root}/.github/scripts/managed/screenshot-tab.mjs`
+);
 const { createControllerRuntime, sessionRequest } = await import(
   `${root}/dist/index.js`
 );
@@ -316,8 +319,8 @@ try {
         process.env.TEST_AGENT_BROWSER_CLI ??
         "/project/.github/scripts/e2e/node_modules/agent-browser/bin/agent-browser.js";
       const cliSession = `managed-${randomUUID().slice(0, 8)}`;
-      const call = async (...args) =>
-        JSON.parse(
+      const call = async (...args) => {
+        const response = JSON.parse(
           (
             await promisify(execFile)(
               process.execPath,
@@ -338,10 +341,14 @@ try {
             )
           ).stdout,
         );
+        assert(response.success);
+        return response.data;
+      };
       try {
-        assert((await call("open", "data:text/html,<h1>Managed harness</h1>")).success);
-        assert((await call("snapshot")).success);
-        assert((await call("screenshot", join(home, "page.png"))).success);
+        await call("open", "data:text/html,<h1>Managed harness</h1>");
+        await call("snapshot");
+        await selectScreenshotTab(call);
+        await call("screenshot", join(home, "page.png"));
         assert((await stat(join(home, "page.png"))).size > 100);
       } finally {
         await call("close");

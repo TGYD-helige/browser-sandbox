@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { connectCdp } from "/project/dist/cdp.js";
 import { diagnoseScreenshot } from "./screenshot-diagnostics.mjs";
+import { selectScreenshotTab } from "./screenshot-tab.mjs";
 
 const home = await mkdtemp(join(tmpdir(), "managed-harness-"));
 const cli = join(
@@ -70,21 +71,7 @@ try {
   );
   await call("open", "data:text/html,<h1>Managed harness</h1>");
   await call("snapshot");
-  const before = (await call("eval", "document.visibilityState")).result;
-  const { tabs } = await call("tab");
-  const active = tabs.find((tab) => tab.active);
-  assert(active, "Retained browser has no selected tab");
-  const selected = await call("tab", active.tabId);
-  assert.equal(selected.targetId, active.targetId);
-  assert.notEqual(selected.revived, true, "Tab selection reloaded the retained page");
-  const after = (await call("eval", "document.visibilityState")).result;
-  console.error(
-    "managed_tab_selection " +
-      JSON.stringify({
-        before: ["visible", "hidden"].includes(before) ? before : "unknown",
-        after: ["visible", "hidden"].includes(after) ? after : "unknown",
-      }),
-  );
+  await selectScreenshotTab(call);
   const screenshot = join(home, "screenshot.png");
   await call("screenshot", screenshot);
   assert.equal(
