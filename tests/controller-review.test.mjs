@@ -4,6 +4,7 @@ import { once } from "node:events";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { setImmediate as nextTurn } from "node:timers/promises";
+import WebSocket from "ws";
 import { createController } from "../dist/controller.js";
 import { createControllerRuntime } from "../dist/network-control.js";
 
@@ -361,4 +362,260 @@ test("unconfirmed creation cleanup fences replacement and cannot finalize as an 
     (error) => error === failure,
   );
   assert.equal(f.controller.bindings.size, 1);
+});
+
+async function viewer(t, controller, token) {
+  const client = new WebSocket(
+    controller.origin.replace("http:", "ws:") + "/view/socket",
+  );
+  client.on("error", () => {});
+  t.after(() => client.terminate());
+  await once(client, "open");
+  if (token) client.send(JSON.stringify({ type: "authenticate", token }));
+  return client;
+}
+
+for (const [flags, limit] of [
+  [{ control: true }, 1],
+  [{ resize: true }, 1],
+  [{}, 4],
+]) {
+  test(`managed viewer reserves ${limit} slot(s) per ${JSON.stringify(flags)} grant before worker readiness`, async (t) => {
+    const entered = barrier(),
+      release = barrier(),
+      authorized = barrier();
+    let count = 0;
+    t.after(() => release.resolve());
+    const f = await fixture(t, {
+      authorizeAccess: async () => {
+        if (++count === limit + 1) authorized.resolve();
+      },
+      create: async (placement, _signal, makeWorker) => {
+        entered.resolve();
+        await release.promise;
+        return makeWorker(placement);
+      },
+    });
+    const grant = await f.controller.command({
+      op: "access_create",
+      executionId: f.executionId,
+      ...flags,
+    });
+    const token = new URL(grant.viewerUrl).hash.slice(1);
+    const first = await viewer(t, f.controller, token);
+    await entered.promise;
+    for (let i = 1; i < limit; i++) await viewer(t, f.controller, token);
+    const excess = await viewer(t, f.controller);
+    const closed = once(excess, "close", { signal: AbortSignal.timeout(1000) });
+    excess.send(JSON.stringify({ type: "authenticate", token }));
+    await authorized.promise;
+    const [code, reason] = await closed;
+    assert.equal(code, 1008);
+    assert.equal(String(reason), "browser_access_denied");
+    assert.equal(first.readyState, WebSocket.OPEN);
+    release.resolve();
+  });
+}
+
+for (const authenticated of [false, true]) {
+  test(`managed viewer bounds ${authenticated ? "authenticated" : "waiting"} sockets to 64`, async (t) => {
+    const release = barrier(),
+      admitted = barrier();
+    t.after(() => release.resolve());
+    let count = 0;
+    const f = await fixture(t, {
+      authorizeAccess: async () => {
+        if (++count === 64) admitted.resolve();
+      },
+      create: async (placement, _signal, makeWorker) => {
+        await release.promise;
+        return makeWorker(placement);
+      },
+    });
+    const clients = [];
+    for (let i = 0; i < 64; i++) {
+      let token;
+      if (authenticated) {
+        const grant = await f.controller.command({
+          op: "access_create",
+          executionId: f.executionId,
+        });
+        token = new URL(grant.viewerUrl).hash.slice(1);
+      }
+      clients.push(await viewer(t, f.controller, token));
+    }
+    if (authenticated) await admitted.promise;
+    const excess = new WebSocket(
+      f.controller.origin.replace("http:", "ws:") + "/view/socket",
+    );
+    excess.on("error", () => {});
+    t.after(() => excess.terminate());
+    const status = await new Promise((resolve) => {
+      excess.once("open", () => resolve(101));
+      excess.once("unexpected-response", (_req, response) => {
+        response.resume();
+        resolve(response.statusCode);
+      });
+    });
+    assert.equal(status, 403);
+    const closed = once(clients[0], "close");
+    clients[0].terminate();
+    await closed;
+    await nextTurn();
+    await viewer(t, f.controller);
+  });
+}
+
+test("new access waits for an already-cancelled creation to settle before retrying", async (t) => {
+  const entered = barrier(),
+    cancelled = barrier(),
+    release = barrier(),
+    second = barrier();
+  t.after(() => release.resolve());
+  let count = 0,
+    requests = 0,
+    firstSocket;
+  const f = await fixture(t, {
+    authorizeAccess: async (_id, req) => {
+      if (++requests === 1) firstSocket = req.socket;
+      else second.resolve();
+    },
+    create: async (placement, signal, makeWorker) => {
+      if (++count > 1) return makeWorker(placement);
+      entered.resolve();
+      await once(signal, "abort");
+      cancelled.resolve();
+      await release.promise;
+      throw Error("browser_creation_cancelled");
+    },
+  });
+  const first = assert.rejects(fetch(f.url));
+  await entered.promise;
+  firstSocket.destroy();
+  await first;
+  await cancelled.promise;
+  const replacement = fetch(f.url);
+  await second.promise;
+  await nextTurn();
+  release.resolve();
+  assert.equal((await replacement).status, 200);
+  assert.equal(count, 2);
+});
+
+for (const op of ["session", "storage_attach"]) {
+  test(`${op} cancels its own wait without cancelling shared browser creation`, {
+    timeout: 2000,
+  }, async (t) => {
+    const entered = barrier(),
+      release = barrier();
+    t.after(() => release.resolve());
+    let creationSignal;
+    const f = await fixture(t, {
+      create: async (placement, signal, makeWorker) => {
+        creationSignal = signal;
+        entered.resolve();
+        await release.promise;
+        return makeWorker(placement);
+      },
+    });
+    const browser = fetch(f.url);
+    await entered.promise;
+    const life = new AbortController();
+    const pending = f.controller.command(
+      { op, executionId: f.executionId, action: "status" },
+      { signal: new AbortController().signal },
+      life.signal,
+    );
+    const rejected = assert.rejects(pending, /browser_control_timeout/);
+    life.abort();
+    await rejected;
+    assert.equal(creationSignal.aborted, false);
+    release.resolve();
+    assert.equal((await browser).status, 200);
+  });
+}
+
+test("HTTP access denial is 403 on session, files, and auth without leaking hook errors", async (t) => {
+  const f = await fixture(t, {
+    authorizeAccess: async () => {
+      throw Error("private identity details");
+    },
+  });
+  for (const route of ["/session", "/files/test.txt", "/auth"]) {
+    const response = await fetch(f.url.replace("/files/test.txt", route));
+    assert.equal(response.status, 403);
+    assert.deepEqual(await response.json(), { error: "browser_access_denied" });
+  }
+});
+
+async function rejectedUpgrade(url) {
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(url);
+    socket.on("error", () => {});
+    socket.once("open", () => {
+      socket.terminate();
+      reject(Error("Unexpected upgrade"));
+    });
+    socket.once("unexpected-response", async (_req, response) => {
+      let body = "";
+      for await (const chunk of response) body += chunk;
+      resolve({ status: response.statusCode, body });
+    });
+  });
+}
+
+for (const [message, status, code] of [
+  ["browser_worker_start_failed", 502, "browser_worker_start_failed"],
+  ["browser_execution_capacity_exceeded", 503, "browser_execution_capacity_exceeded"],
+  ["private Docker credentials", 502, "browser_worker_unavailable"],
+]) {
+  test(`HTTP and CDP upgrade preserve sanitized creation outcome ${code}`, async (t) => {
+    const f = await fixture(t, {
+      create: async () => {
+        throw Error(message);
+      },
+    });
+    const response = await fetch(f.url);
+    assert.equal(response.status, status);
+    assert.deepEqual(await response.json(), { error: code });
+    const upgrade = await rejectedUpgrade(
+      f.url.replace("http:", "ws:").replace("/files/test.txt", ""),
+    );
+    assert.equal(upgrade.status, status);
+    assert.deepEqual(JSON.parse(upgrade.body), { error: code });
+  });
+}
+
+test("finalization cancels storage attachment during creation", {
+  timeout: 2000,
+}, async (t) => {
+  const entered = barrier(),
+    cancelled = barrier();
+  let removed = 0;
+  const f = await fixture(t, {
+    create: async (placement, _signal, makeWorker) => {
+      const worker = makeWorker(placement);
+      worker.runtime.attachStorage = async (_registration, _adapter, signal) => {
+        assert(signal instanceof AbortSignal);
+        entered.resolve();
+        await once(signal, "abort");
+        cancelled.resolve();
+        throw Error("browser_control_timeout");
+      };
+      return worker;
+    },
+    remove: async () => {
+      removed++;
+    },
+  });
+  const host = createControllerRuntime(f.controller.controlOrigin);
+  t.after(() => host.close());
+  await host.attachStorage({ executionId: f.executionId }, {});
+  const browser = fetch(f.url);
+  await entered.promise;
+  const finish = f.controller.command({ op: "finalize", executionId: f.executionId });
+  await cancelled.promise;
+  await finish;
+  await browser;
+  assert.equal(removed, 1);
 });

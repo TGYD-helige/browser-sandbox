@@ -131,7 +131,8 @@ test("Docker creation reports both operation and cleanup errors", async (t) => {
     ),
     (error) => {
       assert(error instanceof AggregateError);
-      assert.equal(error.errors.length, 2);
+      assert.equal(error.errors.length, 3);
+      assert.equal(error.errors[2].statusCode, 500);
       assert.equal(error.errors[0].statusCode, 500);
       assert.equal(error.errors[1].statusCode, 500);
       assert.match(error.message, /browser_worker_cleanup_unconfirmed/);
@@ -139,3 +140,81 @@ test("Docker creation reports both operation and cleanup errors", async (t) => {
     },
   );
 });
+
+for (const phase of ["network", "container"]) {
+  test(`cancelled Docker ${phase} creation removes resources whose response was not received`, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "docker-cancel-"));
+    const socketPath = join(root, "docker.sock");
+    let enter, release;
+    const entered = new Promise((resolve) => {
+      enter = resolve;
+    });
+    const delayed = new Promise((resolve) => {
+      release = resolve;
+    });
+    const resources = new Map();
+    const name = "bs-incarnation";
+    const server = createServer(async (req, res) => {
+      let input = "";
+      for await (const chunk of req) input += chunk;
+      const body = input ? JSON.parse(input) : {};
+      res.setHeader("content-type", "application/json");
+      const createNetwork = req.url === "/v1.47/networks/create";
+      const createContainer = req.url.startsWith("/v1.47/containers/create?");
+      if (createNetwork || createContainer) {
+        if ((phase === "network") === createNetwork) {
+          enter();
+          await delayed;
+        }
+        resources.set(createNetwork ? "network" : "container", body.Labels);
+        res.end(JSON.stringify({ Id: createNetwork ? "network" : "container" }));
+        return;
+      }
+      if (req.url.endsWith("/connect")) return res.end("{}");
+      const kind = req.url.includes("/containers/") ? "container" : "network";
+      if (!resources.has(kind)) return res.writeHead(404).end("{}");
+      assert(req.url.includes(kind) || req.url.includes(name));
+      if (req.method === "DELETE") {
+        resources.delete(kind);
+        return res.writeHead(204).end();
+      }
+      res.end(
+        JSON.stringify(
+          kind === "container"
+            ? { Config: { Labels: resources.get(kind) } }
+            : { Labels: resources.get(kind), Containers: {} },
+        ),
+      );
+    });
+    await new Promise((resolve) => server.listen(socketPath, resolve));
+    t.after(async () => {
+      release();
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+      await rm(root, { recursive: true, force: true });
+    });
+    const backend = createDockerBackend({
+      installation: "test",
+      controllerContainer: "controller",
+      image: "sha256:" + "a".repeat(64),
+      socketPath,
+      seccomp: {},
+    });
+    const life = new AbortController();
+    const failed = assert.rejects(
+      backend.create(
+        { executionId: "execution", incarnation: "incarnation" },
+        life.signal,
+      ),
+    );
+    await entered;
+    life.abort();
+    release();
+    await failed;
+    assert.deepEqual(
+      [...resources.keys()],
+      [],
+      "Cancelled creation leaked Docker resources",
+    );
+  });
+}

@@ -185,3 +185,43 @@ test("controller routes attached storage callbacks between the real host and wor
   await runtime.request({ op: "finalize", executionId });
   attachment.close();
 });
+
+test("storage attachment cancellation reaches the remote operation", {
+  timeout: 2000,
+}, async (t) => {
+  const server = createServer();
+  let enter, cancelled;
+  const entered = new Promise((resolve) => {
+    enter = resolve;
+  });
+  const aborted = new Promise((resolve) => {
+    cancelled = resolve;
+  });
+  const control = createNetworkHostControl({
+    server,
+    dispatch: async (_request, _peer, signal) => {
+      enter();
+      await new Promise((resolve) =>
+        signal.addEventListener("abort", resolve, { once: true }),
+      );
+      cancelled();
+      return { attached: false };
+    },
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const runtime = createControllerRuntime(`http://127.0.0.1:${server.address().port}`);
+  t.after(async () => {
+    runtime.close();
+    control.close();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const life = new AbortController();
+  const rejected = assert.rejects(
+    runtime.attachStorage({ executionId: "cancelled" }, {}, life.signal),
+    /browser_control_timeout/,
+  );
+  await entered;
+  life.abort();
+  await rejected;
+  await aborted;
+});

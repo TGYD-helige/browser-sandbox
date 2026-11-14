@@ -237,10 +237,14 @@ export function createControllerRuntime(
   return {
     identity: "managed",
     request,
-    async attachStorage(registration: Registration, adapter: StorageAdapter) {
+    async attachStorage(
+      registration: Registration,
+      adapter: StorageAdapter,
+      signal?: AbortSignal,
+    ) {
       storage.set(registration.executionId, adapter);
       try {
-        await request({ op: "storage_attach", ...registration });
+        await request({ op: "storage_attach", ...registration }, { signal });
       } catch (error) {
         storage.delete(registration.executionId);
         throw error;

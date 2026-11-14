@@ -247,7 +247,9 @@ export async function createController(options: ControllerOptions) {
       } else pipeline(req, upstream, () => {});
     } catch (error) {
       if (!res.headersSent)
-        res.writeHead(502).end(JSON.stringify({ error: errorCode(error) }));
+        res
+          .writeHead(errorStatus(error))
+          .end(JSON.stringify({ error: errorCode(error) }));
       else res.destroy();
     }
   });
@@ -304,7 +306,11 @@ export async function createController(options: ControllerOptions) {
       !allowedOrigin(request)
     )
       return;
-    await options.authorizeAccess?.(grant.binding.executionId, request);
+    try {
+      await options.authorizeAccess?.(grant.binding.executionId, request);
+    } catch {
+      throw Error("browser_access_denied");
+    }
     return grant.life.signal.aborted || grant.binding.revoked ? undefined : grant;
   }
   const endpoint = (binding: ExecutionBinding) => {
@@ -334,14 +340,19 @@ export async function createController(options: ControllerOptions) {
   async function attachWorkerStorage(
     worker: ManagedWorker,
     attachment: StorageAttachment,
+    signal: AbortSignal,
   ) {
     const executionId = attachment.registration.executionId;
-    const channel = await worker.runtime.attachStorage(attachment.registration, {
-      load: (signal) => attachment.peer.callback("load", { executionId }, signal),
-      save: (signal) => attachment.peer.callback("save", { executionId }, signal),
-      commit: (payload, signal) =>
-        attachment.peer.callback("commit", { executionId, payload }, signal),
-    });
+    const channel = await worker.runtime.attachStorage(
+      attachment.registration,
+      {
+        load: (signal) => attachment.peer.callback("load", { executionId }, signal),
+        save: (signal) => attachment.peer.callback("save", { executionId }, signal),
+        commit: (payload, signal) =>
+          attachment.peer.callback("commit", { executionId, payload }, signal),
+      },
+      signal,
+    );
     if (attachment.peer.signal.aborted || storage.get(executionId) !== attachment) {
       channel.close();
       throw Error("browser_storage_disconnected");
@@ -365,6 +376,13 @@ export async function createController(options: ControllerOptions) {
   async function ensureWorker(binding: ExecutionBinding, signal: AbortSignal) {
     signal.throwIfAborted();
     if (binding.revoked) throw Error("browser_execution_revoked");
+    if (binding.creation?.abort.signal.aborted) {
+      await waitForControl(
+        binding.starting.catch(() => {}),
+        signal,
+      );
+      return ensureWorker(binding, signal);
+    }
     if (binding.creationFailure instanceof WorkerCleanupFailure)
       throw binding.creationFailure;
     if (binding.worker && !binding.endpoint)
@@ -416,7 +434,7 @@ export async function createController(options: ControllerOptions) {
           );
           creationSignal.throwIfAborted();
           const attachment = storage.get(binding.executionId);
-          if (attachment) await attachWorkerStorage(worker, attachment);
+          if (attachment) await attachWorkerStorage(worker, attachment, creationSignal);
           creationSignal.throwIfAborted();
           binding.endpoint = result;
           binding.creation = undefined;
@@ -496,9 +514,10 @@ export async function createController(options: ControllerOptions) {
       peer.signal.addEventListener("abort", attachment.cleanup, { once: true });
       try {
         if (binding?.starting) {
-          const worker = await binding.starting;
+          const worker = await waitForControl(binding.starting, signal);
           signal.throwIfAborted();
-          if (!attachment.channel) await attachWorkerStorage(worker, attachment);
+          if (!attachment.channel)
+            await attachWorkerStorage(worker, attachment, signal);
         }
         return { attached: true };
       } catch (error) {
@@ -637,7 +656,7 @@ export async function createController(options: ControllerOptions) {
       throw Error("browser_session_not_live");
     }
     if (!binding.starting) throw Error("browser_session_not_live");
-    const worker = await binding.starting;
+    const worker = await waitForControl(binding.starting, signal);
     return worker.runtime.request(request, { signal });
   }
   const controlServer = createServer((_req, res) => res.writeHead(404).end());
@@ -651,6 +670,7 @@ export async function createController(options: ControllerOptions) {
     authenticateHost: options.authenticateHost,
   });
   const viewers = new WebSocketServer({ noServer: true, maxPayload: 16384 });
+  let waiting = 0;
   const rawConnections = new Set<import("node:net").Socket>();
   server.on("connection", (socket) => {
     rawConnections.add(socket);
@@ -702,18 +722,41 @@ export async function createController(options: ControllerOptions) {
     socket.once("close", () => life.abort());
     try {
       if (req.url === "/view/socket" && allowedOrigin(req)) {
+        if (waiting >= 64 || viewers.clients.size >= 64 || closing)
+          throw Error("browser_access_denied");
         viewers.handleUpgrade(req, socket, head, (client) => {
+          waiting++;
+          let authenticated = false;
           const timer = setTimeout(() => client.terminate(), 5000);
-          client.once("close", () => clearTimeout(timer));
+          client.once("close", () => {
+            clearTimeout(timer);
+            if (!authenticated) waiting--;
+          });
           client.on("error", () => client.terminate());
           client.once("message", async (raw) => {
             clearTimeout(timer);
+            waiting--;
+            authenticated = true;
             client.pause();
+            let grant: Access;
+            const reservation = { destroy: () => client.terminate() };
             try {
-              const auth = JSON.parse(String(raw));
-              const grant =
-                auth.type === "authenticate" && (await access(auth.token, "view", req));
-              if (!grant) throw Error("browser_access_denied");
+              let auth: { type?: string; token?: string } | null;
+              try {
+                auth = JSON.parse(String(raw));
+              } catch {
+                throw Error("browser_access_denied");
+              }
+              grant =
+                auth?.type === "authenticate" &&
+                (await access(auth.token, "view", req));
+              if (
+                !grant ||
+                grant.connections.size >= (grant.control || grant.resize ? 1 : 4)
+              )
+                throw Error("browser_access_denied");
+              grant.connections.add(reservation);
+              client.once("close", () => grant.connections.delete(reservation));
               await ensureWorker(
                 grant.binding,
                 AbortSignal.any([life.signal, grant.life.signal]),
@@ -730,8 +773,15 @@ export async function createController(options: ControllerOptions) {
                 },
               );
               client.resume();
-            } catch {
-              client.close(1008, "browser_access_denied");
+            } catch (error) {
+              client.resume();
+              const status = errorStatus(error);
+              client.close(
+                status === 403 ? 1008 : status === 503 ? 1013 : 1011,
+                errorCode(error).slice(0, 123),
+              );
+            } finally {
+              grant?.connections.delete(reservation);
             }
           });
         });
@@ -749,8 +799,18 @@ export async function createController(options: ControllerOptions) {
       cdp.handleUpgrade(req, socket, head, (client) =>
         tunnel(client, grant.binding.endpoint.cdpUrl, grant),
       );
-    } catch {
-      socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+    } catch (error) {
+      const status = errorStatus(error);
+      const body = JSON.stringify({ error: errorCode(error) });
+      const reason =
+        status === 403
+          ? "Forbidden"
+          : status === 503
+            ? "Service Unavailable"
+            : "Bad Gateway";
+      socket.end(
+        `HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+      );
     }
   });
   await new Promise<void>((resolve, reject) => {
@@ -810,4 +870,10 @@ function errorCode(error: any) {
   return /^browser_[a-z_]+$/.test(error?.message)
     ? error.message
     : "browser_worker_unavailable";
+}
+
+function errorStatus(error: unknown) {
+  const code = errorCode(error);
+  if (code === "browser_access_denied") return 403;
+  return /_(capacity_exceeded|overloaded)$/.test(code) ? 503 : 502;
 }

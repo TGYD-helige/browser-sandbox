@@ -75,14 +75,22 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
     expected: Record<string, string>,
     signal: AbortSignal,
   ) {
-    const container = await api(`/containers/${id}/json`, "GET", undefined, signal);
+    const container = await api(
+      `/containers/${id}/json`,
+      "GET",
+      undefined,
+      signal,
+    ).catch(absent);
+    if (!container) return;
     if (
       !Object.entries(expected).every(
         ([key, value]) => container.Config.Labels?.[key] === value,
       )
     )
       throw Error("browser_worker_ownership_mismatch");
-    await api(`/containers/${id}?force=true&v=true`, "DELETE", undefined, signal);
+    await api(`/containers/${id}?force=true&v=true`, "DELETE", undefined, signal).catch(
+      absent,
+    );
   }
   return {
     async create(placement, signal) {
@@ -192,12 +200,12 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         const cleanup = AbortSignal.timeout(30000);
         const failures: unknown[] = [];
         try {
-          if (id) await removeOwned(id, expected, cleanup);
+          await removeOwned(id ?? name, expected, cleanup);
         } catch (failure) {
           failures.push(failure);
         }
         try {
-          if (network) await removeNetwork(network, expected, cleanup);
+          await removeNetwork(network ?? name, expected, cleanup);
         } catch (failure) {
           failures.push(failure);
         }

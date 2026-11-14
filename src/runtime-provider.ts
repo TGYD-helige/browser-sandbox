@@ -18,6 +18,7 @@ export interface BrowserRuntime {
   attachStorage(
     registration: Registration,
     adapter: StorageAdapter,
+    signal?: AbortSignal,
   ): ReturnType<typeof attachStorage>;
 }
 
@@ -40,8 +41,8 @@ export interface RuntimeProvider {
 export function createSocketRuntime(socketPath: string): BrowserRuntime {
   return {
     request: (request, options) => hostRequest(socketPath, request, options),
-    attachStorage: (registration, adapter) =>
-      attachStorage(socketPath, registration, adapter),
+    attachStorage: (registration, adapter, signal) =>
+      attachStorage(socketPath, registration, adapter, signal),
   };
 }
 
