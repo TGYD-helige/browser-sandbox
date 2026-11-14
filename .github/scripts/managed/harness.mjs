@@ -41,11 +41,12 @@ const call = async (...args) => {
         },
       )
     ).stdout;
-  } catch {
+  } catch (error) {
     if (args[0] === "screenshot") {
       const report = await diagnoseScreenshot(
         process.env.BROWSER_WS_ENDPOINT,
         connectCdp,
+        error,
       ).catch(() => ({ error: "browser_screenshot_diagnostic_failed" }));
       console.error("managed_screenshot_diagnostics " + JSON.stringify(report));
     }
