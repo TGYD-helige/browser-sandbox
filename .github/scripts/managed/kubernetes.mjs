@@ -165,7 +165,7 @@ const wait = async (description, predicate, timeout = 90000) => {
 };
 const controllerReady = async () =>
   wait(
-    "Controller Service was not ready from the client",
+    "Controller agent and host services were not ready from the client",
     async () => {
       try {
         await kubectl(
@@ -174,7 +174,7 @@ const controllerReady = async () =>
           "--",
           "node",
           "-e",
-          `fetch('http://${deployment}.${namespace}.svc:8080/health',{signal:AbortSignal.timeout(2000)}).then(r=>{if(!r.ok)process.exit(1)},()=>process.exit(1))`,
+          `Promise.all([fetch('http://${deployment}.${namespace}.svc:8080/health',{signal:AbortSignal.timeout(2000)}),fetch('http://${deployment}-host.${namespace}.svc:8082/health',{signal:AbortSignal.timeout(2000)})]).then(([agent,host])=>{if(!agent.ok||host.status!==404)process.exit(1)},()=>process.exit(1))`,
         );
         return true;
       } catch {
