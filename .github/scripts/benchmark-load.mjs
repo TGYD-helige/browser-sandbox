@@ -43,6 +43,8 @@ export async function benchmarkLoad({ socket, url, samples, report }) {
       const response = once(child, "message", { signal: AbortSignal.timeout(60000) });
       child.send({ action: "ready", url });
       const [message] = await response;
+      if (message.error && report)
+        report.workerFailure = { phase: message.phase, reason: message.reason };
       assert(!message.error, "Concurrent renderer failed");
       const ready = performance.now() - start;
       const exited = once(child, "exit");

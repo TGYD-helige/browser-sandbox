@@ -1,0 +1,11 @@
+ARG BROWSER_IMAGE=browser-sandbox:managed
+FROM ${BROWSER_IMAGE}
+USER root
+WORKDIR /project
+COPY .github/scripts/managed/client/package*.json /project/.github/scripts/e2e/
+RUN npm ci --prefix /project/.github/scripts/e2e --omit=dev
+COPY .github/scripts/managed/host-storage.mjs /opt/browser-sandbox/.github/scripts/managed/host-storage.mjs
+COPY .github/scripts/managed/screenshot-tab.mjs /opt/browser-sandbox/.github/scripts/managed/screenshot-tab.mjs
+ENV BROWSER_PACKAGE_ROOT=/opt/browser-sandbox
+USER 100001:100001
+ENTRYPOINT ["node"]

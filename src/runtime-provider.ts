@@ -9,6 +9,8 @@ import { validExecutorUid } from "./peer-identity.js";
 
 /** One runtime reachable through its trusted host-control channel. */
 export interface BrowserRuntime {
+  /** Managed runtimes do not use kernel executor UIDs. */
+  identity?: "managed";
   request<T = Record<string, unknown>>(
     request: Record<string, unknown>,
     options?: { signal?: AbortSignal; timeoutMs?: number },
@@ -16,6 +18,7 @@ export interface BrowserRuntime {
   attachStorage(
     registration: Registration,
     adapter: StorageAdapter,
+    options?: { signal?: AbortSignal },
   ): ReturnType<typeof attachStorage>;
 }
 
@@ -28,6 +31,7 @@ export interface Placement {
 
 /** Decides which runtime owns an execution; multi-instance and per-tenant deployments implement this. */
 export interface RuntimeProvider {
+  identity?: "managed";
   /** Repeated calls for one executionId must return the same runtime. */
   acquire(placement: Placement, signal?: AbortSignal): Promise<BrowserRuntime>;
   /** Called after the runtime confirmed the execution finished, or when registration was refused. */
@@ -37,8 +41,8 @@ export interface RuntimeProvider {
 export function createSocketRuntime(socketPath: string): BrowserRuntime {
   return {
     request: (request, options) => hostRequest(socketPath, request, options),
-    attachStorage: (registration, adapter) =>
-      attachStorage(socketPath, registration, adapter),
+    attachStorage: (registration, adapter, options) =>
+      attachStorage(socketPath, registration, adapter, options),
   };
 }
 
@@ -66,7 +70,7 @@ export interface BrowserSessionOptions {
 export interface BrowserSessionHandle {
   executionId: string;
   /** Run the harness process as this Linux UID; the endpoint rejects other peers. */
-  executorUid: number;
+  executorUid?: number;
   wsEndpoint: string;
   /** Trusted host-control channel for session and access requests about this execution. */
   runtime: BrowserRuntime;
@@ -107,7 +111,7 @@ export function createBrowserSessions({
       const placement: Placement = { executionId: randomUUID(), tenantId, profileId };
       const registration: Registration = {
         executionId: placement.executionId,
-        executorUid: takeUid(),
+        executorUid: provider.identity === "managed" ? undefined : takeUid(),
         profileId,
         allowedDomains,
       };
@@ -126,11 +130,25 @@ export function createBrowserSessions({
       };
       try {
         runtime = await provider.acquire(placement, signal);
+        if (runtime.identity === "managed") {
+          used.delete(registration.executorUid);
+          registration.executorUid = undefined;
+        } else if (registration.executorUid === undefined)
+          registration.executorUid = takeUid();
         signal?.throwIfAborted();
         if (options.storage)
-          storage = await runtime.attachStorage(registration, options.storage);
+          storage = await runtime.attachStorage(registration, options.storage, {
+            signal,
+          });
         const { wsEndpoint } = await runtime.request<{ wsEndpoint: string }>(
-          { op: "register", ...registration, storage: storage ? true : undefined },
+          {
+            op: "register",
+            ...registration,
+            ...(runtime.identity === "managed" && tenantId !== undefined
+              ? { tenantId }
+              : {}),
+            storage: storage ? true : undefined,
+          },
           { signal },
         );
         return {

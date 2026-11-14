@@ -60,17 +60,22 @@ export function createBenchmarkSite(root) {
 if (process.argv[2] === "worker") {
   let cdp, sessionId;
   process.on("message", async ({ action, url, bytes, cookieCount = 0 }) => {
+    let phase = "command";
     try {
       let result;
       if (action === "unused") {
         result = true;
       } else if (action === "ready") {
+        phase = "connect";
         cdp = await connectCdp(process.env.BROWSER_WS_ENDPOINT);
+        phase = "target";
         const { targetId } = await cdp.call("Target.createTarget", { url });
+        phase = "attach";
         ({ sessionId } = await cdp.call("Target.attachToTarget", {
           targetId,
           flatten: true,
         }));
+        phase = "page-ready";
         let pageReady = false;
         for (let i = 0; i < 200; i++) {
           const { result: ready } = await cdp.call(
@@ -88,8 +93,10 @@ if (process.argv[2] === "worker") {
           await delay(25);
         }
         assert(pageReady, "Benchmark page did not become ready");
+        phase = "screenshot";
         const screenshot = await cdp.call("Page.captureScreenshot", {}, sessionId);
         assert(screenshot.data.length > 100);
+        phase = "version";
         result = (await cdp.call("Browser.getVersion")).product;
       } else if (action === "seed" || action === "verify") {
         if (cookieCount) {
@@ -139,8 +146,17 @@ if (process.argv[2] === "worker") {
         result = true;
       }
       process.send({ result });
-    } catch {
-      process.send({ error: "browser_benchmark_worker_failed" });
+    } catch (error) {
+      const reason =
+        [
+          "browser_cdp_connect_failed",
+          "browser_cdp_closed",
+          "browser_cdp_timeout",
+          "browser_cdp_operation_failed",
+          "ERR_ASSERTION",
+        ].find((value) => value === error?.message || value === error?.code) ??
+        "unknown";
+      process.send({ error: "browser_benchmark_worker_failed", phase, reason });
     }
   });
   process.on("disconnect", () => {

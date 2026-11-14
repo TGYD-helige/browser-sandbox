@@ -1,0 +1,18 @@
+{{- if not .Values.controllerData.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-data
+  {{- if .Values.controllerData.retain }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if .Values.controllerData.storageClass }}
+  storageClassName: {{ .Values.controllerData.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.controllerData.size | quote }}
+{{- end }}
