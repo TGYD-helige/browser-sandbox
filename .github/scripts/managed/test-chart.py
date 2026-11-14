@@ -19,7 +19,7 @@ def render(*arguments, release="trial"):
 
 class ChartTest(unittest.TestCase):
     def test_invalid_release_names_fail_at_render_time(self):
-        for release in ["a.b", "a" * 49 + "--aa"]:
+        for release in ["1abc", "a.b", "a" * 49 + "--aa"]:
             with self.subTest(release=release):
                 with self.assertRaises(subprocess.CalledProcessError):
                     render(release=release)
