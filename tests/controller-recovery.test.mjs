@@ -680,6 +680,11 @@ test("unconfirmed persistent recovery becomes visible and retains its lease unti
     /browser_profile_busy/,
   );
   await second.stop();
+  let storageAttached = false;
+  worker.runtime.attachStorage = async () => {
+    storageAttached = true;
+    return { close() {} };
+  };
   const third = await f.start({ profileStore, reconciliationMs: 60000 });
   await third.reconcile();
   assert.equal(
@@ -687,8 +692,13 @@ test("unconfirmed persistent recovery becomes visible and retains its lease unti
     "recovery-blocked",
   );
   assert.equal(third.capacity().workers, 1);
-  worker.runtime.request = request;
+  worker.runtime.request = async (input) => {
+    if (input.op === "finalize" && !storageAttached)
+      throw Error("browser_profile_save_unconfirmed");
+    return request(input);
+  };
   await third.command({ op: "finish", executionId });
+  assert.equal(storageAttached, true);
   assert.equal(f.resources.size, 0);
   assert.equal(third.capacity().workers, 0);
   await third.command({
