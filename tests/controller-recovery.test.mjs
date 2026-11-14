@@ -1678,7 +1678,7 @@ test("temporary backends without discovery still finalize a known revoked worker
   assert.equal(controller.capacity().workers, 0);
 });
 
-test("finish recovers the previous published revision after its immediate reread also failed", async (t) => {
+test("finish recovers the previous published revision across consecutive read failures", async (t) => {
   const f = await fixture(t);
   const controller = await f.start({ reconciliationMs: 60000 });
   const executionId = randomUUID();
@@ -1690,18 +1690,18 @@ test("finish recovers the previous published revision after its immediate reread
   const sync = prototype.sync,
     read = prototype.readFile;
   let inject = true,
-    failRead = false;
+    failRead = 0;
   const syncMock = t.mock.method(prototype, "sync", async function () {
     if (inject && (await this.stat()).isDirectory()) {
       inject = false;
-      failRead = true;
+      failRead = 3;
       throw Object.assign(Error("Injected published write failure"), { code: "EIO" });
     }
     return sync.call(this);
   });
   const readMock = t.mock.method(prototype, "readFile", async function (...args) {
     if (failRead) {
-      failRead = false;
+      failRead--;
       throw Object.assign(Error("Injected recovery read failure"), { code: "EIO" });
     }
     return read.apply(this, args);
@@ -1710,10 +1710,12 @@ test("finish recovers the previous published revision after its immediate reread
     await assert.rejects(controller.command({ op: "endpoint", executionId }), {
       code: "EIO",
     });
-    await assert.rejects(
-      controller.command({ op: "finish", executionId }),
-      /browser_execution_record_changed/,
-    );
+    await assert.rejects(controller.command({ op: "access_revoke", executionId }), {
+      code: "EIO",
+    });
+    await assert.rejects(controller.command({ op: "finish", executionId }), {
+      code: "EIO",
+    });
     await controller.command({ op: "finish", executionId });
     assert.equal(controller.capacity().workers, 0);
     assert.equal(f.resources.size, 0);

@@ -280,6 +280,24 @@ export async function createController(options: ControllerOptions) {
               recoveryAttempts: data.recoveryAttempts,
             }
           : data;
+      const reread = async () => {
+        const record = await journal.read(binding.executionId);
+        if (
+          [recordData, binding.pendingRecordData].some(
+            (data) =>
+              data && isDeepStrictEqual(record.data, JSON.parse(JSON.stringify(data))),
+          )
+        ) {
+          binding.revision = record.revision;
+          binding.pendingRecordData = undefined;
+        }
+        return record.revision;
+      };
+      if (binding.pendingRecordData) {
+        if ((await reread()) !== binding.revision)
+          throw Error("browser_execution_record_changed");
+        binding.pendingRecordData = undefined;
+      }
       try {
         const record = binding.revision
           ? await journal.update(binding.executionId, binding.revision, recordData)
@@ -287,21 +305,9 @@ export async function createController(options: ControllerOptions) {
         binding.revision = record.revision;
         binding.pendingRecordData = undefined;
       } catch (error) {
-        const pending = binding.pendingRecordData;
-        if (errorCode(error) !== "browser_execution_record_changed")
-          binding.pendingRecordData = recordData;
+        binding.pendingRecordData = recordData;
         try {
-          const record = await journal.read(binding.executionId);
-          if (
-            [recordData, pending].some(
-              (data) =>
-                data &&
-                isDeepStrictEqual(record.data, JSON.parse(JSON.stringify(data))),
-            )
-          ) {
-            binding.revision = record.revision;
-            binding.pendingRecordData = undefined;
-          }
+          await reread();
         } catch {
           // Unknown disk state cannot confirm this write.
         }
