@@ -708,3 +708,76 @@ for (const silent of ["client", "worker", "neither"]) {
     assert.equal(String((await once(replacement, "message"))[0]), "ready");
   });
 }
+
+test("tunnel heartbeat preserves healthy peers while a write drain is delayed", {
+  timeout: 3000,
+}, async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const release = barrier(),
+    blocked = barrier();
+  t.after(() => release.resolve());
+  const workerSockets = new WebSocketServer({ noServer: true });
+  let workerPeer;
+  const f = await fixture(t, {
+    authorizeAccess: async (_id, req) => {
+      const socket = req.socket,
+        write = socket.write.bind(socket);
+      let hold = true;
+      t.mock.method(socket, "write", (chunk, ...args) => {
+        const done = args.at(-1);
+        if (hold && chunk.length >= 4096 && typeof done === "function") {
+          hold = false;
+          args[args.length - 1] = (...result) => {
+            blocked.resolve();
+            release.promise.then(() => done(...result));
+          };
+        }
+        return write(chunk, ...args);
+      });
+    },
+    workerUpgrade: (req, socket, head) =>
+      workerSockets.handleUpgrade(req, socket, head, (peer) => {
+        workerPeer = peer;
+        peer.on("error", () => {});
+        peer.on("message", (raw) => peer.send(String(raw)));
+      }),
+  });
+  t.after(async () => {
+    for (const peer of workerSockets.clients) peer.terminate();
+    await new Promise((resolve) => workerSockets.close(resolve));
+  });
+  const grant = await f.controller.command({
+    op: "access_create",
+    executionId: f.executionId,
+    control: true,
+  });
+  const client = await viewer(t, f.controller, new URL(grant.viewerUrl).hash.slice(1));
+  await once(client, "message");
+  const delivered = once(client, "message");
+  workerPeer.send("x".repeat(4096));
+  await blocked.promise;
+  await delivered;
+  workerPeer.send("buffered");
+  const closed = once(client, "close").then(() => "closed");
+  for (let i = 0; i < 3; i++) {
+    const pinged = once(client, "ping");
+    t.mock.timers.tick(30000);
+    assert.equal(await Promise.race([pinged.then(() => "ping"), closed]), "ping");
+    const received = once(workerPeer, "message");
+    client.send("barrier");
+    assert.equal(
+      await Promise.race([received.then(() => "received"), closed]),
+      "received",
+    );
+  }
+  const resumed = barrier();
+  client.on("message", (raw) => {
+    if (String(raw) === "resumed") resumed.resolve();
+  });
+  client.send("resumed");
+  release.resolve();
+  await resumed.promise;
+  const freshPing = once(workerPeer, "ping");
+  t.mock.timers.tick(30000);
+  await freshPing;
+});

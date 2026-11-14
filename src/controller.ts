@@ -708,6 +708,10 @@ export async function createController(options: ControllerOptions) {
     const heartbeat = setInterval(() => {
       for (const peer of [client, upstream]) {
         if (peer.readyState !== WebSocket.OPEN) continue;
+        if (peer.isPaused) {
+          alive.add(peer);
+          continue;
+        }
         if (!alive.delete(peer)) return close();
         peer.ping();
       }
