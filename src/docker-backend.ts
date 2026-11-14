@@ -97,15 +97,30 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
       const name = `bs-${placement.incarnation}`;
       const expected = labels(placement.executionId, placement.incarnation);
       let network: string, id: string;
+      const createResource = async (path: string, body: object) => {
+        signal.throwIfAborted();
+        try {
+          // Observe mutation completion before cancellation can confirm resource absence.
+          return await api(path, "POST", body, AbortSignal.timeout(30000));
+        } catch (error) {
+          if (error.message === "browser_docker_unavailable")
+            throw new WorkerCleanupFailure(
+              error,
+              Error("browser_worker_cleanup_unconfirmed"),
+            );
+          throw error;
+        }
+      };
       try {
         network = (
-          await api(
-            "/networks/create",
-            "POST",
-            { Name: name, Driver: "bridge", EnableIPv6: false, Labels: expected },
-            signal,
-          )
+          await createResource("/networks/create", {
+            Name: name,
+            Driver: "bridge",
+            EnableIPv6: false,
+            Labels: expected,
+          })
         ).Id;
+        signal.throwIfAborted();
         await api(
           `/networks/${network}/connect`,
           "POST",
@@ -116,60 +131,56 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
           (key) => options.environment?.[key] !== undefined,
         ).map((key) => `${key}=${options.environment[key]}`);
         id = (
-          await api(
-            `/containers/create?name=${name}`,
-            "POST",
-            {
-              Image: options.image,
-              Cmd: ["worker"],
-              Env: [
-                ...environment,
-                "CONCURRENT=1",
-                "QUEUED=0",
-                `BROWSER_EXECUTION_ID=${placement.executionId}`,
-                `BROWSER_WORKER_ORIGIN=http://${name}:8081`,
-                ...(options.extensionsSource
-                  ? ["BROWSER_EXTENSIONS_DIR=/browser-extensions"]
-                  : []),
+          await createResource(`/containers/create?name=${name}`, {
+            Image: options.image,
+            Cmd: ["worker"],
+            Env: [
+              ...environment,
+              "CONCURRENT=1",
+              "QUEUED=0",
+              `BROWSER_EXECUTION_ID=${placement.executionId}`,
+              `BROWSER_WORKER_ORIGIN=http://${name}:8081`,
+              ...(options.extensionsSource
+                ? ["BROWSER_EXTENSIONS_DIR=/browser-extensions"]
+                : []),
+            ],
+            Labels: { ...expected, [prefix + "network"]: network },
+            HostConfig: {
+              ...(options.extensionsSource
+                ? {
+                    Mounts: [
+                      {
+                        Type: "bind",
+                        Source: options.extensionsSource,
+                        Target: "/browser-extensions",
+                        ReadOnly: true,
+                      },
+                    ],
+                  }
+                : {}),
+              NetworkMode: network,
+              CapDrop: ["ALL"],
+              CapAdd: [
+                "SETUID",
+                "SETGID",
+                "CHOWN",
+                "KILL",
+                "DAC_OVERRIDE",
+                "SYS_CHROOT",
+                "NET_ADMIN",
               ],
-              Labels: { ...expected, [prefix + "network"]: network },
-              HostConfig: {
-                ...(options.extensionsSource
-                  ? {
-                      Mounts: [
-                        {
-                          Type: "bind",
-                          Source: options.extensionsSource,
-                          Target: "/browser-extensions",
-                          ReadOnly: true,
-                        },
-                      ],
-                    }
-                  : {}),
-                NetworkMode: network,
-                CapDrop: ["ALL"],
-                CapAdd: [
-                  "SETUID",
-                  "SETGID",
-                  "CHOWN",
-                  "KILL",
-                  "DAC_OVERRIDE",
-                  "SYS_CHROOT",
-                  "NET_ADMIN",
-                ],
-                SecurityOpt: [
-                  "no-new-privileges",
-                  `seccomp=${JSON.stringify(options.seccomp)}`,
-                ],
-                ShmSize: options.shmBytes ?? 536870912,
-                Memory: options.memoryBytes ?? 2147483648,
-                Init: true,
-                RestartPolicy: { Name: "no" },
-              },
+              SecurityOpt: [
+                "no-new-privileges",
+                `seccomp=${JSON.stringify(options.seccomp)}`,
+              ],
+              ShmSize: options.shmBytes ?? 536870912,
+              Memory: options.memoryBytes ?? 2147483648,
+              Init: true,
+              RestartPolicy: { Name: "no" },
             },
-            signal,
-          )
+          })
         ).Id;
+        signal.throwIfAborted();
         await api(`/containers/${id}/start`, "POST", undefined, signal);
         const origin = `http://${name}:8081`;
         while (true) {

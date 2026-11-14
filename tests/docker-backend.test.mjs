@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -145,12 +146,15 @@ for (const phase of ["network", "container"]) {
   test(`cancelled Docker ${phase} creation removes resources whose response was not received`, async (t) => {
     const root = await mkdtemp(join(tmpdir(), "docker-cancel-"));
     const socketPath = join(root, "docker.sock");
-    let enter, release;
+    let enter, release, commit;
     const entered = new Promise((resolve) => {
       enter = resolve;
     });
     const delayed = new Promise((resolve) => {
       release = resolve;
+    });
+    const committed = new Promise((resolve) => {
+      commit = resolve;
     });
     const resources = new Map();
     const name = "bs-incarnation";
@@ -167,6 +171,7 @@ for (const phase of ["network", "container"]) {
           await delayed;
         }
         resources.set(createNetwork ? "network" : "container", body.Labels);
+        if ((phase === "network") === createNetwork) commit();
         res.end(JSON.stringify({ Id: createNetwork ? "network" : "container" }));
         return;
       }
@@ -209,7 +214,10 @@ for (const phase of ["network", "container"]) {
     );
     await entered;
     life.abort();
+    // Let a cancelled client finish its cleanup before the daemon publishes the resource.
+    await Promise.race([failed, once(AbortSignal.timeout(100), "abort")]);
     release();
+    await committed;
     await failed;
     assert.deepEqual(
       [...resources.keys()],
@@ -218,3 +226,36 @@ for (const phase of ["network", "container"]) {
     );
   });
 }
+
+test("an unobserved Docker create outcome remains fenced even when cleanup sees absence", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "docker-unknown-"));
+  const socketPath = join(root, "docker.sock");
+  const server = createServer((req, res) => {
+    if (req.url === "/v1.47/networks/create") req.socket.destroy();
+    else res.writeHead(404).end("{}");
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  });
+  const backend = createDockerBackend({
+    installation: "test",
+    controllerContainer: "controller",
+    image: "sha256:" + "a".repeat(64),
+    socketPath,
+    seccomp: {},
+  });
+  await assert.rejects(
+    backend.create(
+      { executionId: "execution", incarnation: "incarnation" },
+      AbortSignal.timeout(1000),
+    ),
+    (error) => {
+      assert(error instanceof AggregateError);
+      assert.match(error.message, /browser_worker_cleanup_unconfirmed/);
+      assert.equal(error.errors[0].message, "browser_docker_unavailable");
+      return true;
+    },
+  );
+});
