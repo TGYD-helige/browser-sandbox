@@ -166,3 +166,20 @@ test("compaction cannot delete a record whose serialized update still needs clea
   assert.match(admission.reason.message, /browser_execution_capacity_exceeded/);
   assert.deepEqual((await journal.read(id)).data, { phase: "cleanup-pending" });
 });
+
+test("startup streams validated records to recovery without a retained body cache", async (t) => {
+  const { journal, options } = await fixture(t);
+  const id = randomUUID();
+  await journal.create(id, { phase: "active", profileId: "original" });
+  const recovered = [];
+  await createExecutionJournal({
+    ...options,
+    async onRecord(record) {
+      await Promise.resolve();
+      recovered.push(record);
+    },
+  });
+  assert.deepEqual(recovered, [
+    { executionId: id, revision: 1, data: { phase: "active", profileId: "original" } },
+  ]);
+});

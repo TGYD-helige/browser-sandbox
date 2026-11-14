@@ -16,10 +16,12 @@ export async function createExecutionJournal({
   directory,
   installationId,
   maxRecords = 65536,
+  onRecord,
 }: {
   directory: string;
   installationId: string;
   maxRecords?: number;
+  onRecord?: (record: ExecutionRecord) => Promise<void> | void;
 }) {
   if (
     !installationId ||
@@ -178,6 +180,7 @@ export async function createExecutionJournal({
     const loaded = await readRecord(id);
     ids.add(id);
     if (loaded.finishedAt !== undefined) finished.set(id, loaded.finishedAt);
+    await onRecord?.(loaded.record);
   }
   if (removedPending) await syncDirectory();
   finished = new Map([...finished].sort((a, b) => a[1] - b[1]));
@@ -185,6 +188,8 @@ export async function createExecutionJournal({
   return {
     read,
     ids: () => [...ids],
+    has: (id: string) => ids.has(id),
+    finishedIds: () => [...finished.keys()],
     async create(id: string, data: Record<string, unknown>) {
       filename(id);
       if (ids.has(id)) throw Error("browser_execution_revoked");
