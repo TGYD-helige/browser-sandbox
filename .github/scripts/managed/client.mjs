@@ -10,7 +10,7 @@ import { createDockerClient } from "./dist/docker-backend.js";
 import { createControllerRuntime, sessionRequest } from "./dist/index.js";
 
 const api = createDockerClient();
-const runtime = createControllerRuntime("http://controller:8080");
+const runtime = createControllerRuntime("http://127.0.0.1:8082");
 const stateFile = "/tmp/managed-state.json";
 const installation = process.env.BROWSER_INSTALLATION;
 const ids = [];
@@ -121,9 +121,18 @@ try {
           pageId = current.targetId;
           const status = await sessionRequest(endpoint, "retain", 30000);
           retained = status;
-          const renewed = await sessionRequest(endpoint, "renew", 120000);
+          const renewalMs = 180000;
+          assert(
+            Date.now() + renewalMs > status.hardExpiresAt,
+            "Test renewal does not cross the hard deadline",
+          );
+          const renewed = await sessionRequest(endpoint, "renew", renewalMs);
           assert(renewed.expiresAt > status.expiresAt);
-          assert(renewed.expiresAt <= renewed.hardExpiresAt);
+          assert.equal(
+            renewed.expiresAt,
+            renewed.hardExpiresAt,
+            "Renewal beyond the hard deadline was not capped",
+          );
           primaryWorker = await workerFor(executionId);
         }
       } finally {
@@ -363,7 +372,12 @@ try {
           String.raw`
           import assert from 'node:assert/strict';
           import {execFileSync} from 'node:child_process';
-          for(const target of ['http://169.254.169.254/','http://${controllerIp}:8080/health','http://${secondIp}:8081/health']) await assert.rejects(fetch(target,{signal:AbortSignal.timeout(2000)}));
+          const rejected=()=>execFileSync('iptables',['-L','OUTPUT','-nvx']).toString().split('\n').filter(line=>line.includes('REJECT')).reduce((total,line)=>total+Number(line.trim().split(/\s+/)[0]),0);
+          for(const target of ['http://169.254.169.254/','http://${controllerIp}:8080/health','http://${secondIp}:8081/health']) {
+            const before=rejected();
+            await assert.rejects(fetch(target,{signal:AbortSignal.timeout(2000)}));
+            assert(rejected()>before,'Denied target did not hit worker egress policy');
+          }
           const rules=execFileSync('iptables',['-L','OUTPUT','-nvx']).toString();
           assert(rules.split('\n').some(line=>line.includes('REJECT')&&line.includes('169.254.0.0/16')&&Number(line.trim().split(/\s+/)[0])>0));
           execFileSync(process.execPath, ['-e', "fetch('http://127.0.0.1:8081/health',{signal:AbortSignal.timeout(2000)}).then(()=>process.exit(1),()=>process.exit(0))"], {uid:20001,gid:20001});

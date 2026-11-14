@@ -23,13 +23,15 @@ The controller creates a private bridge per worker, connecting only that worker 
 
 ## Connect a host and agent
 
+The agent listener is port 8080. Host-control `/host` is served separately on loopback port 8082 by default; the agent listener rejects that route. Run the trusted host adapter in the controller network namespace (for example a trusted adapter container using `--network container:browser-controller`), or bind host control to a dedicated management interface protected from agent and browser networks. Publish only the agent port to agents. The host authentication hook remains available on the separate listener; authentication is still deferred.
+
 ```js
 import {
   createBrowserSessions,
   createControllerRuntime,
 } from '@amaster.ai/browser-sandbox';
 
-const runtime = createControllerRuntime('http://127.0.0.1:8080', {
+const runtime = createControllerRuntime('http://127.0.0.1:8082', {
   automation: {
     async pause(executionId, signal) {
       // Resolve only after this execution's automation has stopped.
@@ -60,7 +62,7 @@ try {
 
 `register` and `endpoint` return opaque controller URLs shaped as `/execution/<reference>`. Registration and unused session status queries do not create a worker. First CDP, file, or viewer use allocates one worker; HTTP `/session`, `/files/<name>`, and `/auth` use the same controller reference. `browser-session` and `sessionRequest` derive their HTTP route from the returned endpoint as in local mode. CDP clients that require a client-side shared files mount must instead stage files through HTTP `/files`; remote workers do not share the client's filesystem.
 
-Host-control WebSocket `/host` carries the existing request operations and bounded bidirectional callbacks. `createControllerRuntime` implements `BrowserRuntime`; `attachStorage` transports small `load`/`save`/`commit` messages and `automation` transports pause/resume confirmations. Dropped connections fail pending work explicitly and abort callback signals. Persistent Profile registrations are rejected in this slice; the transport is available for persistent-storage adapters in the next slice. Never replay commands or website writes after a disconnect.
+Host-control WebSocket `/host` on the separate management listener carries the existing request operations and bounded bidirectional callbacks. `createControllerRuntime` implements `BrowserRuntime`; `attachStorage` transports small `load`/`save`/`commit` messages and `automation` transports pause/resume confirmations. Dropped connections fail pending work explicitly and abort callback signals. Persistent Profile registrations are rejected in this slice; the transport is available for persistent-storage adapters in the next slice. Never replay commands or website writes after a disconnect.
 
 `access_create` returns separate CDP and viewer references, with the requested control/resize flags and an expiry of at most 30 minutes. A fresh access reference resolves the same execution and worker. `access_revoke` terminates active connections and rejects old HTTP, CDP, and viewer references. Request a fresh endpoint/access reference after revocation. Session retain/renew/release and takeover operations remain worker-owned; renewal does not extend the hard browser deadline. Keep the host runtime connection open while automation callbacks are required.
 
@@ -72,6 +74,7 @@ Every protected agent route crosses the controller's `authorizeAccess` function 
 |---|---|
 | `BROWSER_INSTALLATION` | Installation label namespace; default `default`; use a distinct value per controller |
 | `BROWSER_CONTROLLER_PORT`, `BROWSER_CONTROLLER_HOST` | Listener; defaults `8080`, `0.0.0.0` |
+| `BROWSER_HOST_CONTROL_PORT`, `BROWSER_HOST_CONTROL_HOST` | Separate trusted-host listener; defaults `8082`, `127.0.0.1`; do not publish it to agents |
 | `BROWSER_CONTROLLER_ORIGIN` | Host/agent-reachable controller HTTP(S) origin; set explicitly for containers |
 | `BROWSER_VIEWER_ORIGINS` | Comma-separated allowed embedding/browser origins |
 | `BROWSER_DOCKER_SOCKET` | Controller Docker API socket; default `/var/run/docker.sock` |
@@ -81,6 +84,6 @@ Every protected agent route crosses the controller's `authorizeAccess` function 
 
 Controller management settings and secrets are never copied into worker environments. Browser UID traffic to the worker loopback control listener is also blocked. The adapter overrides role, execution identity, incarnation labels, private origin, `CONCURRENT=1`, and `QUEUED=0`. `createDockerBackend` accepts worker memory and shared-memory sizes (defaults 2 GiB and 512 MiB). Extensions use the same directory permissions and trust requirements as local extensions.
 
-Finalization revokes access, confirms worker runtime finalization, and removes the exact owned container and network. Unused executions finalize without creating infrastructure. Terminal worker-control transport failure force-removes the exact temporary worker and reports `browser_worker_finalization_failed`; failed infrastructure deletion retains the binding for an explicit retry; no replacement worker is created automatically. Temporary Profile data is container-local and removed with the worker. The controller currently owns bindings in memory and supports one replica. The in-memory execution identity budget is 65,536 registrations per controller lifetime; reaching it rejects further registration. Restart recovery, abandoned-execution TTL, admission/capacity limits, and orphan reconciliation are subsequent slices. If a Docker controller crashes, workers remain until an operator reclaims them; Browserless's browser timeout does not bound the lifetime of an idle worker container. A normal controller SIGTERM attempts finalization; do not assume an orchestrator's short stop grace permits every worker to finish.
+Finalization revokes access, confirms worker runtime finalization, and removes the exact owned container and network. Unused executions finalize without creating infrastructure. Terminal worker-control transport failure force-removes the exact temporary worker and reports `browser_worker_finalization_failed`; failed infrastructure deletion retains the binding for an explicit retry. Worker creation belongs to all current waiters; one disconnect does not cancel other waiters, and the final waiter leaving cancels an unfinished attempt. A failed or cancelled attempt is cleared so later requests can retry after confirmed cleanup. A published running worker is never transparently replaced. Cleanup errors preserve the original operation failure and close the runtime channel even when infrastructure deletion fails. Temporary Profile data is container-local and removed with the worker. The controller currently owns bindings in memory and supports one replica. The in-memory finished-identity window retains the most recent 65,536 finalized executions and evicts older identities. Active registrations have a separate limit; normal finalization does not exhaust a lifetime registration budget. Durable fencing across restarts belongs to the recovery slice. Restart recovery, abandoned-execution TTL, admission/capacity limits, and orphan reconciliation are subsequent slices. If a Docker controller crashes, workers remain until an operator reclaims them; Browserless's browser timeout does not bound the lifetime of an idle worker container. A normal controller SIGTERM attempts finalization; do not assume an orchestrator's short stop grace permits every worker to finish.
 
 Use `GET /health` on the controller for readiness. Workers expose readiness only on their private listener after the existing real-renderer startup probe. Managed integration CI runs both Docker architectures, records first-browser readiness and direct-versus-proxy measurements, and tests standard CDP, files, session/access renewal, sandbox diagnostics, an existing agent-browser harness, egress denial, and owned cleanup. Measurements describe the test environment; they are not production capacity guarantees.

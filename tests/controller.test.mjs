@@ -40,7 +40,7 @@ test("managed sessions register without a UID, allocate lazily, proxy files, and
     },
   });
   t.after(() => controller.stop());
-  const runtime = createControllerRuntime(controller.origin);
+  const runtime = createControllerRuntime(controller.controlOrigin);
   t.after(() => runtime.close());
   const sessions = createBrowserSessions({
     provider: { acquire: async () => runtime, release: async () => {} },
@@ -111,7 +111,7 @@ test("managed sessions reject tenant placement and persistent profiles before wo
     },
   });
   t.after(() => controller.stop());
-  const runtime = createControllerRuntime(controller.origin);
+  const runtime = createControllerRuntime(controller.controlOrigin);
   t.after(() => runtime.close());
   const sessions = createBrowserSessions({
     provider: {

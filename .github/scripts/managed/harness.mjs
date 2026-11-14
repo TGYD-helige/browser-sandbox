@@ -53,6 +53,10 @@ try {
     }),
     "Agent reached private worker",
   );
+  await assert.rejects(
+    fetch("http://controller:8082/host", { signal: AbortSignal.timeout(2000) }),
+    "Agent reached host-control listener",
+  );
   await call("open", "data:text/html,<h1>Managed harness</h1>");
   await call("snapshot");
   const screenshot = join(home, "screenshot.png");

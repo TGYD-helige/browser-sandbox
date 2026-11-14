@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
+import { WorkerCleanupFailure } from "./lifecycle-errors.js";
 import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
 import { createControllerRuntime } from "./network-control.js";
 
@@ -189,12 +190,18 @@ export function createDockerBackend(options: DockerBackendOptions): ManagedBacke
         };
       } catch (error) {
         const cleanup = AbortSignal.timeout(30000);
+        const failures: unknown[] = [];
         try {
           if (id) await removeOwned(id, expected, cleanup);
-          if (network) await removeNetwork(network, expected, cleanup);
-        } catch {
-          throw Error("browser_worker_cleanup_unconfirmed");
+        } catch (failure) {
+          failures.push(failure);
         }
+        try {
+          if (network) await removeNetwork(network, expected, cleanup);
+        } catch (failure) {
+          failures.push(failure);
+        }
+        if (failures.length) throw new WorkerCleanupFailure(error, ...failures);
         throw error;
       }
     },

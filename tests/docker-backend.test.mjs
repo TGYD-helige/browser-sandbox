@@ -102,3 +102,40 @@ test("Docker creation failure removes a network before the controller was attach
   );
   assert(removed, "Unattached worker network was left behind after failed creation");
 });
+
+test("Docker creation reports both operation and cleanup errors", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "docker-cleanup-"));
+  const socketPath = join(root, "docker.sock");
+  const server = createServer((req, res) => {
+    res.setHeader("content-type", "application/json");
+    if (req.url === "/v1.47/networks/create")
+      res.end(JSON.stringify({ Id: "network" }));
+    else res.writeHead(500).end("{}");
+  });
+  await new Promise((resolve) => server.listen(socketPath, resolve));
+  t.after(async () => {
+    await new Promise((resolve) => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  });
+  const backend = createDockerBackend({
+    installation: "test",
+    controllerContainer: "controller",
+    image: "sha256:" + "a".repeat(64),
+    socketPath,
+    seccomp: {},
+  });
+  await assert.rejects(
+    backend.create(
+      { executionId: "execution", incarnation: "incarnation" },
+      AbortSignal.timeout(1000),
+    ),
+    (error) => {
+      assert(error instanceof AggregateError);
+      assert.equal(error.errors.length, 2);
+      assert.equal(error.errors[0].statusCode, 500);
+      assert.equal(error.errors[1].statusCode, 500);
+      assert.match(error.message, /browser_worker_cleanup_unconfirmed/);
+      return true;
+    },
+  );
+});

@@ -83,7 +83,7 @@ test("controller and a private single-execution worker preserve text frames and 
     },
   });
   cleanups.push(() => controller.stop());
-  const runtime = createControllerRuntime(controller.origin);
+  const runtime = createControllerRuntime(controller.controlOrigin);
   cleanups.push(() => runtime.close());
   await assert.rejects(
     gateway.workerCommand({ op: "register", executionId: randomUUID() }),

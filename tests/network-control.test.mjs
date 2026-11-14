@@ -147,7 +147,7 @@ test("controller routes attached storage callbacks between the real host and wor
     },
   });
   t.after(() => controller.stop());
-  const runtime = createControllerRuntime(controller.origin);
+  const runtime = createControllerRuntime(controller.controlOrigin);
   t.after(() => runtime.close());
   const attachment = await runtime.attachStorage(
     { executionId },

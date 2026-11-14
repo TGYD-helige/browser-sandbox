@@ -2,9 +2,12 @@ import { randomBytes, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
-import { pipeline } from "node:stream";
+import { pipeline, Transform } from "node:stream";
 import WebSocket, { createWebSocketStream, WebSocketServer } from "ws";
+import { waitForControl } from "./automation-control.js";
+import { MAX_FILE_BYTES } from "./files.js";
 import type { Registration } from "./host-client.js";
+import { WorkerCleanupFailure } from "./lifecycle-errors.js";
 import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
 import { type ControlPeer, createNetworkHostControl } from "./network-control.js";
 import { normalizeAllowedDomains } from "./network-policy.js";
@@ -16,6 +19,8 @@ export interface ExecutionBinding {
   allowedDomains: string[];
   worker?: ManagedWorker;
   starting?: Promise<ManagedWorker>;
+  creation?: { abort: AbortController; waiters: number };
+  creationFailure?: unknown;
   endpoint?: { cdpUrl: string; viewerToken: string };
   life: AbortController;
   revoked: boolean;
@@ -43,6 +48,8 @@ export interface ControllerOptions {
   backend: ManagedBackend;
   port?: number;
   host?: string;
+  controlPort?: number;
+  controlHost?: string;
   publicOrigin?: string;
   viewerOrigins?: string[];
   creationTimeoutMs?: number;
@@ -67,6 +74,10 @@ export async function createController(options: ControllerOptions) {
   const grants = new Map<string, Access>();
   const finished = new Set<string>();
   const storage = new Map<string, StorageAttachment>();
+  const rememberFinished = (id: string) => {
+    finished.add(id);
+    if (finished.size > 65536) finished.delete(finished.values().next().value);
+  };
   let closing = false;
   let origin = options.publicOrigin;
   if (
@@ -146,7 +157,17 @@ export async function createController(options: ControllerOptions) {
             return;
           }
         }
-        const action = req.method === "POST" ? JSON.parse(input) : { action: "status" };
+        let action: { action?: string; durationMs?: number };
+        try {
+          action = req.method === "POST" ? JSON.parse(input) : { action: "status" };
+        } catch {
+          res.writeHead(400).end(JSON.stringify({ error: "browser_request_invalid" }));
+          return;
+        }
+        if (!action || typeof action !== "object" || Array.isArray(action)) {
+          res.writeHead(400).end(JSON.stringify({ error: "browser_request_invalid" }));
+          return;
+        }
         const result = await command(
           {
             op: "session",
@@ -162,7 +183,12 @@ export async function createController(options: ControllerOptions) {
           .end(JSON.stringify(result));
         return;
       }
-      const worker = await ensureWorker(grant.binding, signal);
+      const fileRoute = match[2].startsWith("/files/");
+      if (fileRoute && Number(req.headers["content-length"]) > MAX_FILE_BYTES) {
+        res.writeHead(413, { connection: "close" }).end();
+        return;
+      }
+      await ensureWorker(grant.binding, signal);
       signal.throwIfAborted();
       const target = new URL(grant.binding.endpoint.cdpUrl);
       target.protocol = "http:";
@@ -186,8 +212,34 @@ export async function createController(options: ControllerOptions) {
             .end(JSON.stringify({ error: "browser_worker_unavailable" }));
         else res.destroy();
       });
-      pipeline(req, upstream, () => {});
-      void worker;
+      if (fileRoute) {
+        let bytes = 0,
+          exceeded = false;
+        const limit = new Transform({
+          transform(chunk, _encoding, done) {
+            bytes += chunk.length;
+            if (bytes > MAX_FILE_BYTES) {
+              exceeded = true;
+              req.unpipe(limit);
+              req.resume();
+              res.once("finish", () => req.destroy());
+              res.writeHead(413, { connection: "close" }).end();
+              done(Error("browser_file_too_large"));
+              return;
+            }
+            done(undefined, chunk);
+          },
+        });
+        req.once("error", (error) => limit.destroy(error));
+        res.once("close", () => {
+          req.unpipe(limit);
+          limit.destroy();
+        });
+        req.pipe(limit);
+        pipeline(limit, upstream, (error) => {
+          if (error && !exceeded) req.destroy();
+        });
+      } else pipeline(req, upstream, () => {});
     } catch (error) {
       if (!res.headersSent)
         res.writeHead(502).end(JSON.stringify({ error: errorCode(error) }));
@@ -291,19 +343,38 @@ export async function createController(options: ControllerOptions) {
     }
     attachment.channel = channel;
   }
+  async function removeWorker(worker: ManagedWorker, signal: AbortSignal) {
+    let failure: unknown;
+    try {
+      await options.backend.remove(worker, signal);
+    } catch (error) {
+      failure = error;
+    }
+    try {
+      worker.runtime.close?.();
+    } catch (error) {
+      failure = failure ? new WorkerCleanupFailure(failure, error) : error;
+    }
+    if (failure) throw failure;
+  }
   async function ensureWorker(binding: ExecutionBinding, signal: AbortSignal) {
     signal.throwIfAborted();
     if (binding.revoked) throw Error("browser_execution_revoked");
+    if (binding.worker && !binding.endpoint)
+      throw binding.creationFailure ?? Error("browser_worker_cleanup_unconfirmed");
     if (!binding.starting) {
-      // One creation belongs to the binding; a disconnect cancels its initial acquisition.
+      const attempt = { abort: new AbortController(), waiters: 0 };
+      binding.creation = attempt;
+      binding.creationFailure = undefined;
+      binding.incarnation = randomUUID();
       const creationSignal = AbortSignal.any([
         binding.life.signal,
-        signal,
+        attempt.abort.signal,
         AbortSignal.timeout(options.creationTimeoutMs ?? 90000),
       ]);
       const startedAt = performance.now();
       event(binding, "creating");
-      binding.starting = (async () => {
+      const starting = (async () => {
         const worker = await options.backend.create(
           {
             executionId: binding.executionId,
@@ -341,24 +412,41 @@ export async function createController(options: ControllerOptions) {
           if (attachment) await attachWorkerStorage(worker, attachment);
           creationSignal.throwIfAborted();
           binding.endpoint = result;
+          binding.creation = undefined;
           event(binding, "ready", { elapsedMs: performance.now() - startedAt });
           return worker;
         } catch (error) {
-          await options.backend.remove(worker, AbortSignal.timeout(30000));
-          worker.runtime.close?.();
-          binding.worker = undefined;
+          try {
+            await removeWorker(worker, AbortSignal.timeout(30000));
+            binding.worker = undefined;
+          } catch (cleanup) {
+            throw new WorkerCleanupFailure(error, cleanup);
+          }
           throw error;
         }
       })();
-      // Keep a failed creation fenced; retry/replacement is an explicit recovery operation.
-      binding.starting.catch((error) =>
+      binding.starting = starting.catch((error) => {
+        if (binding.creation === attempt) {
+          binding.starting = undefined;
+          binding.creation = undefined;
+          binding.creationFailure = error;
+        }
         event(binding, "failed", {
           elapsedMs: performance.now() - startedAt,
           error: errorCode(error),
-        }),
-      );
+        });
+        throw error;
+      });
     }
-    return binding.starting;
+    const attempt = binding.creation;
+    if (!attempt) return binding.starting;
+    attempt.waiters++;
+    try {
+      return await waitForControl(binding.starting, signal);
+    } finally {
+      attempt.waiters--;
+      if (!attempt.waiters && !binding.endpoint) attempt.abort.abort();
+    }
   }
   async function command(
     request: any,
@@ -429,8 +517,7 @@ export async function createController(options: ControllerOptions) {
       if (binding && JSON.stringify(binding.allowedDomains) !== JSON.stringify(domains))
         throw Error("browser_domains_changed");
       if (!binding) {
-        if (bindings.size + finished.size >= 65536)
-          throw Error("browser_execution_capacity_exceeded");
+        if (bindings.size >= 65536) throw Error("browser_execution_capacity_exceeded");
         binding = {
           executionId: id,
           incarnation: randomUUID(),
@@ -470,22 +557,30 @@ export async function createController(options: ControllerOptions) {
                 "browser_control_unavailable",
                 "browser_control_timeout",
               ].includes(error.message)
-            )
+            ) {
+              try {
+                current.worker.runtime.close?.();
+              } catch (cleanup) {
+                throw new WorkerCleanupFailure(error, cleanup);
+              }
               throw error;
-            await options.backend.remove(current.worker, AbortSignal.timeout(30000));
-            current.worker.runtime.close?.();
+            }
+            try {
+              await removeWorker(current.worker, AbortSignal.timeout(30000));
+            } catch (cleanup) {
+              throw new WorkerCleanupFailure(error, cleanup);
+            }
             storage.get(id)?.cleanup();
             bindings.delete(id);
-            finished.add(id);
+            rememberFinished(id);
             event(current, "removed", { error: errorCode(error) });
             throw Error("browser_worker_finalization_failed");
           }
-          await options.backend.remove(current.worker, signal);
-          current.worker.runtime.close?.();
+          await removeWorker(current.worker, signal);
         }
         storage.get(id)?.cleanup();
         bindings.delete(id);
-        finished.add(id);
+        rememberFinished(id);
         event(current, "removed");
         return result;
       })().catch((error) => {
@@ -536,8 +631,13 @@ export async function createController(options: ControllerOptions) {
     const worker = await binding.starting;
     return worker.runtime.request(request, { signal });
   }
+  const controlServer = createServer((_req, res) => res.writeHead(404).end());
+  controlServer.on("upgrade", (req, socket) => {
+    if (req.url !== "/host")
+      socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+  });
   const control = createNetworkHostControl({
-    server,
+    server: controlServer,
     dispatch: command,
     authenticateHost: options.authenticateHost,
   });
@@ -589,7 +689,6 @@ export async function createController(options: ControllerOptions) {
   }
   const cdp = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
   server.on("upgrade", async (req, socket, head) => {
-    if (req.url === "/host") return;
     const life = new AbortController();
     socket.once("close", () => life.abort());
     try {
@@ -649,8 +748,26 @@ export async function createController(options: ControllerOptions) {
     server.once("error", reject);
     server.listen(options.port ?? 8080, options.host ?? "127.0.0.1", resolve);
   });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      controlServer.once("error", reject);
+      controlServer.listen(
+        options.controlPort ?? 0,
+        options.controlHost ?? "127.0.0.1",
+        resolve,
+      );
+    });
+  } catch (error) {
+    control.close();
+    cdp.close();
+    viewers.close();
+    for (const socket of rawConnections) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    throw error;
+  }
   origin ??= `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   return {
+    controlOrigin: `http://127.0.0.1:${(controlServer.address() as AddressInfo).port}`,
     origin,
     command,
     bindings,
@@ -671,7 +788,11 @@ export async function createController(options: ControllerOptions) {
       viewers.close();
       cdp.close();
       for (const socket of rawConnections) socket.destroy();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      controlServer.closeAllConnections();
+      await Promise.all([
+        new Promise<void>((resolve) => server.close(() => resolve())),
+        new Promise<void>((resolve) => controlServer.close(() => resolve())),
+      ]);
       if (failure) throw failure;
     },
   };

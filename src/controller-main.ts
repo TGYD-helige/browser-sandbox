@@ -25,6 +25,8 @@ const controller = await createController({
   port: Number(process.env.BROWSER_CONTROLLER_PORT ?? 8080),
   host: process.env.BROWSER_CONTROLLER_HOST ?? "0.0.0.0",
   publicOrigin: process.env.BROWSER_CONTROLLER_ORIGIN,
+  controlPort: Number(process.env.BROWSER_HOST_CONTROL_PORT ?? 8082),
+  controlHost: process.env.BROWSER_HOST_CONTROL_HOST ?? "127.0.0.1",
   viewerOrigins: process.env.BROWSER_VIEWER_ORIGINS?.split(","),
 });
 for (const signal of ["SIGINT", "SIGTERM"])
