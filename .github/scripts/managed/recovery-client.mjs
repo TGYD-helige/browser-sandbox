@@ -4,7 +4,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { connectCdp } from "./dist/cdp.js";
 import { createControllerRuntime, sessionRequest } from "./dist/index.js";
 
-const origin = process.env.CONTROLLER_ORIGIN ?? "http://controller:8080";
+const origin = process.env.TEST_CONTROL_ORIGIN ?? "http://127.0.0.1:8082";
 const stateFile = "/controller-data/recovery-test.json";
 const runtime = createControllerRuntime(origin);
 const phase = process.argv[2];

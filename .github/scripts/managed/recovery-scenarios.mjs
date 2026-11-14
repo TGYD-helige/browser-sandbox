@@ -7,7 +7,7 @@ const { connectCdp } = await import(`${root}/dist/cdp.js`);
 const { createBrowserSessions, createControllerRuntime, sessionRequest } = await import(
   `${root}/dist/index.js`
 );
-const origin = process.env.TEST_CONTROLLER_ORIGIN ?? "http://controller:8080";
+const origin = process.env.TEST_CONTROL_ORIGIN ?? "http://127.0.0.1:8082";
 const runtime = createControllerRuntime(origin, {
   automation: { pause: async () => {}, resume: async () => {} },
 });

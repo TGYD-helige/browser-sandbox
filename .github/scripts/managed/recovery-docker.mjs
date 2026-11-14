@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { promisify } from "node:util";
+import { archiveFixture } from "../benchmark-storage.mjs";
 
 const exec = promisify(execFile);
 const docker = async (...args) =>
@@ -14,7 +17,7 @@ const installation = `recovery-${randomUUID().slice(0, 8)}`;
 const image = process.env.BROWSER_IMAGE ?? "browser-sandbox:managed";
 const nextImage = `browser-sandbox:protocol-${installation}`;
 const controllerName = `controller-${installation}`;
-let controller, network, volume;
+let controller, network, volume, archive, archiveDirectory, archiveUrl;
 const results = [];
 const workerIds = () =>
   docker("ps", "-aq", "--filter", `label=browser-sandbox.installation=${installation}`);
@@ -77,12 +80,14 @@ const create = async (candidate = image, store = true, workerImage) => {
     "BROWSER_MAX_QUEUED=1",
     "-e",
     "TIMEOUT=180000",
+    "-e",
+    `BROWSER_STORAGE_EGRESS=${JSON.stringify([{ address: archiveUrl.hostname, port: Number(archiveUrl.port) }])}`,
     ...(store
       ? [
           "-e",
           "BROWSER_PROFILE_STORE_ROOT=/controller-data/profiles",
           "-e",
-          `BROWSER_PROFILE_STORE_ORIGIN=http://${controllerName}:8082`,
+          `BROWSER_PROFILE_STORE_ORIGIN=http://${controllerName}:8083`,
         ]
       : []),
     ...(workerImage ? ["-e", `BROWSER_IMAGE=${workerImage}`] : []),
@@ -120,7 +125,7 @@ const scenarios = async (phase) =>
       "-e",
       `TEST_RECOVERY_PHASE=${phase}`,
       "-e",
-      `BROWSER_HOST_ARCHIVE_URL=http://${controllerName}:8082/archive`,
+      `BROWSER_HOST_ARCHIVE_URL=${archiveUrl}`,
       controller,
       "node",
       "/opt/browser-sandbox/recovery-scenarios.mjs",
@@ -140,6 +145,24 @@ try {
   );
   network = await docker("network", "create", `agents-${installation}`);
   volume = await docker("volume", "create", `state-${installation}`);
+  archiveDirectory = await mkdtemp(join(tmpdir(), "recovery-archive-"));
+  archive = await archiveFixture(archiveDirectory, { host: "0.0.0.0" });
+  archiveUrl = new URL(archive.url);
+  archiveUrl.hostname =
+    process.platform === "darwin"
+      ? await docker(
+          "run",
+          "--rm",
+          "--network",
+          network,
+          "--entrypoint",
+          "node",
+          image,
+          "-e",
+          "require('node:dns').lookup('host.docker.internal',(error,result)=>{if(error)process.exit(1);console.log(result)})",
+        )
+      : JSON.parse(await docker("network", "inspect", "bridge"))[0].IPAM.Config[0]
+          .Gateway;
   await create();
   results.push(
     await scenarios("core"),
@@ -203,40 +226,6 @@ try {
   results.push(await run("image-failure"));
   assert.equal(await workerIds(), "");
   await replace(image, false);
-  await docker(
-    "exec",
-    controller,
-    "mkdir",
-    "-p",
-    "/opt/browser-sandbox/.github/scripts/managed",
-  );
-  await docker(
-    "cp",
-    ".github/scripts/managed/host-storage.mjs",
-    `${controller}:/opt/browser-sandbox/.github/scripts/managed/host-storage.mjs`,
-  );
-  await docker(
-    "exec",
-    "-d",
-    controller,
-    "node",
-    "/opt/browser-sandbox/.github/scripts/managed/host-storage.mjs",
-  );
-  await wait(
-    "Host storage fixture did not listen",
-    () =>
-      docker(
-        "exec",
-        controller,
-        "node",
-        "-e",
-        "const s=require('node:net').connect(8082,'127.0.0.1');s.once('connect',()=>s.end());s.once('error',()=>process.exit(1))",
-      ).then(
-        () => true,
-        () => false,
-      ),
-    Boolean,
-  );
   results.push(await scenarios("ttl-host"));
   assert.equal(await workerIds(), "");
   await writeFile(
@@ -256,6 +245,8 @@ try {
   );
   throw error;
 } finally {
+  await archive?.close();
+  if (archiveDirectory) await rm(archiveDirectory, { recursive: true, force: true });
   for (const id of (await workerIds().catch(() => "")).split("\n").filter(Boolean))
     await docker("rm", "-f", "-v", id).catch(() => {});
   if (controller) await docker("rm", "-f", controller).catch(() => {});
