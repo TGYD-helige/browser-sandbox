@@ -314,6 +314,8 @@ export function createKubernetesBackend(
                 "ImagePullBackOff",
                 "InvalidImageName",
                 "CreateContainerConfigError",
+                "CreateContainerError",
+                "RunContainerError",
               ].includes(container.state?.waiting?.reason),
             )
           )

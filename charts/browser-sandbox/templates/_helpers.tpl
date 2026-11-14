@@ -1,5 +1,10 @@
 {{- define "browser-sandbox.name" -}}
-{{- printf "%s-browser" .Release.Name | trunc 51 | trimSuffix "-" -}}
+{{- $name := printf "%s-browser" .Release.Name | trunc 51 | trimSuffix "-" -}}
+{{- $dnsLabel := "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" -}}
+{{- if or (not (regexMatch $dnsLabel .Release.Name)) (not (regexMatch $dnsLabel $name)) -}}
+{{- fail "Release.Name and its truncated resource name must be DNS labels (lowercase letters, digits and hyphens, starting and ending with a letter or digit)" -}}
+{{- end -}}
+{{- $name -}}
 {{- end -}}
 {{- define "browser-sandbox.image" -}}
 {{- if not (regexMatch "^sha256:[a-f0-9]{64}$" .Values.image.digest) -}}
