@@ -11,7 +11,7 @@ export interface ExecutionRecord {
   data: Record<string, unknown>;
 }
 
-/** Single-controller durable identities. Finished records are fences, never automatic GC candidates. */
+/** Single-controller durable identities with bounded recent finished fences. */
 export async function createExecutionJournal({
   directory,
   installationId,
@@ -21,17 +21,23 @@ export async function createExecutionJournal({
   installationId: string;
   maxRecords?: number;
 }) {
-  if (!installationId || !Number.isSafeInteger(maxRecords) || maxRecords < 1)
+  if (
+    !installationId ||
+    !Number.isSafeInteger(maxRecords) ||
+    maxRecords < 1 ||
+    maxRecords > 65536
+  )
     throw Error("browser_execution_journal_invalid");
   await mkdir(directory, { recursive: true, mode: 0o700 });
   await chmod(directory, 0o700);
   const ids = new Set<string>();
+  let finished = new Map<string, number>();
   const mutations = new Map<string, Promise<unknown>>();
   const filename = (id: string) => {
     if (!uuid.test(id)) throw Error("browser_execution_id_invalid");
     return join(directory, `${id}.json`);
   };
-  const read = async (id: string): Promise<ExecutionRecord> => {
+  const readRecord = async (id: string) => {
     const file = await open(
       filename(id),
       constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
@@ -52,21 +58,39 @@ export async function createExecutionJournal({
         Array.isArray(body.data)
       )
         throw Error("browser_execution_journal_corrupt");
-      return { executionId: id, revision: body.revision, data: body.data };
+      const finishedAt =
+        body.data.phase === "finished"
+          ? (body.finishedAt ?? Math.floor(stat.mtimeMs))
+          : undefined;
+      if (
+        body.finishedAt !== undefined &&
+        (body.data.phase !== "finished" ||
+          !Number.isSafeInteger(body.finishedAt) ||
+          body.finishedAt < 0)
+      )
+        throw Error("browser_execution_journal_corrupt");
+      return {
+        record: {
+          executionId: id,
+          revision: body.revision,
+          data: body.data,
+        } as ExecutionRecord,
+        finishedAt: finishedAt as number | undefined,
+      };
     } finally {
       await file.close();
     }
   };
-  const entries = await opendir(directory);
-  for await (const entry of entries) {
-    if (entry.name.startsWith(".pending-")) continue;
-    const id = entry.name.slice(0, -5);
-    if (!entry.name.endsWith(".json") || !uuid.test(id))
-      throw Error("browser_execution_journal_corrupt");
-    if (ids.size >= maxRecords) throw Error("browser_execution_journal_full");
-    await read(id);
-    ids.add(id);
-  }
+  const read = async (id: string): Promise<ExecutionRecord> =>
+    (await readRecord(id)).record;
+  const syncDirectory = async () => {
+    const folder = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
+    try {
+      await folder.sync();
+    } finally {
+      await folder.close();
+    }
+  };
   const write = async (record: ExecutionRecord, create: boolean) => {
     const target = filename(record.executionId);
     if (
@@ -77,10 +101,15 @@ export async function createExecutionJournal({
       record.revision < 1
     )
       throw Error("browser_execution_record_invalid");
+    const finishedAt =
+      record.data.phase === "finished"
+        ? (finished.get(record.executionId) ?? Date.now())
+        : undefined;
     const body = JSON.stringify({
       protocol: "browser-sandbox.execution/v1",
       installationId,
       ...record,
+      finishedAt,
     });
     if (Buffer.byteLength(body) > MAX_RECORD_BYTES)
       throw Error("browser_execution_record_too_large");
@@ -95,17 +124,14 @@ export async function createExecutionJournal({
     try {
       if (create) await link(temporary, target);
       else await rename(temporary, target);
-      const folder = await open(directory, constants.O_RDONLY | constants.O_DIRECTORY);
-      try {
-        await folder.sync();
-      } finally {
-        await folder.close();
-      }
+      await syncDirectory();
     } finally {
       await unlink(temporary).catch((error) => {
         if (error.code !== "ENOENT") throw error;
       });
     }
+    if (finishedAt !== undefined) finished.set(record.executionId, finishedAt);
+    else finished.delete(record.executionId);
   };
   const serialize = <T>(id: string, action: () => Promise<T>): Promise<T> => {
     const work = (mutations.get(id) ?? Promise.resolve()).then(action);
@@ -117,14 +143,57 @@ export async function createExecutionJournal({
     mutations.set(id, settled);
     return work;
   };
+  let compacting: Promise<unknown> = Promise.resolve();
+  const compact = (reserve: number) => {
+    const work = compacting.then(async () => {
+      let removed = 0;
+      while (ids.size + reserve > maxRecords && finished.size) {
+        const id = finished.keys().next().value;
+        await serialize(id, async () => {
+          if (!finished.has(id)) return;
+          await unlink(filename(id));
+          await syncDirectory();
+          finished.delete(id);
+          ids.delete(id);
+          removed++;
+        });
+      }
+      return removed;
+    });
+    compacting = work.catch(() => {});
+    return work;
+  };
+  let removedPending = false;
+  const entries = await opendir(directory);
+  for await (const entry of entries) {
+    if (entry.name.startsWith(".pending-") && uuid.test(entry.name.slice(9))) {
+      await unlink(join(directory, entry.name));
+      removedPending = true;
+      continue;
+    }
+    const id = entry.name.slice(0, -5);
+    if (!entry.name.endsWith(".json") || !uuid.test(id))
+      throw Error("browser_execution_journal_corrupt");
+    if (ids.size >= 65536) throw Error("browser_execution_capacity_exceeded");
+    const loaded = await readRecord(id);
+    ids.add(id);
+    if (loaded.finishedAt !== undefined) finished.set(id, loaded.finishedAt);
+  }
+  if (removedPending) await syncDirectory();
+  finished = new Map([...finished].sort((a, b) => a[1] - b[1]));
+  await compact(0);
   return {
     read,
     ids: () => [...ids],
-    create(id: string, data: Record<string, unknown>) {
+    async create(id: string, data: Record<string, unknown>) {
       filename(id);
-      if (ids.has(id)) return Promise.reject(Error("browser_execution_revoked"));
-      if (ids.size >= maxRecords)
-        return Promise.reject(Error("browser_execution_journal_full"));
+      if (ids.has(id)) throw Error("browser_execution_revoked");
+      while (ids.size >= maxRecords) {
+        const removed = await compact(1);
+        if (!removed && ids.size >= maxRecords)
+          throw Error("browser_execution_capacity_exceeded");
+      }
+      if (ids.has(id)) throw Error("browser_execution_revoked");
       // A failed durable write remains fenced until restart resolves its actual on-disk outcome.
       ids.add(id);
       return serialize(id, async () => {
