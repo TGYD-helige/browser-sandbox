@@ -1843,3 +1843,33 @@ test("a blocked persistent finalization accepts an absent worker after confirmed
       worker.runtime.request = async () => ({ stopped: true });
   }
 });
+
+test("HTTP renewal preserves detected session loss while revoking the old endpoint", async (t) => {
+  const f = await fixture(t);
+  const controller = await f.start({ reconciliationMs: 60000 });
+  const executionId = randomUUID();
+  const endpoint = await controller.command({ op: "register", executionId });
+  await fetch(fileUrl(controller, endpoint));
+  const sessionUrl = `${controller.origin + new URL(endpoint.wsEndpoint).pathname}/session`;
+  assert.equal((await (await fetch(sessionUrl)).json()).generation, "original");
+  const worker = [...f.resources.values()][0];
+  const request = worker.runtime.request;
+  worker.runtime.request = async (input) => {
+    const result = await request(input);
+    if (input.op === "worker_status")
+      result.session = { ...result.session, state: "expired" };
+    return result;
+  };
+  try {
+    const response = await fetch(sessionUrl, {
+      method: "POST",
+      body: JSON.stringify({ action: "renew", durationMs: 10000 }),
+    });
+    assert.deepEqual(await response.json(), { error: "browser_session_lost" });
+    assert.equal(response.status, 502);
+    assert.equal((await fetch(sessionUrl)).status, 403);
+    assert.equal(f.created, 1);
+  } finally {
+    worker.runtime.request = request;
+  }
+});

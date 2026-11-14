@@ -2038,6 +2038,12 @@ export async function createController(options: ControllerOptions) {
   };
 }
 function errorCode(error: any, grant?: Access) {
+  // Session loss revokes its own grant; preserve the cause for the detecting request.
+  if (
+    error?.message === "browser_session_lost" &&
+    grant?.binding.recoveryError === "browser_session_lost"
+  )
+    return "browser_session_lost";
   if (grant?.life.signal.aborted || grant?.binding.revoked)
     return "browser_execution_revoked";
   return /^browser_[a-z_]+$/.test(error?.message)
