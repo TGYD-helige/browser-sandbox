@@ -630,3 +630,70 @@ test("unreachable temporary recovery retries before deleting its infrastructure"
     "finished",
   );
 });
+
+test("unconfirmed persistent recovery becomes visible and retains its lease until explicit finish", async (t) => {
+  const f = await fixture(t);
+  const profileStore = { open: () => ({ close: async () => {} }) };
+  const create = f.backend.create;
+  f.backend.create = async (...args) => {
+    const worker = await create(...args);
+    worker.runtime.attachStorage = async () => ({ close() {} });
+    return worker;
+  };
+  const first = await f.start({ profileStore, reconciliationMs: 60000 });
+  const executionId = randomUUID();
+  const endpoint = await first.command({
+    op: "register",
+    executionId,
+    profileId: "kept-profile",
+  });
+  await fetch(fileUrl(first, endpoint));
+  await first.stop();
+  const worker = [...f.resources.values()][0];
+  const request = worker.runtime.request;
+  worker.runtime.request = async () => {
+    throw Error("browser_control_disconnected");
+  };
+  t.after(() => {
+    worker.runtime.request = request;
+  });
+  const events = [];
+  const second = await f.start({
+    profileStore,
+    reconciliationMs: 60000,
+    onWorkerEvent: (event) => events.push(event),
+  });
+  for (let i = 0; i < 3; i++) await second.reconcile();
+  const status = await second.command({ op: "controller_status", executionId });
+  assert.equal(status.execution.phase, "recovery-blocked");
+  assert.equal(status.recoveryBlocked, 1);
+  assert.equal(status.execution.recoveryAttempts, 3);
+  assert.equal(status.execution.statusError, "browser_control_disconnected");
+  assert.equal(events.filter((event) => event.type === "recovery-blocked").length, 1);
+  assert.equal(second.capacity().workers, 1);
+  await assert.rejects(
+    second.command({
+      op: "register",
+      executionId: randomUUID(),
+      profileId: "kept-profile",
+    }),
+    /browser_profile_busy/,
+  );
+  await second.stop();
+  const third = await f.start({ profileStore, reconciliationMs: 60000 });
+  await third.reconcile();
+  assert.equal(
+    (await third.command({ op: "controller_status", executionId })).execution.phase,
+    "recovery-blocked",
+  );
+  assert.equal(third.capacity().workers, 1);
+  worker.runtime.request = request;
+  await third.command({ op: "finish", executionId });
+  assert.equal(f.resources.size, 0);
+  assert.equal(third.capacity().workers, 0);
+  await third.command({
+    op: "register",
+    executionId: randomUUID(),
+    profileId: "kept-profile",
+  });
+});
