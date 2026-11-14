@@ -648,6 +648,7 @@ export async function createController(options: ControllerOptions) {
     if (peer.signal.aborted) throw Error("browser_storage_disconnected");
     if (binding.storagePeer === peer) return;
     binding.storageDisconnect?.();
+    if (!binding.storage) bindStorage(binding);
     binding.storagePeer = peer;
     storageAttachments.add(binding);
     const disconnect = () => {
@@ -657,6 +658,7 @@ export async function createController(options: ControllerOptions) {
       binding.storageConnection = undefined;
       binding.storagePeer = undefined;
       binding.storageDisconnect = undefined;
+      if (!binding.profileId) binding.storage = undefined;
       storageAttachments.delete(binding);
     };
     binding.storageDisconnect = disconnect;
