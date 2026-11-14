@@ -1,0 +1,5 @@
+apiVersion: v2
+name: browser-sandbox
+description: Controller-managed isolated browser workers
+version: 0.1.0
+type: application

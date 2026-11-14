@@ -1,0 +1,130 @@
+{{- range $name, $_ := .Values.runtime }}
+{{- if not (has $name (list "TIMEOUT" "TZ" "BROWSER_STARTUP_TIMEOUT" "LANG")) }}
+{{- fail (printf "runtime.%s is not a shared worker setting; controller environment is managed by the chart" $name) }}
+{{- end }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "browser-sandbox.name" . }}
+  labels:
+    {{- include "browser-sandbox.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "browser-sandbox.labels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+  template:
+    metadata:
+      annotations:
+        checksum/worker-template: {{ include "browser-sandbox.worker-template" . | sha256sum }}
+      labels:
+        {{- include "browser-sandbox.labels" . | nindent 8 }}
+        app.kubernetes.io/component: controller
+    spec:
+      terminationGracePeriodSeconds: {{ add .Values.worker.terminationGracePeriodSeconds 30 }}
+      serviceAccountName: {{ include "browser-sandbox.name" . }}
+      imagePullSecrets: {{ .Values.imagePullSecrets | toJson }}
+      nodeSelector: {{ .Values.controller.nodeSelector | toJson }}
+      tolerations: {{ .Values.controller.tolerations | toJson }}
+      affinity: {{ .Values.controller.affinity | toJson }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 20000
+        runAsGroup: 20000
+        {{- if .Values.profileStore.enabled }}
+        fsGroup: 20000
+        fsGroupChangePolicy: OnRootMismatch
+        {{- end }}
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: {{ include "browser-sandbox.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: [controller]
+          env:
+            - name: BROWSER_BACKEND
+              value: kubernetes
+            - name: BROWSER_INSTALLATION
+              value: {{ .Release.Name | quote }}
+            - name: BROWSER_IMAGE
+              value: {{ include "browser-sandbox.image" . | quote }}
+            - name: BROWSER_KUBERNETES_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: BROWSER_KUBERNETES_OWNER
+              value: {{ include "browser-sandbox.name" . }}-workers
+            - name: BROWSER_CONTROLLER_PORT
+              value: {{ .Values.service.port | quote }}
+            - name: BROWSER_HOST_CONTROL_HOST
+              value: "0.0.0.0"
+            - name: BROWSER_HOST_CONTROL_PORT
+              value: {{ .Values.hostControl.port | quote }}
+            - name: BROWSER_CONTROLLER_ORIGIN
+              value: {{ default (printf "http://%s.%s.svc:%v" (include "browser-sandbox.name" .) .Release.Namespace .Values.service.port) .Values.controller.publicOrigin | quote }}
+            - name: BROWSER_STORAGE_EGRESS
+              value: {{ .Values.networkPolicy.storageEgress | toJson | quote }}
+            {{- if .Values.profileStore.enabled }}
+            - name: BROWSER_PROFILE_STORE_ROOT
+              value: /var/lib/browser-sandbox/profiles
+            - name: BROWSER_PROFILE_STORE_ORIGIN
+              value: {{ printf "http://%s-storage.%s.svc:8083" (include "browser-sandbox.name" .) .Release.Namespace | quote }}
+            - name: BROWSER_PROFILE_MAX_COUNT
+              value: {{ .Values.profileStore.maxProfiles | quote }}
+            - name: BROWSER_PROFILE_MAX_BYTES
+              value: {{ .Values.profileStore.maxBytes | quote }}
+            - name: BROWSER_PROFILE_MAX_STAGED_BYTES
+              value: {{ .Values.profileStore.maxStagedBytes | quote }}
+            - name: BROWSER_PROFILE_MAX_TRANSFERS
+              value: {{ .Values.profileStore.maxTransfers | quote }}
+            {{- if .Values.profileStore.idleTtlMs }}
+            - name: BROWSER_PROFILE_IDLE_TTL_MS
+              value: {{ .Values.profileStore.idleTtlMs | quote }}
+            {{- end }}
+            {{- end }}
+            {{- range $name, $value := .Values.runtime }}
+            - name: {{ $name }}
+              value: {{ $value | quote }}
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          resources: {{ .Values.controller.resources | toJson }}
+          ports:
+            - name: access
+              containerPort: {{ .Values.service.port }}
+            - name: host-control
+              containerPort: {{ .Values.hostControl.port }}
+            {{- if .Values.profileStore.enabled }}
+            - name: storage
+              containerPort: 8083
+            {{- end }}
+          readinessProbe:
+            tcpSocket:
+              port: access
+          livenessProbe:
+            tcpSocket:
+              port: access
+          volumeMounts:
+            - name: configuration
+              mountPath: /etc/browser-sandbox
+              readOnly: true
+            {{- if .Values.profileStore.enabled }}
+            - name: profile-store
+              mountPath: /var/lib/browser-sandbox
+            {{- end }}
+      volumes:
+        - name: configuration
+          configMap:
+            name: {{ include "browser-sandbox.name" . }}-config
+        {{- if .Values.profileStore.enabled }}
+        - name: profile-store
+          persistentVolumeClaim:
+            claimName: {{ default (printf "%s-profiles" (include "browser-sandbox.name" .)) .Values.profileStore.existingClaim }}
+        {{- end }}

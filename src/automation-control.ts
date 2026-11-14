@@ -1,6 +1,8 @@
 import type { Execution } from "./executions.js";
 
 export interface AutomationCoordinator {
+  /** Private worker transport can lose or lack an upstream coordinator. */
+  available?(executionId: string): boolean;
   pause(executionId: string, signal: AbortSignal): Promise<void>;
   resume(executionId: string, signal: AbortSignal): Promise<void>;
 }
@@ -34,14 +36,16 @@ export function createAutomationControl(automation?: AutomationCoordinator) {
     entry.session.status(entry.peers.size).generation;
   const confirmed = (entry: Execution) =>
     confirmations.has(entry) && confirmations.get(entry) === generation(entry);
+  const available = (entry: Execution) =>
+    !!automation && (automation.available?.(entry.executionId) ?? true);
   return {
     confirm(entry: Execution) {
       confirmations.set(entry, generation(entry));
     },
     canPause: (entry: Execution) =>
-      !transitions.has(entry) && (!!automation || confirmed(entry)),
+      !transitions.has(entry) && (available(entry) || confirmed(entry)),
     async pause(entry: Execution, signal: AbortSignal) {
-      if (automation) await automation.pause(entry.executionId, signal);
+      if (available(entry)) await automation.pause(entry.executionId, signal);
       else {
         const stopped = confirmed(entry);
         confirmations.delete(entry);
@@ -50,7 +54,7 @@ export function createAutomationControl(automation?: AutomationCoordinator) {
       signal.throwIfAborted();
     },
     async resume(entry: Execution, signal: AbortSignal) {
-      if (!automation) return false;
+      if (!available(entry)) return false;
       await automation.resume(entry.executionId, signal);
       signal.throwIfAborted();
       return true;

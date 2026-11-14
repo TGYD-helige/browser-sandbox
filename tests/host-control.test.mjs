@@ -93,3 +93,54 @@ test("host request parsing preserves UTF-8 split across socket reads", async () 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("socket storage setup is cancellable without tying an attached channel to the setup signal", {
+  timeout: 2000,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "storage-cancel-"));
+  const socketPath = join(root, "control.sock");
+  const peers = new Set();
+  let latest,
+    enter,
+    ready = false;
+  const entered = new Promise((resolve) => {
+    enter = resolve;
+  });
+  const server = createServer((socket) => {
+    peers.add(socket);
+    latest = socket;
+    socket.once("close", () => peers.delete(socket));
+    socket.once("data", () => {
+      if (ready) socket.write(JSON.stringify({ ready: true }) + "\n");
+      else enter();
+    });
+  });
+  await new Promise((resolve) => server.listen(socketPath + ".auth", resolve));
+  t.after(async () => {
+    for (const socket of peers) socket.destroy();
+    await new Promise((resolve) => server.close(resolve));
+    await rm(root, { recursive: true, force: true });
+  });
+  const { createSocketRuntime } = await import("../dist/runtime-provider.js");
+  const runtime = createSocketRuntime(socketPath);
+  const cancelled = new AbortController();
+  const rejected = assert.rejects(
+    runtime.attachStorage({ executionId: "cancelled" }, {}, cancelled.signal),
+    /browser_storage_disconnected/,
+  );
+  await entered;
+  cancelled.abort();
+  await rejected;
+  ready = true;
+  const life = new AbortController();
+  const channel = await runtime.attachStorage(
+    { executionId: "ready" },
+    { load: async () => ({ absent: true }) },
+    life.signal,
+  );
+  t.after(() => channel.close());
+  life.abort();
+  const result = once(latest, "data");
+  latest.write(JSON.stringify({ op: "load", requestId: "fixture" }) + "\n");
+  assert.deepEqual(JSON.parse(String((await result)[0])).result, { absent: true });
+});

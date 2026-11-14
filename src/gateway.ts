@@ -1,3 +1,4 @@
+import { channel } from "node:diagnostics_channel";
 import { chmod, mkdir } from "node:fs/promises";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -9,6 +10,7 @@ import { attachCdpProxy } from "./cdp-proxy.js";
 import { createExecutions } from "./executions.js";
 import { createHostControl } from "./host-control.js";
 import { createHttpHandler } from "./http-routes.js";
+import { WORKER_UID } from "./managed-backend.js";
 import { peerUid } from "./peer-identity.js";
 
 /** Host lifecycle and execution-scoped transports over a private Linux network. */
@@ -29,8 +31,15 @@ export async function createGateway({
   startupTimeoutMs = 45000,
   maxSessionMs = 1800000,
   access = undefined as AccessOptions | undefined,
+  workerExecutionId = undefined as string | undefined,
 }) {
   const server = createServer();
+  let preparation: Record<string, unknown>;
+  const timing = channel("browser-sandbox.preparation");
+  const prepared = (message: any) => {
+    if (message.executionId === workerExecutionId) preparation = { ...message };
+  };
+  if (workerExecutionId) timing.subscribe(prepared);
   let remote: Awaited<ReturnType<typeof createAccessServer>>;
   const executions = await createExecutions({
     launch,
@@ -79,10 +88,11 @@ export async function createGateway({
           executions,
           WebSocket,
           WebSocketServer,
-          options: access,
+          options: { ...access, workerExecutionId },
           fileTransfers,
           authentication,
           automationControl,
+          healthy,
         })
       : undefined;
   } catch (error) {
@@ -119,9 +129,28 @@ export async function createGateway({
   });
   return {
     command,
+    async workerCommand(request, signal?: AbortSignal) {
+      if (!workerExecutionId || request.executionId !== workerExecutionId)
+        throw Error("browser_identity_mismatch");
+      if (request.op === "worker_metrics") return { preparation };
+      const commandStartedAt = performance.now();
+      if (request.op === "access_confirm_stopped") return remote.command(request);
+      const result = await executions.dispatch(
+        { ...request, executorUid: WORKER_UID },
+        signal,
+        false,
+      );
+      if (request.op === "register")
+        return { ...result, ...remote.bindWorker(executions.get(workerExecutionId)) };
+      return request.op === "finalize"
+        ? { ...result, profileFinalizeMs: performance.now() - commandStartedAt }
+        : result;
+    },
     port: (server.address() as AddressInfo).port,
     accessPort: remote?.port,
+    workerServer: workerExecutionId ? remote?.server : undefined,
     async stop() {
+      if (workerExecutionId) timing.unsubscribe(prepared);
       executions.beginShutdown();
       await remote?.stop();
       await control.drain();
