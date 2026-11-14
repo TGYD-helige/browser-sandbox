@@ -9,10 +9,15 @@ export interface WorkerStatus {
   pendingAuth: number;
 }
 
-/** Shared by controller preflight and the worker's atomic idle-finalize check. Unknown state keeps data. */
-export function workerIdle(value: unknown, now = Date.now()): boolean {
+export type IdleProtection = "unknown" | "auth" | "takeover" | "clients" | "retention";
+
+/** One conservative classification drives controller reporting and the worker's atomic recheck. */
+export function workerIdleProtection(
+  value: unknown,
+  now = Date.now(),
+): IdleProtection | undefined {
   const status = value as WorkerStatus;
-  if (!status || status.protocol !== WORKER_PROTOCOL) return false;
+  if (!status || status.protocol !== WORKER_PROTOCOL) return "unknown";
   const session = status.session;
   if (
     !session ||
@@ -20,12 +25,21 @@ export function workerIdle(value: unknown, now = Date.now()): boolean {
       session.state,
     ) ||
     !Number.isSafeInteger(session.connectedClients) ||
-    session.connectedClients !== 0 ||
-    status.takeover !== "automation" ||
-    status.pendingAuth !== 0
+    session.connectedClients < 0 ||
+    !Number.isSafeInteger(status.pendingAuth) ||
+    status.pendingAuth < 0 ||
+    !["automation", "stopping", "human", "uncertain"].includes(status.takeover)
   )
-    return false;
-  if (session.state === "retained")
-    return Number.isSafeInteger(session.expiresAt) && session.expiresAt <= now;
-  return true;
+    return "unknown";
+  if (status.pendingAuth) return "auth";
+  if (status.takeover !== "automation") return "takeover";
+  if (session.connectedClients) return "clients";
+  if (session.state === "retained") {
+    if (!Number.isSafeInteger(session.expiresAt)) return "unknown";
+    if (session.expiresAt > now) return "retention";
+  }
+}
+
+export function workerIdle(value: unknown, now = Date.now()): boolean {
+  return workerIdleProtection(value, now) === undefined;
 }

@@ -35,6 +35,7 @@ export function createWorkerAdmission({
   };
   return {
     status: () => ({ workers, pending, queued: queue.length }),
+    // Restored workers are already ready; no creation deadline applies.
     restore(): WorkerSlot {
       workers++;
       let released = false;
@@ -69,7 +70,6 @@ export function createWorkerAdmission({
           if (started) return;
           const index = queue.indexOf(start);
           if (index >= 0) queue.splice(index, 1);
-          detach();
           reject(abort.signal.reason);
         };
         const timer = setTimeout(cancel, creationTimeoutMs);
