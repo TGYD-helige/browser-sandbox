@@ -575,6 +575,13 @@ export async function createController(options: ControllerOptions) {
       );
     }
   }
+  function checkHostStorageCapacity(binding?: ExecutionBinding) {
+    if (
+      (!binding || !storageAttachments.has(binding)) &&
+      storageAttachments.size >= 2000
+    )
+      throw Error("browser_access_capacity_exceeded");
+  }
   function bindHostStorage(binding: ExecutionBinding, peer: ControlPeer) {
     if (peer.signal.aborted) throw Error("browser_storage_disconnected");
     if (binding.storagePeer === peer) return;
@@ -884,12 +891,7 @@ export async function createController(options: ControllerOptions) {
       if (hostStorage && !peer) throw Error("browser_profile_storage_unavailable");
       if (hostStorage && peer.signal.aborted)
         throw Error("browser_storage_disconnected");
-      if (
-        hostStorage &&
-        (!binding || !storageAttachments.has(binding)) &&
-        storageAttachments.size >= 2000
-      )
-        throw Error("browser_access_capacity_exceeded");
+      if (hostStorage) checkHostStorageCapacity(binding);
       if (request.profileId) {
         if (!hostStorage && !options.profileStore)
           throw Error("browser_profile_storage_unavailable");
@@ -898,6 +900,7 @@ export async function createController(options: ControllerOptions) {
         binding = bindings.get(id);
         if (closing || finished.has(id) || (binding?.revoked && !storageReconnect))
           throw Error("browser_execution_revoked");
+        if (hostStorage) checkHostStorageCapacity(binding);
       }
       const domains = normalizeAllowedDomains(request.allowedDomains);
       if (binding && JSON.stringify(binding.allowedDomains) !== JSON.stringify(domains))

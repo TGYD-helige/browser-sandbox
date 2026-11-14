@@ -478,16 +478,39 @@ test("registration cannot replace a live storage callback owner", async (t) => {
 });
 
 test("host storage attachments keep their bounded quota and release it on disconnect", async (t) => {
+  const listed = Promise.withResolvers(),
+    release = Promise.withResolvers();
   const controller = await createController({
     port: 0,
-    backend: { async remove() {} },
+    backend: {
+      async remove() {},
+      async list() {
+        listed.resolve();
+        return release.promise;
+      },
+    },
   });
   t.after(() => controller.stop());
   const life = new AbortController();
   setMaxListeners(0, life.signal);
   const peer = { signal: life.signal, callback: async () => ({}) };
-  for (let i = 0; i < 2000; i++)
+  for (let i = 0; i < 1999; i++)
     await controller.command({ op: "storage_attach", executionId: randomUUID() }, peer);
+  const pending = ["quota-a", "quota-b"].map((profileId) =>
+    controller.command(
+      { op: "storage_attach", executionId: randomUUID(), profileId },
+      peer,
+    ),
+  );
+  const settled = Promise.allSettled(pending);
+  await listed.promise;
+  release.resolve([]);
+  const outcomes = await settled;
+  assert.equal(outcomes.filter((result) => result.status === "fulfilled").length, 1);
+  assert.match(
+    outcomes.find((result) => result.status === "rejected").reason.message,
+    /browser_access_capacity_exceeded/,
+  );
   await assert.rejects(
     controller.command({ op: "storage_attach", executionId: randomUUID() }, peer),
     /browser_access_capacity_exceeded/,
