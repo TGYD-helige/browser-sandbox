@@ -36,7 +36,8 @@ const call = async (...args) => {
         ],
         {
           env: { ...process.env, AGENT_BROWSER_SOCKET_DIR: home },
-          timeout: 30000,
+          // Let the native client's 30-second CDP deadline report its own failure.
+          timeout: 45000,
           maxBuffer: 2 * 1024 * 1024,
         },
       )
