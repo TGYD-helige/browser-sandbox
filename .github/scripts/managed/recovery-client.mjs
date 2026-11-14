@@ -84,6 +84,7 @@ try {
       }
       console.log(JSON.stringify({ phase, failedStatusKeptWorker: true }));
     } else if (phase === "lost") {
+      let reclaimed = false;
       await assert.rejects(
         runtime.request({
           op: "session",
@@ -91,14 +92,41 @@ try {
           action: "renew",
           durationMs: 1000,
         }),
-        /browser_(?:control_|worker_|session_lost)/,
+        (error) => {
+          assert.match(
+            error.message,
+            /browser_(?:control_|worker_|session_lost|execution_revoked)/,
+          );
+          if (error.message === "browser_execution_revoked") reclaimed = true;
+          return true;
+        },
       );
+      if (reclaimed)
+        assert.equal(
+          (
+            await runtime.request({
+              op: "controller_status",
+              executionId: state.executionId,
+            })
+          ).execution.phase,
+          "finished",
+        );
       await assert.rejects(connectCdp(state.wsEndpoint), /browser_cdp_/);
       console.log(JSON.stringify({ phase, renewalFailedWithoutReplacement: true }));
     } else if (phase === "finish-lost") {
-      await assert.rejects(
-        runtime.request({ op: "finalize", executionId: state.executionId }),
-        /browser_worker_finalization_failed/,
+      try {
+        await runtime.request({ op: "finalize", executionId: state.executionId });
+      } catch (error) {
+        assert.match(error.message, /browser_worker_finalization_failed/);
+      }
+      assert.equal(
+        (
+          await runtime.request({
+            op: "controller_status",
+            executionId: state.executionId,
+          })
+        ).execution.phase,
+        "finished",
       );
       console.log(JSON.stringify({ phase, ownedLossCleaned: true }));
     } else if (phase === "incompatible") {

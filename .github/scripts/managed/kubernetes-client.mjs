@@ -112,6 +112,7 @@ try {
     );
     console.log(JSON.stringify({ samePage: true, sameGeneration: true }));
   } else if (action === "lost") {
+    let reclaimed = false;
     await assert.rejects(
       runtime.request({
         op: "session",
@@ -119,8 +120,21 @@ try {
         action: "renew",
         durationMs: 1000,
       }),
-      /browser_(?:control_|worker_|session_lost)/,
+      (error) => {
+        assert.match(
+          error.message,
+          /browser_(?:control_|worker_|session_lost|execution_revoked)/,
+        );
+        if (error.message === "browser_execution_revoked") reclaimed = true;
+        return true;
+      },
     );
+    if (reclaimed)
+      assert.equal(
+        (await runtime.request({ op: "controller_status", executionId })).execution
+          .phase,
+        "finished",
+      );
     console.log(JSON.stringify({ workerLossReported: true }));
   } else {
     const { wsEndpoint } = await runtime.request({ op: "register", executionId });

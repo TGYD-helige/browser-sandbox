@@ -609,6 +609,10 @@ test("recovery releases the Profile lease when discovery confirms its worker dis
   assert.equal(status.execution.phase, "finished");
   assert.equal(second.capacity().workers, 0);
   assert.equal(f.created, 1);
+  await assert.rejects(
+    second.command({ op: "session", executionId, action: "renew", durationMs: 1000 }),
+    /browser_execution_revoked/,
+  );
   await second.command({
     op: "register",
     executionId: randomUUID(),
