@@ -18,7 +18,12 @@ export interface ManagedWorker {
   incarnation: string;
   origin: string;
   profileId?: string;
-  runtime: BrowserRuntime & { close?(): void };
+  /** An owned cleanup resource with no surviving browser process or Profile disk. */
+  infrastructureOnly?: boolean;
+  runtime: BrowserRuntime & {
+    close?(): void;
+    setAutomation?(automation: AutomationCoordinator): void;
+  };
 }
 
 /** Optional platform adapter; create cleans partial resources or throws WorkerCleanupFailure when cleanup is unconfirmed. */

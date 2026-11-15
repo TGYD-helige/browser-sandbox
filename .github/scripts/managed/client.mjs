@@ -150,7 +150,7 @@ try {
         ),
       );
       assert.equal((await sessionRequest(endpoint)).generation, retained.generation);
-      const files = endpoint.replace("ws:", "http:") + "/files/check.txt";
+      const files = `${endpoint.replace("ws:", "http:")}/files/check.txt`;
       assert.equal(
         (await fetch(files, { method: "PUT", body: "managed transfer" })).status,
         201,
@@ -226,7 +226,7 @@ try {
       await runtime.request({ op: "access_revoke", executionId });
       await assert.rejects(connectCdp(access.cdpUrl));
       assert.equal(
-        (await fetch(access.cdpUrl.replace("ws:", "http:") + "/session")).status,
+        (await fetch(`${access.cdpUrl.replace("ws:", "http:")}/session`)).status,
         403,
       );
       endpoint = (await runtime.request({ op: "endpoint", executionId })).wsEndpoint;
@@ -343,8 +343,12 @@ try {
           await runtime.request({ op: "register", executionId: secondId })
         ).wsEndpoint;
         const second = await connectCdp(secondEndpoint);
+        let secondIp;
         try {
           await second.call("Browser.getVersion");
+          const secondWorker = await workerFor(secondId);
+          const secondDetails = await api(`/containers/${secondWorker.Id}/json`);
+          secondIp = Object.values(secondDetails.NetworkSettings.Networks)[0].IPAddress;
           await sessionRequest(secondEndpoint, "retain", 100);
         } finally {
           second.close();
@@ -360,12 +364,8 @@ try {
         assert.equal(expiredSession.state, "expired");
         await assert.rejects(
           sessionRequest(secondEndpoint, "renew", 10000),
-          /browser_session_not_live/,
+          /browser_session_lost/,
         );
-        const secondWorker = await workerFor(secondId);
-        const secondDetails = await api(`/containers/${secondWorker.Id}/json`);
-        const secondIp = Object.values(secondDetails.NetworkSettings.Networks)[0]
-          .IPAddress;
         assert((await fetch(`${workerOrigin}/health`)).ok);
         const checks = await execWorker(
           primaryWorker.Id,

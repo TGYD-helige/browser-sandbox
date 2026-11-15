@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { setMaxListeners } from "node:events";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import { createController } from "../dist/controller.js";
@@ -455,3 +456,74 @@ for (const mode of ["volume", "host", "host-disconnect"])
     assert.equal(setupSignal.aborted, true);
     await response;
   });
+test("registration cannot replace a live storage callback owner", async (t) => {
+  const controller = await createController({
+    port: 0,
+    backend: { list: async () => [] },
+  });
+  t.after(() => controller.stop());
+  const life = new AbortController();
+  const peer = { signal: life.signal, callback: async () => ({}) };
+  const other = { signal: new AbortController().signal, callback: async () => ({}) };
+  const registration = { executionId: randomUUID(), profileId: "owned-storage" };
+  await controller.command({ ...registration, op: "storage_attach" }, peer);
+  await controller.command({ ...registration, op: "register", storage: true }, peer);
+  await assert.rejects(
+    controller.command({ ...registration, op: "register", storage: true }, other),
+    /browser_storage_already_attached/,
+  );
+  assert.equal(controller.bindings.get(registration.executionId).storagePeer, peer);
+  life.abort();
+  await controller.command({ ...registration, op: "storage_attach" }, other);
+});
+
+test("host storage attachments keep their bounded quota and release it on disconnect", async (t) => {
+  const listed = Promise.withResolvers(),
+    release = Promise.withResolvers();
+  const controller = await createController({
+    port: 0,
+    backend: {
+      async remove() {},
+      async list() {
+        listed.resolve();
+        return release.promise;
+      },
+    },
+  });
+  t.after(() => controller.stop());
+  const life = new AbortController();
+  setMaxListeners(0, life.signal);
+  const peer = { signal: life.signal, callback: async () => ({}) };
+  for (let i = 0; i < 1999; i++)
+    await controller.command({ op: "storage_attach", executionId: randomUUID() }, peer);
+  const pending = ["quota-a", "quota-b"].map((profileId) =>
+    controller.command(
+      { op: "storage_attach", executionId: randomUUID(), profileId },
+      peer,
+    ),
+  );
+  const settled = Promise.allSettled(pending);
+  await listed.promise;
+  release.resolve([]);
+  const outcomes = await settled;
+  assert.equal(outcomes.filter((result) => result.status === "fulfilled").length, 1);
+  assert.match(
+    outcomes.find((result) => result.status === "rejected").reason.message,
+    /browser_access_capacity_exceeded/,
+  );
+  await assert.rejects(
+    controller.command({ op: "storage_attach", executionId: randomUUID() }, peer),
+    /browser_access_capacity_exceeded/,
+  );
+  assert.equal(
+    (await controller.command({ op: "controller_status" })).executions,
+    2000,
+  );
+  life.abort();
+  const next = new AbortController();
+  t.after(() => next.abort());
+  await controller.command(
+    { op: "storage_attach", executionId: randomUUID() },
+    { signal: next.signal },
+  );
+});

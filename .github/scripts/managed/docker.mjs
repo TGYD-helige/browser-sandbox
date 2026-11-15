@@ -145,6 +145,11 @@ try {
       ".github/scripts/managed/screenshot-diagnostics.mjs",
       `${agent}:/project/screenshot-diagnostics.mjs`,
     );
+    await docker(
+      "cp",
+      ".github/scripts/managed/screenshot-tab.mjs",
+      `${agent}:/project/screenshot-tab.mjs`,
+    );
     const output = await docker("start", "-a", agent);
     assert.equal(
       JSON.parse(await docker("inspect", agent))[0].State.ExitCode,

@@ -84,3 +84,17 @@ profileStore:
   maxStagedBytes: "1073741824"
   maxTransfers: 4
   idleTtlMs: ""
+
+# Retained controller-only execution journal, independent of Profile storage.
+controllerData:
+  existingClaim: ""
+  storageClass: ""
+  size: 1Gi
+  retain: true
+capacity:
+  maxWorkers: 8
+  maxPending: 2
+  maxQueued: 32
+  creationTimeoutMs: 90000
+  maxExecutionMs: 3600000
+  idleRegistrationMs: 900000

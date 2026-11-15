@@ -1,0 +1,4 @@
+# Synthetic next-protocol fixture: keep real browsers and vary only protocol identity.
+ARG BROWSER_IMAGE=browser-sandbox:managed
+FROM ${BROWSER_IMAGE}
+RUN node --input-type=module -e 'import fs from "node:fs/promises";const name="/opt/browser-sandbox/dist/worker-protocol.js";const source=await fs.readFile(name,"utf8");if(!source.includes("browser-sandbox.worker/v1"))throw Error("Protocol fixture source changed");await fs.writeFile(name,source.replaceAll("browser-sandbox.worker/v1","browser-sandbox.worker/v2"));'

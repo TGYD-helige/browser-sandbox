@@ -4,8 +4,26 @@ const code = (error) =>
     : "browser_screenshot_diagnostic_failed";
 
 /** Diagnostic reads never convert the original failed harness command into success. */
-export async function diagnoseScreenshot(endpoint, connect) {
+export async function diagnoseScreenshot(endpoint, connect, failure) {
   const report = {};
+  if (failure) {
+    // CLI output can contain capability URLs; retain only fixed diagnostic categories.
+    const output = `${failure.stdout ?? ""} ${failure.stderr ?? ""}`.toLowerCase();
+    report.command = {
+      killed: failure.killed === true,
+      exitCode: Number.isInteger(failure.code) ? failure.code : null,
+      signal: ["SIGTERM", "SIGKILL"].includes(failure.signal) ? failure.signal : null,
+      categories: [
+        "timeout",
+        "closed",
+        "connection",
+        "target",
+        "session",
+        "screenshot",
+        "cdp",
+      ].filter((category) => output.includes(category)),
+    };
+  }
   const probe = async (timeoutMs, work) => {
     let connection;
     try {
@@ -47,7 +65,7 @@ export async function diagnoseScreenshot(endpoint, connect) {
           });
           const { data } = await connection.call(
             "Page.captureScreenshot",
-            {},
+            { format: "png", fromSurface: true },
             sessionId,
           );
           return { ok: true, byteSize: Buffer.byteLength(data, "base64") };

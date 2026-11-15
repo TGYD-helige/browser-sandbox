@@ -39,6 +39,37 @@ test("failed screenshot diagnostics compare raw capture with activation without 
     afterActivate: { ok: true, byteSize: 3 },
   });
   assert(calls.some(([method]) => method === "Target.activateTarget"));
+  assert.deepEqual(calls.find(([method]) => method === "Page.captureScreenshot")[1], {
+    format: "png",
+    fromSurface: true,
+  });
   assert.equal(closed, 3);
   assert(!JSON.stringify(report).includes("secret"));
+});
+
+test("screenshot command diagnostics retain timeout and exit metadata without raw CLI output", async () => {
+  const report = await diagnoseScreenshot(
+    "fixture-endpoint",
+    async () => ({
+      closed: Promise.resolve(),
+      close() {},
+      call: async () => ({ targetInfos: [] }),
+    }),
+    {
+      killed: true,
+      code: null,
+      signal: "SIGTERM",
+      stdout: '{"error":"cdp timeout secret https://capability.invalid/token"}',
+      stderr: "private-output",
+    },
+  );
+  assert.deepEqual(report.command, {
+    killed: true,
+    exitCode: null,
+    signal: "SIGTERM",
+    categories: ["timeout", "cdp"],
+  });
+  assert(!JSON.stringify(report).includes("secret"));
+  assert(!JSON.stringify(report).includes("capability"));
+  assert(!JSON.stringify(report).includes("private-output"));
 });

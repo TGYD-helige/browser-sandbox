@@ -87,6 +87,7 @@ export function createAuthRequests(
       });
       const record = { prompt: undefined as BrowserAuthPrompt, respond: answer };
       pending.set(entry, record);
+      entry.authPending = true;
       const lifetime = new AbortController();
       const signal = AbortSignal.any([
         caller,
@@ -264,6 +265,7 @@ export function createAuthRequests(
           } catch {}
         }
         pending.delete(entry);
+        entry.authPending = false;
       }
       return { requestId, status, selectedOption, controlReleased, resumed };
     },
