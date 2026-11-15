@@ -678,10 +678,10 @@ export async function createExecutions({
     command,
     disconnected,
     ensureStarted,
-    dispatch(request, signal) {
+    dispatch(request, signal, fromSocket = true) {
       const id = request.executionId;
       const work = (mutations.get(id) ?? Promise.resolve()).then(() =>
-        command(request, true, true, signal),
+        command(request, true, fromSocket, signal),
       );
       const settled = work
         .catch(() => {})

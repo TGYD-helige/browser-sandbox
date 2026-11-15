@@ -54,3 +54,66 @@ export function normalizeAllowedDomains(value: unknown): string[] {
     throw Error("browser_domains_invalid");
   return [...new Set(value.map((domain) => domain.toLowerCase()))].sort();
 }
+
+/** Managed workers serve one controller; untrusted pages cannot initiate private-network connections. */
+export function installWorkerNetworkPolicy(run = execFileSync) {
+  for (const [binary, destination] of [
+    ["iptables", "127.0.0.0/8"],
+    ["ip6tables", "::1/128"],
+  ]) {
+    run(
+      binary,
+      [
+        "-w",
+        "-I",
+        "OUTPUT",
+        "-d",
+        destination,
+        "-p",
+        "tcp",
+        "--dport",
+        "8081",
+        "-m",
+        "owner",
+        "--uid-owner",
+        "20001",
+        "-j",
+        "REJECT",
+      ],
+      { stdio: "ignore" },
+    );
+  }
+  for (const [binary, destinations] of [
+    [
+      "iptables",
+      [
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "100.64.0.0/10",
+        "0.0.0.0/8",
+      ],
+    ],
+    ["ip6tables", ["fc00::/7", "fe80::/10", "::ffff:0:0/96"]],
+  ] as const) {
+    for (const destination of destinations)
+      run(
+        binary,
+        [
+          "-w",
+          "-I",
+          "OUTPUT",
+          "-d",
+          destination,
+          "-m",
+          "conntrack",
+          "--ctstate",
+          "NEW",
+          "-j",
+          "REJECT",
+        ],
+        { stdio: "ignore" },
+      );
+  }
+}

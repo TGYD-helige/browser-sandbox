@@ -3,7 +3,7 @@ import { StringDecoder } from "node:string_decoder";
 
 export interface Registration {
   executionId: string;
-  executorUid: number;
+  executorUid?: number;
   profileId?: string;
   storage?: boolean;
   allowedDomains?: string[];
@@ -18,7 +18,7 @@ export interface BrowserAccess {
 
 export interface Endpoint {
   protocol: "browser-sandbox.host/v1";
-  executorUid: number;
+  executorUid?: number;
   wsEndpoint: string | null;
   profileId?: string;
 }
@@ -80,12 +80,16 @@ export async function attachStorage(
   socketPath: string,
   registration: Registration,
   adapter: StorageAdapter,
+  signal?: AbortSignal,
 ) {
   const socket = connect(socketPath + ".auth");
   const life = new AbortController();
   let input = "";
   const decoder = new StringDecoder("utf8");
   let ready = false;
+  const abort = () => socket.destroy();
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) abort();
   await new Promise<void>((resolve, reject) => {
     const timer = setTimeout(() => {
       socket.destroy();
@@ -165,7 +169,7 @@ export async function attachStorage(
           );
       }
     });
-  });
+  }).finally(() => signal?.removeEventListener("abort", abort));
   return {
     close() {
       life.abort();

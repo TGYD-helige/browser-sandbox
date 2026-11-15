@@ -54,8 +54,13 @@ export async function createAccessServer({
   fileTransfers,
   authentication,
   automationControl,
+  healthy = async () => true,
 }: any) {
   const config = options as AccessOptions;
+  // Private worker transport carries execution references and trusted viewer context, never grants.
+  const worker = options.workerExecutionId as string | undefined;
+  let workerEntry: any;
+  const references = new Map<string, Grant>();
   const grants = new Map<string, Grant>();
   const viewportOwners = new Map<any, Grant>();
   let origin = config.publicOrigin;
@@ -69,6 +74,7 @@ export async function createAccessServer({
     )
       throw Error("browser_access_origin_invalid");
     if (
+      !worker &&
       url.protocol === "http:" &&
       !["127.0.0.1", "localhost", "[::1]"].includes(url.hostname)
     )
@@ -96,18 +102,19 @@ export async function createAccessServer({
   }
   const allowedOrigin = (value: string) => value === origin || viewerOrigins.has(value);
   function bindBrowser(grant: Grant) {
-    if (grant.browser || !grant.entry.starting) return;
+    if (worker || grant.browser || !grant.entry.starting) return;
     grant.browser = grant.entry.starting;
     grant.browserSignal = grant.entry.abort.signal;
     grant.browserSignal.addEventListener("abort", grant.browserEnded, { once: true });
     if (grant.browserSignal.aborted) grant.browserEnded();
   }
   function resolve(token: string, kind: Grant["kind"]) {
-    const grant = grants.get(token);
+    const grant = worker ? references.get(kind) : grants.get(token);
+    if (worker && grant?.token !== token) return null;
     if (
       !grant ||
       grant.kind !== kind ||
-      grant.expiresAt <= Date.now() ||
+      (!worker && grant.expiresAt <= Date.now()) ||
       grant.entry.revoked ||
       grant.life.signal.aborted ||
       executions.closing ||
@@ -174,11 +181,11 @@ export async function createAccessServer({
       expiresAt,
       life,
       connections: new Map(),
-      timer: setTimeout(() => revoke(), expiresAt - Date.now()),
+      timer: worker ? undefined : setTimeout(() => revoke(), expiresAt - Date.now()),
       cleanup: () => revoke(),
       browserEnded: () => revoke(true),
     };
-    grant.timer.unref();
+    grant.timer?.unref();
     entry.lifetime.signal.addEventListener("abort", grant.cleanup, { once: true });
     grants.set(token, grant);
     bindBrowser(grant);
@@ -207,6 +214,14 @@ export async function createAccessServer({
     if (req.headers.origin && !allowedOrigin(req.headers.origin)) {
       res.writeHead(403);
       res.end();
+      return;
+    }
+    if (worker && req.url === "/health") {
+      res
+        .writeHead(
+          !executions.closing && (await healthy().catch(() => false)) ? 204 : 503,
+        )
+        .end();
       return;
     }
     const asset = assets.get(req.url);
@@ -273,7 +288,7 @@ export async function createAccessServer({
   const viewers = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
   let waiting = 0;
   server.on("upgrade", (req, socket, head) => {
-    if (httpSockets.has(socket)) return;
+    if (httpSockets.has(socket) || (worker && req.url === "/host")) return;
     if (/^\/execution\/[a-f0-9]{64}$/.test(req.url ?? "")) return;
     if (
       req.url !== "/view/socket" ||
@@ -301,6 +316,22 @@ export async function createAccessServer({
         try {
           const auth = JSON.parse(String(raw));
           grant = auth.type === "authenticate" && resolve(auth.token, "view");
+          if (worker && grant) {
+            if (auth.resize === true && viewportOwners.has(workerEntry))
+              throw Error("browser_viewport_busy");
+            grant = issue(
+              workerEntry,
+              "view",
+              auth.control === true,
+              Number.MAX_SAFE_INTEGER,
+              auth.resize === true,
+            );
+            grant.token = auth.token;
+            if (grant.resize) {
+              viewportOwners.set(workerEntry, grant);
+            }
+            client.once("close", grant.cleanup);
+          }
           if (
             !grant ||
             grant.connections.size >= (grant.control || grant.resize ? 1 : 4)
@@ -649,11 +680,30 @@ export async function createAccessServer({
   origin ??= `http://127.0.0.1:${port}`;
   return {
     port,
+    server,
+    bindWorker(entry: any) {
+      if (!worker || entry.executionId !== worker)
+        throw Error("browser_identity_mismatch");
+      if (workerEntry === entry)
+        return {
+          cdpUrl: `${origin.replace(/^http/, "ws")}/execution/${references.get("cdp").token}`,
+          viewerToken: references.get("view").token,
+        };
+      workerEntry = entry;
+      references.set("cdp", issue(entry, "cdp", false, Number.MAX_SAFE_INTEGER));
+      references.set("view", issue(entry, "view", false, Number.MAX_SAFE_INTEGER));
+      return {
+        cdpUrl: `${origin.replace(/^http/, "ws")}/execution/${references.get("cdp").token}`,
+        viewerToken: references.get("view").token,
+      };
+    },
     browserStarting(entry: any) {
       for (const grant of grants.values())
         if (grant.entry === entry) bindBrowser(grant);
     },
     command(request: any) {
+      if (worker && request.op !== "access_confirm_stopped")
+        throw Error("browser_host_operation_invalid");
       const entry = executions.get(request.executionId);
       if (!entry || entry.revoked || executions.closing)
         throw Error("browser_execution_revoked");

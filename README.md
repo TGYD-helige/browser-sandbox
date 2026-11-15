@@ -58,6 +58,10 @@ flowchart LR
 | **Files and rendering** | Execution-scoped upload/download handling, screenshots, and Chinese/Emoji font support |
 | **Chrome extensions** | Load trusted unpacked extensions from a read-only mounted directory on each browser launch |
 
+## Managed Docker workers
+
+For a controller that creates one private Docker worker per execution, see [managed Docker setup](./docs/managed-docker.md). Managed mode is an internal-only preview with temporary Profiles; local mode remains the default.
+
 ## Local Chrome extensions
 
 Add the following settings to your existing sandboxed Compose service:
