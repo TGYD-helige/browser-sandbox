@@ -864,14 +864,40 @@ export async function createController(options: ControllerOptions) {
     origin,
     command,
     bindings,
-    async stop() {
+    async stop({
+      preserveWorkers = options.backend.preserveWorkersOnShutdown ?? false,
+    }: {
+      preserveWorkers?: boolean;
+    } = {}) {
       closing = true;
       let failure: unknown;
+      if (preserveWorkers) {
+        for (const binding of bindings.values()) {
+          binding.revoked = true;
+          if (!binding.endpoint) binding.life.abort();
+        }
+      }
       for (const binding of bindings.values()) {
         try {
-          await command({ op: "finalize", executionId: binding.executionId });
+          if (preserveWorkers) {
+            if (binding.creationFailure instanceof WorkerCleanupFailure)
+              throw binding.creationFailure;
+            if (!binding.endpoint) {
+              await binding.starting?.catch((error) => {
+                if (
+                  error?.name !== "AbortError" &&
+                  error?.message !== "browser_worker_creation_cancelled"
+                )
+                  throw error;
+              });
+            }
+          } else {
+            await command({ op: "finalize", executionId: binding.executionId });
+          }
         } catch (error) {
           failure ??= error;
+        } finally {
+          if (preserveWorkers) binding.worker?.runtime.close?.();
         }
       }
       for (const attachment of storage.values()) attachment.cleanup();

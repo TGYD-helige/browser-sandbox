@@ -1,0 +1,60 @@
+{{- if not .Values.networkPolicy.apiServerCidrs }}
+{{- fail "networkPolicy.apiServerCidrs must list every Kubernetes API endpoint CIDR" }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-workers
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "browser-sandbox.labels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "browser-sandbox.labels" . | nindent 14 }}
+              app.kubernetes.io/component: controller
+  egress:
+    # Public IPv4 only. Private, link-local, cluster and API destinations are excluded.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- $reserved := list "0.0.0.0/8" "10.0.0.0/8" "100.64.0.0/10" "127.0.0.0/8" "169.254.0.0/16" "172.16.0.0/12" "192.0.0.0/24" "192.0.2.0/24" "192.168.0.0/16" "198.18.0.0/15" "198.51.100.0/24" "203.0.113.0/24" "224.0.0.0/4" "240.0.0.0/4" }}
+              {{- concat $reserved .Values.networkPolicy.deniedCidrs .Values.networkPolicy.apiServerCidrs | uniq | toYaml | nindent 14 }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dnsNamespace | quote }}
+          podSelector:
+            matchLabels: {{ .Values.networkPolicy.dnsLabels | toJson }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-controller
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "browser-sandbox.labels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+    {{- if .Values.hostControl.allowedPeers }}
+    - from: {{ .Values.hostControl.allowedPeers | toJson }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.hostControl.port }}
+    {{- end }}

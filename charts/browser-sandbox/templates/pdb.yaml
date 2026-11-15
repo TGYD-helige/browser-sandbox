@@ -1,0 +1,12 @@
+{{- if .Values.worker.disruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-workers
+spec:
+  minAvailable: {{ .Values.worker.disruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "browser-sandbox.labels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+{{- end }}

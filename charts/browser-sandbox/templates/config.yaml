@@ -1,0 +1,16 @@
+# Stable release-owned identity: controller replacement must not collect workers.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-workers
+  labels:
+    {{- include "browser-sandbox.labels" . | nindent 4 }}
+data: {}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-config
+data:
+  worker-template.json: |
+    {{- include "browser-sandbox.worker-template" . | nindent 4 }}
