@@ -380,7 +380,8 @@ try {
           }
           const rules=execFileSync('iptables',['-L','OUTPUT','-nvx']).toString();
           assert(rules.split('\n').some(line=>line.includes('REJECT')&&line.includes('169.254.0.0/16')&&Number(line.trim().split(/\s+/)[0])>0));
-          execFileSync(process.execPath, ['-e', "fetch('http://127.0.0.1:8081/health',{signal:AbortSignal.timeout(2000)}).then(()=>process.exit(1),()=>process.exit(0))"], {uid:20001,gid:20001});
+          const {WORKER_UID}=await import('/opt/browser-sandbox/dist/managed-backend.js');
+          for (const uid of [20001,WORKER_UID]) execFileSync(process.execPath, ['-e', "fetch('http://127.0.0.1:8081/health',{signal:AbortSignal.timeout(2000)}).then(()=>process.exit(1),()=>process.exit(0))"], {uid,gid:uid});
           console.log('metadata, other worker, controller, and browser-loopback egress denied');
         `,
         );

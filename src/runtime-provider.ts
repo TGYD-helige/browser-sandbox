@@ -137,7 +137,7 @@ export function createBrowserSessions({
           registration.executorUid = takeUid();
         signal?.throwIfAborted();
         if (options.storage)
-          storage = await runtime.attachStorage(registration, options.storage);
+          storage = await runtime.attachStorage(registration, options.storage, signal);
         const { wsEndpoint } = await runtime.request<{ wsEndpoint: string }>(
           {
             op: "register",

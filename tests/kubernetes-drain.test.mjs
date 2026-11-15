@@ -19,6 +19,7 @@ async function fixture(t) {
     deleted: false,
     owner: "release-uid",
     workerReads: 0,
+    profileId: "",
   };
   const server = createServer(async (request, response) => {
     const chunks = [];
@@ -78,6 +79,9 @@ async function fixture(t) {
                       "app.kubernetes.io/name": "browser-sandbox",
                       "app.kubernetes.io/instance": "trial",
                       "app.kubernetes.io/component": "worker",
+                      "browser-sandbox.io/profile": state.profileId
+                        ? "persistent"
+                        : "temporary",
                     },
                     ownerReferences: [
                       {
@@ -124,7 +128,11 @@ test("uninstall drain stops admission before workers and waits for confirmed del
     },
   );
   await controllerObserved;
-  assert.equal(state.workerReads, 0);
+  assert.equal(
+    state.workerReads,
+    1,
+    "Preflight only inspected workers before controller exit",
+  );
   state.controllerGone = true;
   await deletionObserved;
   assert.equal(settled, false);
@@ -152,4 +160,16 @@ test("unconfirmed worker deletion times out instead of completing uninstall", as
   );
   assert.equal(state.deleted, true);
   assert.equal(state.workerGone, false);
+});
+
+test("uninstall refuses persistent workers before removing their controller or recovery data", async (t) => {
+  const { state, options } = await fixture(t);
+  state.profileId = "account";
+  state.controllerGone = true;
+  await assert.rejects(
+    drainKubernetesWorkers(options, AbortSignal.timeout(250)),
+    /browser_profile_busy/,
+  );
+  assert.equal(state.scaled, false);
+  assert.equal(state.deleted, false);
 });

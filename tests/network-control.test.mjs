@@ -5,6 +5,7 @@ import {
   createControllerRuntime,
   createNetworkHostControl,
 } from "../dist/network-control.js";
+import { createBrowserSessions } from "../dist/runtime-provider.js";
 
 test("network host control transports operations and rejects pending callbacks on disconnect", async (t) => {
   const server = createServer();
@@ -186,42 +187,109 @@ test("controller routes attached storage callbacks between the real host and wor
   attachment.close();
 });
 
-test("storage attachment cancellation reaches the remote operation", {
-  timeout: 2000,
-}, async (t) => {
-  const server = createServer();
-  let enter, cancelled;
-  const entered = new Promise((resolve) => {
-    enter = resolve;
+for (const method of ["runtime", "session"])
+  test(`${method} storage attachment cancellation reaches the remote operation`, {
+    timeout: 2000,
+  }, async (t) => {
+    const server = createServer();
+    let enter, cancelled;
+    const entered = new Promise((resolve) => {
+      enter = resolve;
+    });
+    const aborted = new Promise((resolve) => {
+      cancelled = resolve;
+    });
+    const control = createNetworkHostControl({
+      server,
+      dispatch: async (request, _peer, signal) => {
+        if (request.op === "finalize") return { stopped: true };
+        enter();
+        await new Promise((resolve) =>
+          signal.addEventListener("abort", resolve, { once: true }),
+        );
+        cancelled();
+        return { attached: false };
+      },
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const runtime = createControllerRuntime(
+      `http://127.0.0.1:${server.address().port}`,
+    );
+    let pending;
+    let released = 0;
+    t.after(async () => {
+      runtime.close();
+      control.close();
+      await new Promise((resolve) => server.close(resolve));
+      await Promise.allSettled([pending]);
+    });
+    const life = new AbortController();
+    pending =
+      method === "runtime"
+        ? runtime.attachStorage({ executionId: "cancelled" }, {}, life.signal)
+        : createBrowserSessions({
+            provider: {
+              identity: "managed",
+              acquire: async () => runtime,
+              release: async () => {
+                released++;
+              },
+            },
+          }).open({ storage: {}, signal: life.signal });
+    const rejected = assert.rejects(pending, /browser_control_timeout/);
+    await entered;
+    life.abort();
+    await rejected;
+    await aborted;
+    assert.equal(released, method === "session" ? 1 : 0);
   });
-  const aborted = new Promise((resolve) => {
-    cancelled = resolve;
-  });
+
+test("duplicate attachment and repeated stale close preserve the current host adapter", async (t) => {
+  const server = createServer((_req, res) => res.end());
+  let attached = false;
   const control = createNetworkHostControl({
     server,
-    dispatch: async (_request, _peer, signal) => {
-      enter();
-      await new Promise((resolve) =>
-        signal.addEventListener("abort", resolve, { once: true }),
-      );
-      cancelled();
-      return { attached: false };
+    dispatch: async (request, peer, signal) => {
+      if (request.op === "storage_attach") {
+        if (attached) throw Error("browser_storage_already_attached");
+        attached = true;
+        return { attached: true };
+      }
+      if (request.op === "storage_detach") {
+        attached = false;
+        return { detached: true };
+      }
+      if (request.op === "probe")
+        return peer.callback("load", { executionId: "fixture" }, signal);
+      return {};
     },
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const runtime = createControllerRuntime(`http://127.0.0.1:${server.address().port}`);
-  t.after(async () => {
-    runtime.close();
+  t.after(() => {
     control.close();
-    await new Promise((resolve) => server.close(resolve));
+    return new Promise((resolve) => server.close(resolve));
   });
-  const life = new AbortController();
-  const rejected = assert.rejects(
-    runtime.attachStorage({ executionId: "cancelled" }, {}, life.signal),
-    /browser_control_timeout/,
+  const runtime = createControllerRuntime(`http://127.0.0.1:${server.address().port}`);
+  t.after(() => runtime.close());
+  const original = await runtime.attachStorage(
+    { executionId: "fixture" },
+    { load: async () => ({ marker: "original" }) },
   );
-  await entered;
-  life.abort();
-  await rejected;
-  await aborted;
+  await assert.rejects(
+    runtime.attachStorage(
+      { executionId: "fixture" },
+      { load: async () => ({ marker: "duplicate" }) },
+    ),
+    /browser_storage_already_attached/,
+  );
+  assert.deepEqual(await runtime.request({ op: "probe" }), { marker: "original" });
+  original.close();
+  await runtime.request({ op: "barrier" });
+  const next = await runtime.attachStorage(
+    { executionId: "fixture" },
+    { load: async () => ({ marker: "next" }) },
+  );
+  original.close();
+  assert.deepEqual(await runtime.request({ op: "probe" }), { marker: "next" });
+  next.close();
 });

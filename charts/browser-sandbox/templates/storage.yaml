@@ -1,0 +1,59 @@
+{{- if .Values.profileStore.enabled }}
+{{- if not .Values.profileStore.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-profiles
+  labels:
+    {{- include "browser-sandbox.labels" . | nindent 4 }}
+  {{- if .Values.profileStore.retainOnDelete }}
+  annotations:
+    helm.sh/resource-policy: keep
+  {{- end }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if .Values.profileStore.storageClass }}
+  storageClassName: {{ .Values.profileStore.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.profileStore.size }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-storage
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "browser-sandbox.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+  ports:
+    - name: storage
+      port: 8083
+      targetPort: storage
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-storage
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "browser-sandbox.labels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "browser-sandbox.labels" . | nindent 14 }}
+              app.kubernetes.io/component: worker
+      ports:
+        - protocol: TCP
+          port: 8083
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.service.port }}
+{{- end }}

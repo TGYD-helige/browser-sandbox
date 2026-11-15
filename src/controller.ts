@@ -6,17 +6,24 @@ import { pipeline, Transform } from "node:stream";
 import WebSocket, { createWebSocketStream, WebSocketServer } from "ws";
 import { waitForControl } from "./automation-control.js";
 import { MAX_FILE_BYTES } from "./files.js";
-import type { Registration } from "./host-client.js";
+import type { Registration, StorageAdapter } from "./host-client.js";
 import { WorkerCleanupFailure } from "./lifecycle-errors.js";
+import { validProfileId } from "./local-profiles.js";
 import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
 import { type ControlPeer, createNetworkHostControl } from "./network-control.js";
 import { normalizeAllowedDomains } from "./network-policy.js";
+import type { createProfileStore } from "./profile-store.js";
 import type { SessionStatus } from "./session.js";
 
 export interface ExecutionBinding {
   executionId: string;
   incarnation: string;
   allowedDomains: string[];
+  profileId?: string;
+  storageMode?: "host" | "volume";
+  storage?: StorageAdapter;
+  storageConnection?: { close(): void };
+  volumeAdapter?: StorageAdapter & { close(): Promise<void> };
   worker?: ManagedWorker;
   starting?: Promise<ManagedWorker>;
   creation?: { abort: AbortController; waiters: number };
@@ -25,9 +32,13 @@ export interface ExecutionBinding {
   life: AbortController;
   revoked: boolean;
   finishing?: Promise<any>;
+  confirmedCommit?: { incarnation: string; result: Record<string, unknown> };
+  stopConfirmed?: boolean;
+  finalResult?: Record<string, unknown>;
   host?: ControlPeer;
 }
 interface StorageAttachment {
+  life: AbortController;
   registration: Registration;
   peer: ControlPeer;
   channel?: { close(): void };
@@ -46,6 +57,7 @@ interface Access {
 }
 export interface ControllerOptions {
   backend: ManagedBackend;
+  profileStore?: Awaited<ReturnType<typeof createProfileStore>>;
   port?: number;
   host?: string;
   controlPort?: number;
@@ -73,6 +85,44 @@ export async function createController(options: ControllerOptions) {
   const bindings = new Map<string, ExecutionBinding>();
   const grants = new Map<string, Access>();
   const finished = new Set<string>();
+  const profileLeases = new Map<string, { executionId: string; incarnation: string }>();
+  let recoveredProfiles = false;
+  let recovering: Promise<void> | undefined;
+  const localLease = (lease: { executionId: string; incarnation: string }) =>
+    bindings.get(lease.executionId)?.incarnation === lease.incarnation;
+  const recoverProfiles = (profileId?: string) => {
+    const leases = profileId
+      ? [profileLeases.get(profileId)].filter(Boolean)
+      : [...profileLeases.values()];
+    if (recoveredProfiles && !leases.some((lease) => !localLease(lease)))
+      return Promise.resolve();
+    return (recovering ??= (async () => {
+      if (!options.backend.list) throw Error("browser_profile_leases_unavailable");
+      const workers = await options.backend.list(AbortSignal.timeout(30000));
+      const recovered = new Map<string, ManagedWorker>();
+      for (const worker of workers) {
+        if (!worker.profileId || finished.has(worker.executionId)) continue;
+        if (!validProfileId(worker.profileId) || recovered.has(worker.profileId))
+          throw Error("browser_profile_lease_recovery_failed");
+        recovered.set(worker.profileId, worker);
+      }
+      for (const [id, worker] of recovered) {
+        const lease = profileLeases.get(id);
+        if (lease && localLease(lease) && lease.incarnation !== worker.incarnation)
+          throw Error("browser_profile_lease_recovery_failed");
+      }
+      // Only a successful authoritative read can release recovered occupancy.
+      for (const [id, lease] of profileLeases)
+        if (!localLease(lease)) profileLeases.delete(id);
+      for (const [id, worker] of recovered) {
+        const lease = profileLeases.get(id);
+        if (!lease) profileLeases.set(id, worker);
+      }
+      recoveredProfiles = true;
+    })().finally(() => {
+      recovering = undefined;
+    }));
+  };
   const storage = new Map<string, StorageAttachment>();
   const rememberFinished = (id: string) => {
     finished.add(id);
@@ -338,7 +388,31 @@ export async function createController(options: ControllerOptions) {
       });
     } catch {}
   };
+  function workerStorage(
+    binding: ExecutionBinding,
+    worker: ManagedWorker,
+    adapter: StorageAdapter,
+  ): StorageAdapter {
+    return {
+      load: (signal) => adapter.load(signal),
+      save: (signal) => adapter.save(signal),
+      async commit(result, signal) {
+        const confirmation = await adapter.commit(result, signal);
+        const archive = result.archive as { sha256?: unknown } | undefined;
+        if (
+          /^[a-f0-9]{64}$/.test(confirmation?.confirmedSha) &&
+          confirmation.confirmedSha === archive?.sha256 &&
+          bindings.get(binding.executionId) === binding &&
+          binding.incarnation === worker.incarnation &&
+          binding.worker === worker
+        )
+          binding.confirmedCommit = { incarnation: worker.incarnation, result };
+        return confirmation;
+      },
+    };
+  }
   async function attachWorkerStorage(
+    binding: ExecutionBinding,
     worker: ManagedWorker,
     attachment: StorageAttachment,
     signal: AbortSignal,
@@ -346,13 +420,13 @@ export async function createController(options: ControllerOptions) {
     const executionId = attachment.registration.executionId;
     const channel = await worker.runtime.attachStorage(
       attachment.registration,
-      {
+      workerStorage(binding, worker, {
         load: (signal) => attachment.peer.callback("load", { executionId }, signal),
         save: (signal) => attachment.peer.callback("save", { executionId }, signal),
         commit: (payload, signal) =>
           attachment.peer.callback("commit", { executionId, payload }, signal),
-      },
-      signal,
+      }),
+      AbortSignal.any([signal, attachment.life.signal]),
     );
     if (attachment.peer.signal.aborted || storage.get(executionId) !== attachment) {
       channel.close();
@@ -405,6 +479,7 @@ export async function createController(options: ControllerOptions) {
           {
             executionId: binding.executionId,
             incarnation: binding.incarnation,
+            profileId: binding.profileId,
             allowedDomains: binding.allowedDomains,
             automation: binding.host
               ? {
@@ -429,13 +504,28 @@ export async function createController(options: ControllerOptions) {
             {
               op: "register",
               executionId: binding.executionId,
+              profileId: binding.profileId,
+              storage: binding.profileId ? true : undefined,
               allowedDomains: binding.allowedDomains,
             },
             { signal: creationSignal },
           );
           creationSignal.throwIfAborted();
           const attachment = storage.get(binding.executionId);
-          if (attachment) await attachWorkerStorage(worker, attachment, creationSignal);
+          if (attachment)
+            await attachWorkerStorage(binding, worker, attachment, creationSignal);
+          if (binding.storage)
+            binding.storageConnection = await worker.runtime.attachStorage(
+              {
+                executionId: binding.executionId,
+                profileId: binding.profileId,
+                allowedDomains: binding.allowedDomains,
+                storage: true,
+              },
+              workerStorage(binding, worker, binding.storage),
+              creationSignal,
+            );
+
           creationSignal.throwIfAborted();
           binding.endpoint = result;
           binding.creation = undefined;
@@ -480,6 +570,13 @@ export async function createController(options: ControllerOptions) {
     signal = AbortSignal.timeout(180000),
   ): Promise<any> {
     signal.throwIfAborted();
+    if (request?.op === "profile_delete") {
+      if (!validProfileId(request.profileId) || !options.profileStore)
+        throw Error("browser_profile_storage_unavailable");
+      await recoverProfiles(request.profileId);
+      if (profileLeases.has(request.profileId)) throw Error("browser_profile_busy");
+      return { deleted: await options.profileStore.delete(request.profileId, signal) };
+    }
     if (
       !request ||
       typeof request.op !== "string" ||
@@ -496,16 +593,22 @@ export async function createController(options: ControllerOptions) {
         peer.signal.aborted ||
         closing ||
         finished.has(id) ||
-        binding?.revoked
+        (binding?.revoked && binding.storageMode !== "host")
       )
         throw Error("browser_storage_disconnected");
       if (storage.has(id)) throw Error("browser_storage_already_attached");
       if (storage.size >= 2000) throw Error("browser_access_capacity_exceeded");
       const attachment = {
-        registration: { executionId: id, profileId: request.profileId },
+        life: new AbortController(),
+        registration: {
+          executionId: id,
+          profileId: request.profileId,
+          allowedDomains: request.allowedDomains,
+        },
         peer,
         channel: undefined as { close(): void } | undefined,
         cleanup() {
+          attachment.life.abort();
           attachment.channel?.close();
           peer.signal.removeEventListener("abort", attachment.cleanup);
           if (storage.get(id) === attachment) storage.delete(id);
@@ -514,11 +617,23 @@ export async function createController(options: ControllerOptions) {
       storage.set(id, attachment);
       peer.signal.addEventListener("abort", attachment.cleanup, { once: true });
       try {
+        if (request.profileId) {
+          if (binding) {
+            if (
+              binding.profileId !== request.profileId ||
+              binding.storageMode !== "host"
+            )
+              throw Error("browser_profile_binding_changed");
+          } else {
+            await command({ ...request, op: "register", storage: true }, peer, signal);
+            binding = bindings.get(id);
+          }
+        }
         if (binding?.starting) {
           const worker = await waitForControl(binding.starting, signal);
           signal.throwIfAborted();
           if (!attachment.channel)
-            await attachWorkerStorage(worker, attachment, signal);
+            await attachWorkerStorage(binding, worker, attachment, signal);
         }
         return { attached: true };
       } catch (error) {
@@ -538,21 +653,59 @@ export async function createController(options: ControllerOptions) {
         throw Error("browser_execution_revoked");
       if (request.tenantId !== undefined)
         throw Error("browser_tenant_isolation_unavailable");
-      if (request.profileId !== undefined || request.storage)
+      const hostStorage = storage.has(id);
+      if (request.profileId !== undefined && !validProfileId(request.profileId))
+        throw Error("browser_profile_id_invalid");
+      if (
+        request.storage !== undefined &&
+        (request.storage !== true || !request.profileId)
+      )
+        throw Error("browser_profile_binding_invalid");
+      if ((request.storage === true && !hostStorage) || (hostStorage && !peer))
         throw Error("browser_profile_storage_unavailable");
+      if (request.profileId) {
+        if (!hostStorage && !options.profileStore)
+          throw Error("browser_profile_storage_unavailable");
+        await recoverProfiles(request.profileId);
+        signal.throwIfAborted();
+        binding = bindings.get(id);
+        if (closing || finished.has(id) || binding?.revoked)
+          throw Error("browser_execution_revoked");
+      }
       const domains = normalizeAllowedDomains(request.allowedDomains);
       if (binding && JSON.stringify(binding.allowedDomains) !== JSON.stringify(domains))
         throw Error("browser_domains_changed");
+      if (
+        binding &&
+        (binding.profileId !== request.profileId ||
+          (hostStorage && binding.storageMode !== "host"))
+      )
+        throw Error("browser_profile_binding_changed");
       if (!binding) {
+        if (request.profileId && profileLeases.has(request.profileId))
+          throw Error("browser_profile_busy");
         if (bindings.size >= 65536) throw Error("browser_execution_capacity_exceeded");
         binding = {
           executionId: id,
           incarnation: randomUUID(),
           allowedDomains: domains,
+          profileId: request.profileId,
+          storageMode: request.profileId
+            ? hostStorage
+              ? "host"
+              : "volume"
+            : undefined,
           life: new AbortController(),
           revoked: false,
           host: request.automation ? peer : undefined,
         };
+        if (request.profileId) {
+          if (!hostStorage)
+            binding.storage = binding.volumeAdapter = options.profileStore.open(
+              request.profileId,
+            );
+          profileLeases.set(request.profileId, binding);
+        }
         bindings.set(id, binding);
       }
       return endpoint(binding);
@@ -572,48 +725,68 @@ export async function createController(options: ControllerOptions) {
         await current.starting?.catch(() => {});
         if (!current.worker && current.creationFailure instanceof WorkerCleanupFailure)
           throw current.creationFailure;
-        let result = { used: false, stopped: true };
+        let result = current.finalResult ?? { used: false, stopped: true };
         if (current.worker) {
-          try {
-            result = await current.worker.runtime.request(
-              { op: "finalize", executionId: id },
-              { signal },
-            );
-          } catch (error) {
-            if (
-              ![
-                "browser_control_disconnected",
-                "browser_control_unavailable",
-                "browser_control_timeout",
-              ].includes(error.message)
-            ) {
+          if (!current.stopConfirmed) {
+            try {
+              result = await current.worker.runtime.request(
+                { op: "finalize", executionId: id },
+                { signal },
+              );
+            } catch (error) {
+              if (current.profileId) throw error;
+              if (
+                ![
+                  "browser_control_disconnected",
+                  "browser_control_unavailable",
+                  "browser_control_timeout",
+                ].includes(error.message)
+              ) {
+                try {
+                  current.worker.runtime.close?.();
+                } catch (cleanup) {
+                  throw new WorkerCleanupFailure(error, cleanup);
+                }
+                throw error;
+              }
               try {
-                current.worker.runtime.close?.();
+                await removeWorker(current.worker, AbortSignal.timeout(30000));
               } catch (cleanup) {
                 throw new WorkerCleanupFailure(error, cleanup);
               }
-              throw error;
+              storage.get(id)?.cleanup();
+              bindings.delete(id);
+              rememberFinished(id);
+              event(current, "removed", { error: errorCode(error) });
+              throw Error("browser_worker_finalization_failed");
             }
-            try {
-              await removeWorker(current.worker, AbortSignal.timeout(30000));
-            } catch (cleanup) {
-              throw new WorkerCleanupFailure(error, cleanup);
+            if (current.profileId && result.status === "absent") {
+              if (current.confirmedCommit?.incarnation !== current.incarnation)
+                throw Error("browser_profile_finalization_lost");
+              result = { ...current.confirmedCommit.result, stopped: true };
             }
-            storage.get(id)?.cleanup();
-            bindings.delete(id);
-            rememberFinished(id);
-            event(current, "removed", { error: errorCode(error) });
-            throw Error("browser_worker_finalization_failed");
+            if (result.stopped !== true) throw Error("browser_worker_stop_unconfirmed");
+            current.stopConfirmed = true;
+            current.finalResult = result;
           }
           await removeWorker(current.worker, signal);
         }
+        current.storageConnection?.close();
+        await current.volumeAdapter?.close();
+        if (
+          current.profileId &&
+          profileLeases.get(current.profileId)?.incarnation === current.incarnation
+        )
+          profileLeases.delete(current.profileId);
         storage.get(id)?.cleanup();
         bindings.delete(id);
         rememberFinished(id);
         event(current, "removed");
         return result;
       })().catch((error) => {
-        current.finishing = undefined;
+        // Absence without a confirmed commit is terminal; retain ownership for recovery.
+        if (error.message !== "browser_profile_finalization_lost")
+          current.finishing = undefined;
         throw error;
       });
       return current.finishing;
@@ -864,6 +1037,13 @@ export async function createController(options: ControllerOptions) {
     origin,
     command,
     bindings,
+    async expireProfiles(signal?: AbortSignal) {
+      if (!options.profileStore) return 0;
+      await recoverProfiles();
+      return options.profileStore.expire(signal, (profileId) =>
+        profileLeases.has(profileId),
+      );
+    },
     async stop({
       preserveWorkers = options.backend.preserveWorkersOnShutdown ?? false,
     }: {
