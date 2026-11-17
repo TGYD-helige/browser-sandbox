@@ -281,7 +281,7 @@ export async function createKubernetesOwnership(
     id: string,
     previous: any,
     record: ExecutionRecord | undefined,
-    uid: string,
+    fence: Pick<ExecutionOwner, "uid" | "epoch">,
   ) =>
     save(
       "Secret",
@@ -289,7 +289,11 @@ export async function createKubernetesOwnership(
         ...previous?.metadata,
         name: name(id),
         labels,
-        ownerReferences: [kubernetesOwnerReference("Lease", name(id), uid)],
+        ownerReferences: [kubernetesOwnerReference("Lease", name(id), fence.uid)],
+        annotations: {
+          ...previous?.metadata.annotations,
+          [prefix + "epoch"]: String(fence.epoch),
+        },
       },
       { data: encode(id, record) },
     );
@@ -330,8 +334,8 @@ export async function createKubernetesOwnership(
           );
           continue;
         }
-        // Always advance RV before readiness: stale snapshots must lose their conditional write.
-        await saveRecord(id, secret, body?.record, fence.uid);
+        // Epoch metadata makes takeover a real mutation; Kubernetes can elide no-op PUTs.
+        await saveRecord(id, secret, body?.record, fence);
         if (body?.record?.data.profileId !== undefined) {
           if (typeof body.record.data.profileId !== "string")
             throw Error("browser_profile_id_invalid");
@@ -437,7 +441,7 @@ export async function createKubernetesOwnership(
       );
     const record = { executionId: id, revision: revision + 1, data };
     try {
-      await saveRecord(id, secret, record, lease.metadata.uid);
+      await saveRecord(id, secret, record, ownerOf(lease));
     } catch (error) {
       if (conflict(error)) {
         forget(id);
@@ -500,6 +504,7 @@ export async function createKubernetesOwnership(
           {
             [prefix + "execution"]: id,
             [prefix + "execution-uid"]: lease.metadata.uid,
+            [prefix + "epoch"]: String(ownerOf(lease).epoch),
           },
           { holderIdentity: holder },
         );
@@ -671,7 +676,7 @@ export async function createKubernetesOwnership(
       const id = record.executionId;
       const { lease, secret, body } = await readOwnedRecord(id);
       if (body.record) throw Error("browser_execution_migration_conflict");
-      await saveRecord(id, secret, record, lease.metadata.uid);
+      await saveRecord(id, secret, record, ownerOf(lease));
     },
     epoch: (id: string) => owned.get(id)?.epoch,
     owns: (id: string) =>

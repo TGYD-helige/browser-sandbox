@@ -5,6 +5,7 @@ import { createServer, request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { isDeepStrictEqual } from "node:util";
 import WebSocket from "ws";
 import { waitForControl } from "../dist/automation-control.js";
 import { createController, validateControllerRecord } from "../dist/controller.js";
@@ -133,6 +134,8 @@ async function fixture(t, extra = {}) {
       if (body.metadata.resourceVersion !== previous.metadata.resourceVersion)
         return reply(409);
       body.metadata.uid = previous.metadata.uid;
+      // Kubernetes can elide a no-op PUT without advancing resourceVersion.
+      if (isDeepStrictEqual(body, previous)) return reply(200, previous);
       body.metadata.resourceVersion = String(++version);
       objects.set(path, body);
       return reply(200, body);
