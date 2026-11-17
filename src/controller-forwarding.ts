@@ -11,35 +11,66 @@ export function forwardControllerRequest(
   origin: string,
   head?: Buffer,
 ) {
-  const upstream = request(new URL(req.url, origin), {
+  const target = new URL(req.url, origin);
+  // URL normalization must never turn an agent execution route into trusted peer control.
+  if (target.origin !== origin || target.pathname !== req.url.split("?")[0])
+    throw Error("browser_access_denied");
+  const auth = /^\/execution\/(?:[a-f0-9-]{36}\/)?[a-f0-9]{64}\/auth$/.test(
+    target.pathname,
+  );
+  let responseStarted = false;
+  const life = new AbortController();
+  const deadline = setTimeout(() => life.abort(), auth ? 620000 : 180000);
+  deadline.unref();
+  const upstream = request(target, {
     method: req.method,
-    headers: { ...req.headers, host: new URL(origin).host },
-    timeout: req.url?.endsWith("/auth") ? 620000 : 180000,
+    headers: { ...req.headers, host: target.host },
+    signal: life.signal,
   });
-  const close = () => upstream.destroy();
+  const close = () => life.abort();
+  const cleanup = () => {
+    clearTimeout(deadline);
+    destination.removeListener("close", close);
+    req.removeListener("aborted", close);
+  };
   destination.once("close", close);
+  req.once("aborted", close);
   upstream.once("error", () => {
-    if ("writeHead" in destination && !destination.headersSent)
-      destination
-        .writeHead(503)
-        .end(JSON.stringify({ error: "browser_controller_owner_moved" }));
-    else destination.destroy();
-  });
-  upstream.once("timeout", () => upstream.destroy());
-  upstream.once("response", (response) => {
+    cleanup();
+    if (destination.destroyed) return;
+    const body = JSON.stringify({ error: "browser_controller_owner_moved" });
     if ("writeHead" in destination) {
+      if (destination.headersSent) destination.destroy();
+      else destination.writeHead(503, { "content-type": "application/json" }).end(body);
+    } else if (responseStarted) destination.destroy();
+    else
+      destination.end(
+        `HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+      );
+  });
+  const rawHeaders = (response: IncomingMessage, exclude: string[] = []) =>
+    response.rawHeaders
+      .flatMap((name, index, headers) =>
+        index % 2 === 0 && !exclude.includes(name.toLowerCase())
+          ? [`${name}: ${headers[index + 1]}`]
+          : [],
+      )
+      .join("\r\n");
+  upstream.once("response", (response) => {
+    responseStarted = true;
+    if ("writeHead" in destination)
       destination.writeHead(response.statusCode, response.headers);
-      pipeline(response, destination, () => {});
-    } else {
-      destination.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
-      response.destroy();
-    }
+    else
+      destination.write(
+        `HTTP/1.1 ${response.statusCode} ${response.statusMessage}\r\n${rawHeaders(response, ["transfer-encoding", "connection", "content-length", "trailer"])}\r\nConnection: close\r\n\r\n`,
+      );
+    pipeline(response, destination, cleanup);
   });
   upstream.once("upgrade", (response, socket, upstreamHead) => {
+    // The request deadline covers the handshake; an established CDP session has its own lifetime.
+    cleanup();
     destination.write(
-      `HTTP/1.1 101 Switching Protocols\r\n${Object.entries(response.headers)
-        .map(([key, value]) => `${key}: ${value}`)
-        .join("\r\n")}\r\n\r\n`,
+      `HTTP/1.1 101 Switching Protocols\r\n${rawHeaders(response)}\r\n\r\n`,
     );
     if (upstreamHead.length) destination.write(upstreamHead);
     if (head?.length) socket.write(head);
@@ -47,7 +78,10 @@ export function forwardControllerRequest(
     pipeline(destination as Duplex, socket, () => destination.destroy());
   });
   if (head !== undefined) upstream.end();
-  else pipeline(req, upstream, () => {});
+  else
+    pipeline(req, upstream, (error) => {
+      if (error) life.abort();
+    });
 }
 
 export function createHostForwarding() {

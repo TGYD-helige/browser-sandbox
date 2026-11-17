@@ -157,6 +157,7 @@ async function fixture(
           }),
         );
     } else if (request.method === "POST") {
+      await state.beforeCreate?.();
       if (createStatus || state.quota) {
         response.writeHead(createStatus ?? 403).end(
           JSON.stringify({
@@ -503,8 +504,13 @@ test("Kubernetes epoch fencing prevents stale deletion and permits confirmed sto
     /browser_controller_fenced/,
   );
   assert.equal(state.deleted, false);
+  delete state.pod.metadata.annotations["browser-sandbox.io/creation-epoch"];
   await backend.fence(worker, epoch, AbortSignal.timeout(5000), true);
   assert.equal(state.pod.metadata.annotations["browser-sandbox.io/epoch"], "2");
+  assert.equal(
+    state.pod.metadata.annotations["browser-sandbox.io/creation-epoch"],
+    "1",
+  );
   epoch = 1;
   await assert.rejects(
     backend.remove(worker, AbortSignal.timeout(5000)),
@@ -514,4 +520,41 @@ test("Kubernetes epoch fencing prevents stale deletion and permits confirmed sto
   epoch = 2;
   await backend.remove(worker, AbortSignal.timeout(5000));
   assert.equal(state.deleted, true);
+});
+
+test("a Pod POST paused across takeover cannot publish a stale worker", async (t) => {
+  let epoch = 1;
+  const ownership = {
+    assertOwned: async () => {
+      if (epoch !== 1) throw Error("browser_controller_fenced");
+      return epoch;
+    },
+  };
+  const { backend, state } = await fixture(t, { ownership });
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  state.beforeCreate = async () => {
+    entered.resolve();
+    await resume.promise;
+  };
+  const creating = backend.create(
+    { executionId, incarnation },
+    AbortSignal.timeout(5000),
+  );
+  creating.catch(() => {});
+  await entered.promise;
+  epoch = 2;
+  resume.resolve();
+  try {
+    await assert.rejects(creating, /browser_controller_fenced/);
+  } finally {
+    const worker = await creating.catch(() => undefined);
+    worker?.runtime.close();
+  }
+  assert.equal(
+    state.deleted,
+    false,
+    "stale owner cannot delete across the handoff either",
+  );
+  assert.equal(state.pod.metadata.annotations["browser-sandbox.io/epoch"], "1");
 });

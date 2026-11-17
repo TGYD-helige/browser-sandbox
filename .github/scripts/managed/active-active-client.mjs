@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { setTimeout as delay } from "node:timers/promises";
 
 const root = process.env.BROWSER_PACKAGE_ROOT ?? "/opt/browser-sandbox";
 const { createControllerRuntime, sessionRequest } = await import(
@@ -174,7 +175,18 @@ try {
       assert.equal((await sessionRequest(url.href)).generation, state.generation);
       if (action === "live") {
         await writeFile(`/tmp/ha-live-${executionId}.ready`, "ready");
-        await cdp.closed;
+        let closed = false;
+        void cdp.closed.then(() => {
+          closed = true;
+        });
+        while (!closed) {
+          try {
+            await cdp.call("Browser.getVersion");
+          } catch (error) {
+            if (!closed) throw error;
+          }
+          if (!closed) await delay(100);
+        }
       } else if (action === "functional") {
         const base = url.href.replace(/^ws/, "http");
         const filename = `ha-${randomUUID()}.txt`;

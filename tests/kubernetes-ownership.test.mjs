@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { createServer } from "node:http";
+import { createServer, request } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import WebSocket from "ws";
 import { createController, validateControllerRecord } from "../dist/controller.js";
 import { importExecutionJournal } from "../dist/kubernetes-migration.js";
 import { createKubernetesOwnership } from "../dist/kubernetes-ownership.js";
@@ -13,9 +14,10 @@ import { createControllerRuntime } from "../dist/network-control.js";
 async function fixture(t, extra = {}) {
   const objects = new Map();
   const cleanups = [];
-  const state = {};
+  const state = { requests: 0 };
   let version = 0;
   const server = createServer(async (req, res) => {
+    if (!req.url.includes("watch=true")) state.requests++;
     let input = "";
     for await (const chunk of req) input += chunk;
     const body = input ? JSON.parse(input) : undefined;
@@ -181,6 +183,8 @@ test("the previous release's journal imports idempotently without rewriting the 
   );
   const filename = join(directory, `${id}.json`);
   const original = await readFile(filename);
+  const pending = join(directory, ".pending-33333333-3333-4333-8333-333333333333");
+  const pendingOriginal = await readFile(pending);
   const options = {
     directory,
     installationId: "fixture",
@@ -192,8 +196,9 @@ test("the previous release's journal imports idempotently without rewriting the 
     (await a.journal.read(id)).data.workerProtocol,
     "browser-sandbox.worker/v1",
   );
-  assert.equal(await importExecutionJournal(options), 1);
+  assert.equal(await importExecutionJournal(options), 0);
   assert.deepEqual(await readFile(filename), original);
+  assert.deepEqual(await readFile(pending), pendingOriginal);
 });
 
 test("corrupt and unsupported migration input preserves every source byte and publishes nothing", async (t) => {
@@ -278,6 +283,7 @@ test("host and HTTP requests forward once, and the same capability URL survives 
   assert.equal((await twice.json()).error, "browser_controller_owner_moved");
   await [a, b][peerIndex].resolve(id);
   advance(15001);
+  await controllers[peerIndex].reconcile();
   const recovered = await fetch(`${controllers[peerIndex].origin}${path}/session`);
   assert.equal(recovered.status, 200);
   assert.equal((await recovered.json()).state, "unused");
@@ -657,8 +663,640 @@ test("restarting migration accepts an imported record while its previous owner L
       ownership: b,
       validate: validateControllerRecord,
     }),
-    1,
+    0,
   );
   assert.equal(b.owns(id), false);
   assert.equal((await b.journal.read(id)).revision, 1);
+});
+
+test("unauthenticated execution routes cannot amplify requests to Kubernetes", async (t) => {
+  const { a, ports, state, cleanups } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => [],
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {},
+    },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  const before = state.requests;
+  for (const route of ["session", "files", "auth"]) {
+    const response = await fetch(
+      `${controller.origin}/execution/${id}/${"a".repeat(64)}/${route}`,
+    );
+    assert.equal(response.status, 403);
+    await response.body.cancel();
+  }
+  const status = await new Promise((resolve, reject) => {
+    const req = request(`${controller.origin}/execution/${other}/view/socket`, {
+      headers: { Connection: "Upgrade", Upgrade: "websocket" },
+    });
+    req.on("response", (res) => {
+      res.resume();
+      resolve(res.statusCode);
+    });
+    req.on("error", reject);
+    req.end();
+  });
+  assert.equal(status, 403);
+  assert.equal(
+    state.requests,
+    before,
+    "denied agent requests must not reach the cluster API",
+  );
+});
+
+test("completed migration cannot resurrect compacted v1 grants on a later single-replica startup", async (t) => {
+  const { a } = await fixture(t, { maxFinished: 1 });
+  const directory = await mkdtemp(join(tmpdir(), "migration-once-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await cp(
+    new URL("../.github/scripts/managed/fixtures/journal-v0.2.0/", import.meta.url),
+    directory,
+    { recursive: true },
+  );
+  const options = {
+    directory,
+    installationId: "fixture",
+    ownership: a,
+    validate: validateControllerRecord,
+  };
+  await importExecutionJournal(options);
+  const record = await a.journal.read(id);
+  await a.journal.update(id, record.revision, { ...record.data, phase: "finished" });
+  await a.complete(id);
+  await a.resolve(other, true);
+  await a.journal.create(other, { phase: "finished" });
+  await a.complete(other);
+  await a.refresh();
+  assert.equal(await a.journal.read(id), undefined);
+  assert.equal(await importExecutionJournal(options), 0);
+  assert.equal(
+    await a.journal.read(id),
+    undefined,
+    "compacted grants must stay absent",
+  );
+});
+
+test("watched peer addresses reject credentials, paths and non-HTTP origins", async (t) => {
+  const { a, objects } = await fixture(t);
+  await a.resolve(id, true);
+  const lease = [...objects.values()].find(
+    (o) => o.metadata.labels?.["browser-sandbox.io/execution"] === id,
+  );
+  for (const origin of [
+    "https://peer:8084",
+    "http://user:secret@peer:8084",
+    "http://peer:8084/path",
+  ]) {
+    lease.metadata.annotations["browser-sandbox.io/peer"] = origin;
+    await assert.rejects(a.refresh(), /browser_controller_state_corrupt/);
+  }
+});
+
+test("watch refresh replaces the complete legacy capability set for an execution", async (t) => {
+  const { a } = await fixture(t);
+  await a.resolve(id, true);
+  const first = await a.journal.create(id, {
+    phase: "registered",
+    grants: [{ token: "a".repeat(64) }],
+  });
+  await a.indexLegacy(first);
+  assert.equal(a.findCapability("a".repeat(64)), id);
+  const next = await a.journal.update(id, first.revision, {
+    phase: "registered",
+    grants: [{ token: "b".repeat(64) }],
+  });
+  await a.indexLegacy(next);
+  assert.equal(a.findCapability("a".repeat(64)), undefined);
+  assert.equal(a.findCapability("b".repeat(64)), id);
+  await a.indexLegacy({ ...next, data: { ...next.data, grants: [] } });
+  assert.equal(a.findCapability("b".repeat(64)), undefined);
+});
+
+test("startup renews ownership during delayed discovery and lists workers once per refresh", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const { a, ports, state, advance, cleanups } = await fixture(t);
+  const data = JSON.parse(
+    await readFile(
+      new URL(
+        "../.github/scripts/managed/fixtures/journal-v0.2.0/11111111-1111-4111-8111-111111111111.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  ).data;
+  for (const executionId of [id, other]) {
+    await a.resolve(executionId, true);
+    await a.journal.create(executionId, { ...data, grants: [] });
+  }
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers(),
+    renewed = Promise.withResolvers();
+  let lists = 0;
+  state.beforeWrite = async (path, body) => {
+    if (path.includes("/leases/") && body.spec?.renewTime) renewed.resolve();
+  };
+  const starting = createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => {
+        lists++;
+        entered.resolve();
+        await resume.promise;
+        return [];
+      },
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {},
+    },
+  });
+  cleanups.unshift(async () => {
+    resume.resolve();
+    const c = await starting;
+    await c.stop({ finalize: false });
+  });
+  await entered.promise;
+  advance(5000);
+  t.mock.timers.tick(5000);
+  await Promise.race([
+    renewed.promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(Error("startup did not renew before listening")), 300),
+    ),
+  ]);
+  resume.resolve();
+  await starting;
+  assert.equal(
+    lists,
+    1,
+    "one discovery snapshot is shared across all recovered records",
+  );
+});
+
+test("takeover fences a Profile PUT already past the old owner's authorization checks", async (t) => {
+  const { a, b, state, advance } = await fixture(t);
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "registered", profileId: "put-race" });
+  await a.acquireProfile(id, "put-race");
+  await a.journal.update(id, 1, { phase: "finished", profileId: "put-race" });
+  await b.resolve(id);
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  state.beforeWrite = async (path, body) => {
+    if (
+      path.includes("-p-") &&
+      body.metadata.annotations["browser-sandbox.io/epoch"] === "1"
+    ) {
+      entered.resolve();
+      await resume.promise;
+    }
+  };
+  const old = a.releaseProfile(id, "put-race");
+  old.catch(() => {});
+  await entered.promise;
+  advance(15001);
+  await b.resolve(id);
+  resume.resolve();
+  await assert.rejects(old, /browser_profile_busy|browser_controller_fenced/);
+});
+
+test("failed controller construction closes ownership and its background work", async (t) => {
+  const { a, ports } = await fixture(t);
+  await assert.rejects(
+    createController({
+      ownership: a,
+      peerPort: ports[0],
+      port: 0,
+      backend: {
+        list: async () => {
+          throw Error("discovery_failed");
+        },
+        create: async () => {
+          throw Error("unexpected");
+        },
+        remove: async () => {},
+      },
+    }),
+    /discovery_failed/,
+  );
+  await assert.rejects(a.resolve(id, true), /abort|cancel/i);
+});
+
+test("slow graceful shutdown keeps renewing until it conditionally releases ownership", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const { a, ports, state, advance, cleanups } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      preserveWorkersOnShutdown: true,
+      list: async () => [],
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {},
+    },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  await controller.command(
+    { op: "register", executionId: id },
+    { signal: new AbortController().signal, callback: async () => {} },
+  );
+  const resume = Promise.withResolvers(),
+    renewed = Promise.withResolvers();
+  controller.bindings.get(id).persisted = resume.promise;
+  const stopping = controller.stop({ finalize: false });
+  state.beforeWrite = async (_path, body) => {
+    if (body.spec?.holderIdentity === "a" && body.spec?.renewTime) renewed.resolve();
+  };
+  advance(5000);
+  t.mock.timers.tick(5000);
+  try {
+    await Promise.race([
+      renewed.promise,
+      new Promise((_, reject) =>
+        setTimeout(() => reject(Error("shutdown stopped renewal before cleanup")), 300),
+      ),
+    ]);
+  } finally {
+    resume.resolve();
+    await stopping;
+  }
+  assert.equal(a.owns(id), false);
+});
+
+for (const deletionFails of [false, true])
+  test(`post-takeover discovery rejects a late lower-epoch Pod (${deletionFails ? "retry deletion" : "normal deletion"})`, async (t) => {
+    const { a, b, ports, advance, cleanups } = await fixture(t);
+    const data = JSON.parse(
+      await readFile(
+        new URL(
+          "../.github/scripts/managed/fixtures/journal-v0.2.0/11111111-1111-4111-8111-111111111111.json",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    ).data;
+    await a.resolve(id, true);
+    await a.journal.create(id, {
+      ...data,
+      registeredAt: Date.now(),
+      lastActivityAt: Date.now(),
+      grants: [],
+      workerProtocol: "browser-sandbox.worker/v2",
+    });
+    await b.resolve(id);
+    advance(15001);
+    let late,
+      removed = 0;
+    const backend = {
+      list: async () => (late ? [late] : []),
+      create: async () => {
+        throw Error("unexpected");
+      },
+      fence: async (worker, epoch, _signal, stopped) => {
+        assert.equal(stopped, true);
+        worker.epoch = epoch;
+      },
+      remove: async (worker) => {
+        assert.equal(worker.epoch, 2);
+        removed++;
+        if (deletionFails && removed === 1) throw Error("transient_delete_failure");
+        late = undefined;
+      },
+    };
+    const controller = await createController({
+      ownership: b,
+      backend,
+      peerPort: ports[1],
+      port: 0,
+      reconciliationMs: 60000,
+    });
+    cleanups.unshift(() => controller.stop({ finalize: false }));
+    late = {
+      id: "late/uid",
+      executionId: id,
+      incarnation: data.incarnation,
+      epoch: 1,
+      runtime: {
+        request: async () => {
+          throw Error("late Pod must never run commands");
+        },
+        close: () => {},
+      },
+    };
+    if (deletionFails)
+      await assert.rejects(controller.reconcile(), /transient_delete_failure/);
+    await controller.reconcile();
+    assert.equal(removed, deletionFails ? 2 : 1);
+    assert.equal(controller.bindings.get(id).worker, undefined);
+    await controller.reconcile();
+    assert.equal(removed, deletionFails ? 2 : 1);
+  });
+
+test("the old controller itself reports fencing and performs no destructive action after ownership moves", async (t) => {
+  const { a, b, ports, advance, cleanups } = await fixture(t);
+  const events = [];
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    onWorkerEvent: (e) => events.push(e),
+    backend: {
+      list: async () => [],
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {
+        throw Error("stale cleanup");
+      },
+    },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  await controller.command(
+    { op: "register", executionId: id },
+    {
+      signal: new AbortController().signal,
+      callback: async () => {
+        throw Error("stale commit");
+      },
+    },
+  );
+  await b.resolve(id);
+  advance(15001);
+  await b.resolve(id);
+  await a.refresh();
+  assert.equal(controller.bindings.has(id), false);
+  assert.equal(
+    events.filter((e) => e.type === "fenced" && e.executionId === id).length,
+    1,
+  );
+  assert.equal(
+    events.some((e) => ["removed", "finalized", "commit"].includes(e.type)),
+    false,
+  );
+  assert.equal((await b.journal.read(id)).data.phase, "registered");
+});
+
+test("a pending unacquired Profile intent cannot block takeover while another execution holds it", async (t) => {
+  const { a, b, advance } = await fixture(t);
+  await a.resolve(other, true);
+  await a.journal.create(other, { phase: "registered", profileId: "held" });
+  await a.acquireProfile(other, "held");
+  await a.resolve(id, true);
+  await a.journal.create(id, {
+    phase: "registered",
+    profileId: "held",
+    profileAcquired: false,
+  });
+  await b.resolve(id);
+  advance(15001);
+  assert.equal((await b.resolve(id)).epoch, 2);
+  await assert.rejects(b.acquireProfile(id, "held"), /browser_profile_busy/);
+});
+
+test("journal parser errors never expose malformed persisted data", async (t) => {
+  const { a } = await fixture(t);
+  const directory = await mkdtemp(join(tmpdir(), "journal-redaction-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(
+    join(directory, `${id}.json`),
+    '{"secret":"sensitive-capability","x":bad}',
+  );
+  await assert.rejects(
+    importExecutionJournal({
+      directory,
+      installationId: "fixture",
+      ownership: a,
+      validate: validateControllerRecord,
+    }),
+    { message: "browser_execution_journal_corrupt" },
+  );
+});
+
+test("an expired legacy viewer capability cannot trigger cluster reads before authorization", async (t) => {
+  const { a, ports, state, cleanups } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => [],
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {},
+    },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  await a.resolve(id, true);
+  const data = JSON.parse(
+    await readFile(
+      new URL(
+        "../.github/scripts/managed/fixtures/journal-v0.2.0/11111111-1111-4111-8111-111111111111.json",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  ).data;
+  const token = "c".repeat(64);
+  const record = await a.journal.create(id, {
+    ...data,
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [
+      { token, kind: "view", expiresAt: Date.now() - 1, control: false, resize: false },
+    ],
+  });
+  await a.indexLegacy(record);
+  const before = state.requests;
+  const socket = new WebSocket(
+    `${controller.origin.replace(/^http/, "ws")}/view/socket`,
+  );
+  socket.once("open", () =>
+    socket.send(JSON.stringify({ type: "authenticate", token })),
+  );
+  socket.on("error", () => {});
+  await new Promise((resolve) => socket.once("close", resolve));
+  assert.equal(state.requests, before);
+});
+
+test("finished orphan takeovers share one fresh discovery after all claims complete", async (t) => {
+  const { a, b, ports, cleanups } = await fixture(t);
+  for (const executionId of [id, other]) {
+    await a.resolve(executionId, true);
+    await a.journal.create(executionId, { phase: "finished" });
+    await a.complete(executionId);
+  }
+  let lists = 0;
+  const removed = [];
+  const workers = [id, other].map((executionId) => ({
+    id: `${executionId}/uid`,
+    executionId,
+    incarnation: executionId,
+    runtime: {
+      request: async (request) =>
+        request.op === "finalize"
+          ? { stopped: true, used: false }
+          : { protocol: "browser-sandbox.worker/v2", session: { state: "unused" } },
+      close: () => {},
+    },
+  }));
+  let remaining = workers[1];
+  const backend = {
+    list: async () => {
+      lists++;
+      if (lists === 1) return workers;
+      if (lists === 2)
+        assert(
+          b.owns(id) && b.owns(other),
+          "fresh discovery must follow every candidate takeover",
+        );
+      return remaining ? [remaining] : [];
+    },
+    create: async () => {
+      throw Error("unexpected");
+    },
+    remove: async (worker) => {
+      removed.push(worker.executionId);
+      remaining = undefined;
+    },
+  };
+  const controller = await createController({
+    ownership: b,
+    backend,
+    peerPort: ports[1],
+    port: 0,
+    reconciliationMs: 60000,
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  assert.equal(
+    lists,
+    2,
+    "one initial discovery and one shared post-takeover revalidation",
+  );
+  assert.equal((await b.journal.read(id)).data.phase, "finished");
+  await controller.reconcile();
+  assert.deepEqual(
+    removed,
+    [other],
+    "already absent worker must not be reclaimed again",
+  );
+});
+
+test("an unrecorded orphan absent from post-takeover discovery becomes a finished fence", async (t) => {
+  const { b, ports, cleanups } = await fixture(t);
+  let lists = 0;
+  const worker = {
+    id: "vanished/uid",
+    executionId: id,
+    incarnation: other,
+    runtime: {
+      request: async () => {
+        throw Error("vanished worker cannot be contacted");
+      },
+      close: () => {},
+    },
+  };
+  const controller = await createController({
+    ownership: b,
+    peerPort: ports[1],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => (++lists === 1 ? [worker] : []),
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {
+        throw Error("vanished worker cannot be removed twice");
+      },
+    },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  assert.equal(lists, 2);
+  assert.equal((await b.journal.read(id)).data.phase, "finished");
+  await assert.rejects(
+    controller.command(
+      { op: "register", executionId: id },
+      { signal: new AbortController().signal, callback: async () => {} },
+    ),
+    /browser_execution_revoked/,
+  );
+});
+
+test("non-owner forwarding cannot normalize an execution path into private host control", async (t) => {
+  const { a, b, ports, cleanups } = await fixture(t);
+  const controllers = [];
+  cleanups.unshift(async () => {
+    for (const c of controllers) await c.stop({ finalize: false });
+  });
+  for (const [i, ownership] of [a, b].entries())
+    controllers.push(
+      await createController({
+        ownership,
+        peerPort: ports[i],
+        peerHost: "127.0.0.1",
+        port: 0,
+        reconciliationMs: 60000,
+        backend: {
+          list: async () => [],
+          create: async () => {
+            throw Error("unexpected");
+          },
+          remove: async () => {},
+        },
+      }),
+    );
+  await controllers[0].command(
+    { op: "register", executionId: id },
+    { signal: new AbortController().signal, callback: async () => {} },
+  );
+  await b.refresh();
+  const url = new URL(controllers[1].origin);
+  for (const suffix of ["../../host", "%2e%2e/%2e%2e/host"]) {
+    const status = await new Promise((resolve, reject) => {
+      const req = request({
+        hostname: url.hostname,
+        port: url.port,
+        path: `/execution/${id}/${suffix}`,
+        headers: {
+          Connection: "Upgrade",
+          Upgrade: "websocket",
+          "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+          "Sec-WebSocket-Version": "13",
+        },
+      });
+      req.once("upgrade", (res, socket) => {
+        socket.destroy();
+        resolve(res.statusCode);
+      });
+      req.once("response", (res) => {
+        res.resume();
+        resolve(res.statusCode);
+      });
+      req.once("error", reject);
+      req.end();
+    });
+    assert.equal(
+      status,
+      403,
+      "execution routing must not reach the trusted peer /host route",
+    );
+  }
 });

@@ -11,13 +11,16 @@ import {
   forwardControllerRequest,
   forwardControllerViewer,
 } from "./controller-forwarding.js";
-import { createExecutionJournal } from "./execution-journal.js";
+import { createExecutionJournal, type ExecutionRecord } from "./execution-journal.js";
 import { MAX_FILE_BYTES } from "./files.js";
 import type { StorageAdapter } from "./host-client.js";
-import type { KubernetesOwnership } from "./kubernetes-ownership.js";
 import { WorkerCleanupFailure } from "./lifecycle-errors.js";
 import { validProfileId } from "./local-profiles.js";
-import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
+import type {
+  ExecutionOwnership,
+  ManagedBackend,
+  ManagedWorker,
+} from "./managed-backend.js";
 import {
   CONTROL_TIMEOUT_MS,
   type ControlPeer,
@@ -28,7 +31,11 @@ import type { createProfileStore } from "./profile-store.js";
 import { MAX_ARCHIVE_BYTES } from "./profiles.js";
 import type { SessionStatus } from "./session.js";
 import { createWorkerAdmission, type WorkerSlot } from "./worker-admission.js";
-import { WORKER_PROTOCOL, workerIdleProtection } from "./worker-protocol.js";
+import {
+  LEGACY_WORKER_PROTOCOL,
+  WORKER_PROTOCOL,
+  workerIdleProtection,
+} from "./worker-protocol.js";
 
 export interface ExecutionBinding {
   executionId: string;
@@ -89,7 +96,7 @@ export interface ControllerOptions {
   /** Retained, private storage; exactly one controller may own this directory. */
   profileStore?: Awaited<ReturnType<typeof createProfileStore>>;
   stateDirectory?: string;
-  ownership?: KubernetesOwnership;
+  ownership?: ExecutionOwnership;
   replicas?: number;
   peerPort?: number;
   peerHost?: string;
@@ -108,7 +115,7 @@ export interface ControllerOptions {
   idleRegistrationMs?: number;
   reconciliationMs?: number;
   onWorkerEvent?: (event: {
-    type: "creating" | "ready" | "failed" | "removed" | "recovery-blocked";
+    type: "creating" | "ready" | "failed" | "removed" | "recovery-blocked" | "fenced";
     executionId: string;
     incarnation: string;
     elapsedMs?: number;
@@ -134,12 +141,13 @@ export async function createController(options: ControllerOptions) {
   };
   let journal:
     | Awaited<ReturnType<typeof createExecutionJournal>>
-    | KubernetesOwnership["journal"]
+    | ExecutionOwnership["journal"]
     | undefined;
   const ownership = options.ownership;
+  const scopedCapability = (id: string, token: string, separator: "/" | ".") =>
+    ownership ? `${id}${separator}${token}` : token;
   const supportedProtocol = (protocol: unknown) =>
-    protocol === WORKER_PROTOCOL ||
-    (!ownership && protocol === "browser-sandbox.worker/v1");
+    protocol === WORKER_PROTOCOL || (!ownership && protocol === LEGACY_WORKER_PROTOCOL);
   const forwarding = createHostForwarding();
   if ((options.replicas ?? 1) > 1 && options.profileStore)
     throw Error("browser_profile_store_replicas_unsupported");
@@ -566,11 +574,11 @@ export async function createController(options: ControllerOptions) {
     grant ??= issue(binding, "cdp");
     return {
       protocol: "browser-sandbox.host/v1",
-      wsEndpoint: `${origin.replace(/^http/, "ws")}/execution/${ownership ? `${binding.executionId}/` : ""}${grant.token}`,
+      wsEndpoint: `${origin.replace(/^http/, "ws")}/execution/${scopedCapability(binding.executionId, grant.token, "/")}`,
     };
   };
   const event = (
-    binding: ExecutionBinding,
+    binding: Pick<ExecutionBinding, "executionId" | "incarnation">,
     type: Parameters<NonNullable<ControllerOptions["onWorkerEvent"]>>[0]["type"],
     extra = {},
   ) => {
@@ -1269,8 +1277,8 @@ export async function createController(options: ControllerOptions) {
       await persist(binding);
       return {
         executionId: id,
-        cdpUrl: `${origin.replace(/^http/, "ws")}/execution/${ownership ? `${id}/` : ""}${agent.token}`,
-        viewerUrl: `${origin}/view#${ownership ? `${id}.` : ""}${viewer.token}`,
+        cdpUrl: `${origin.replace(/^http/, "ws")}/execution/${scopedCapability(id, agent.token, "/")}`,
+        viewerUrl: `${origin}/view#${scopedCapability(id, viewer.token, ".")}`,
         expiresAt: agent.expiresAt,
       };
     }
@@ -1459,13 +1467,13 @@ export async function createController(options: ControllerOptions) {
               if (ownership && !req.executionId && auth?.type === "authenticate") {
                 const id = await ownership.findCapability(auth.token);
                 if (id) {
-                  const owner = await ownership.resolve(id);
+                  const owner = ownership.lookup(id);
                   if (owner && !ownership.owns(id)) {
                     if (forwarded) throw Error("browser_controller_owner_moved");
                     forwardControllerViewer(client, owner.origin, id, auth.token);
                     return;
                   }
-                  await loadOwned(id);
+                  req.executionId = id;
                 }
               }
               grant =
@@ -1556,7 +1564,7 @@ export async function createController(options: ControllerOptions) {
       !Array.isArray(data.grants)
     )
       throw Error("browser_execution_journal_corrupt");
-    const worker =
+    let worker =
       owned.get(data.workerId) ??
       discovered.find(
         (item) => item.executionId === id && item.incarnation === data.incarnation,
@@ -1568,6 +1576,11 @@ export async function createController(options: ControllerOptions) {
         worker.profileId !== data.profileId)
     )
       throw Error("browser_worker_ownership_mismatch");
+    if (worker && worker.id !== data.workerId && staleCreation(worker)) {
+      await discardStaleCreation(worker);
+      owned.delete(worker.id);
+      worker = undefined;
+    }
     if (ownership && data.profileId && data.profileAcquired !== false)
       await ownership.acquireProfile(id, data.profileId);
     const binding: ExecutionBinding = {
@@ -1592,7 +1605,7 @@ export async function createController(options: ControllerOptions) {
       confirmedCommit: data.confirmedCommit,
       generation: data.generation,
       // Journal v1 originally described worker protocol v1.
-      workerProtocol: data.workerProtocol ?? "browser-sandbox.worker/v1",
+      workerProtocol: data.workerProtocol ?? LEGACY_WORKER_PROTOCOL,
       cleanupUnconfirmed: data.cleanupUnconfirmed,
       recoveryAttempts: data.recoveryAttempts,
       recoveryError: data.recoveryError,
@@ -1758,6 +1771,8 @@ export async function createController(options: ControllerOptions) {
   function dropOwned(id: string) {
     const binding = bindings.get(id);
     if (!binding) return;
+    if (!closing && binding.phase !== "finished")
+      event(binding, "fenced", { error: "browser_controller_fenced" });
     revokeExecution(binding);
     binding.storageDisconnect?.();
     binding.storageConnection?.close();
@@ -1767,7 +1782,7 @@ export async function createController(options: ControllerOptions) {
     if (binding.profileId) profileLeases.delete(binding.profileId);
   }
   const loading = new Map<string, Promise<void>>();
-  function loadOwned(id: string): Promise<void> {
+  function loadOwned(id: string, workers?: ManagedWorker[]): Promise<void> {
     if (bindings.has(id) || (finished.has(id) && !ownership)) return Promise.resolve();
     let pending = loading.get(id);
     if (!pending) {
@@ -1782,7 +1797,8 @@ export async function createController(options: ControllerOptions) {
         }
         if (Array.isArray(record.data.grants) && record.data.grants.length)
           await ownership.indexLegacy(record);
-        const discovered = await options.backend.list(AbortSignal.timeout(30000));
+        const discovered =
+          workers ?? (await options.backend.list(AbortSignal.timeout(30000)));
         try {
           await restoreRecord(
             record,
@@ -1790,40 +1806,74 @@ export async function createController(options: ControllerOptions) {
             new Map(discovered.map((worker) => [worker.id, worker])),
           );
         } finally {
-          closeUnusedDiscovery(discovered);
+          if (!workers) closeUnusedDiscovery(discovered);
         }
       })().finally(() => loading.delete(id));
       loading.set(id, pending);
     }
     return pending;
   }
+  const staleCreation = (worker: ManagedWorker) =>
+    ownership &&
+    (worker.creationEpoch ?? worker.epoch) !== undefined &&
+    (worker.creationEpoch ?? worker.epoch) < ownership.epoch(worker.executionId);
+  async function discardStaleCreation(worker: ManagedWorker) {
+    const signal = AbortSignal.timeout(30000);
+    worker.creationEpoch ??= worker.epoch;
+    // Only an unpublished old-epoch creation is discarded; exact recorded workers are reattached.
+    await options.backend.fence(
+      worker,
+      ownership.epoch(worker.executionId),
+      signal,
+      true,
+    );
+    await removeWorker(worker, signal);
+    event(worker, "removed", { reason: "stale-creation" });
+  }
   async function refreshOwnership() {
     const ids = await ownership.refresh();
-    for (const id of ids) {
-      await ownership.resolve(id);
-      if (ownership.owns(id)) await loadOwned(id);
-    }
+    for (const id of ids) await ownership.resolve(id);
     const discovered = await options.backend.list(AbortSignal.timeout(30000));
+    const candidates: { worker: ManagedWorker; record?: ExecutionRecord }[] = [];
     try {
+      for (const id of ids) if (ownership.owns(id)) await loadOwned(id, discovered);
       for (const worker of discovered) {
-        if (bindings.has(worker.executionId)) continue;
+        const binding = bindings.get(worker.executionId);
+        if (binding) {
+          if (binding.worker?.id !== worker.id && staleCreation(worker))
+            await discardStaleCreation(worker);
+          continue;
+        }
         await ownership.resolve(worker.executionId, true);
         if (!ownership.owns(worker.executionId)) continue;
         const record = await journal.read(worker.executionId);
-        if (record?.data.phase === "finished") {
-          const current = await options.backend.list(AbortSignal.timeout(30000));
-          try {
-            const remaining = current.find((item) => item.id === worker.id);
-            if (remaining) await restoreOrphan(remaining, record.revision);
-            else await ownership.complete(worker.executionId);
-          } finally {
-            closeUnusedDiscovery(current);
+        candidates.push({ worker, record });
+      }
+      if (candidates.length) {
+        // Resolve every orphan first; all revalidation must follow its ownership handoff.
+        const current = await options.backend.list(AbortSignal.timeout(30000));
+        try {
+          const workers = new Map(current.map((worker) => [worker.id, worker]));
+          for (const { worker, record } of candidates) {
+            const remaining = workers.get(worker.id);
+            if (record?.data.phase === "finished") {
+              if (remaining) await restoreOrphan(remaining, record.revision);
+              else await ownership.complete(worker.executionId);
+              continue;
+            }
+            await loadOwned(worker.executionId, current);
+            if (!ownership.owns(worker.executionId) || bindings.has(worker.executionId))
+              continue;
+            if (remaining) await restoreOrphan(remaining, record?.revision ?? 0);
+            else if (!record) {
+              await journal.create(worker.executionId, { phase: "finished" });
+              await ownership.complete(worker.executionId);
+              rememberFinished(worker.executionId);
+            }
           }
-          continue;
+        } finally {
+          closeUnusedDiscovery(current);
         }
-        await loadOwned(worker.executionId);
-        if (ownership.owns(worker.executionId) && !bindings.has(worker.executionId))
-          await restoreOrphan(worker, record?.revision ?? 0);
       }
     } finally {
       closeUnusedDiscovery(discovered);
@@ -1836,14 +1886,13 @@ export async function createController(options: ControllerOptions) {
     const id =
       match?.[1] ?? (legacy ? await ownership.findCapability(legacy[1]) : undefined);
     if (!id) return false;
-    const owner = await ownership.resolve(id);
+    const owner = ownership.lookup(id);
     if (!owner) throw Error("browser_access_denied");
     if (!ownership.owns(id)) {
       if (forwarded) throw Error("browser_controller_owner_moved");
       forwardControllerRequest(req, destination, owner.origin, head);
       return true;
     }
-    await loadOwned(id);
     req.executionId = id;
     if (match)
       req.url = match[2] === "view/socket" ? "/view/socket" : `/execution/${match[2]}`;
@@ -1865,6 +1914,9 @@ export async function createController(options: ControllerOptions) {
   async function constructionFailed(error: unknown): Promise<never> {
     closing = true;
     control.close();
+    forwarding.close();
+    peerControl?.close();
+    await ownership?.close();
     for (const grant of [...grants.values()]) revoke(grant);
     viewers.close();
     cdp.close();
@@ -2164,12 +2216,6 @@ export async function createController(options: ControllerOptions) {
         resolve,
       );
     }).catch(constructionFailed);
-  const renewal = ownership
-    ? setInterval(() => {
-        void ownership.renew().catch(() => {});
-      }, 5000)
-    : undefined;
-  renewal?.unref();
   schedule();
   origin ??= `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   return {
@@ -2206,7 +2252,6 @@ export async function createController(options: ControllerOptions) {
       stopped = true;
       closing = true;
       clearTimeout(reconciliationTimer);
-      clearInterval(renewal);
       let failure: unknown;
       try {
         await reconciliation;

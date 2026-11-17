@@ -232,7 +232,12 @@ export function createKubernetesBackend(
               labels: expected,
               annotations: {
                 [prefix + "profile-id"]: placement.profileId ?? "",
-                ...(epoch ? { [prefix + "epoch"]: String(epoch) } : {}),
+                ...(epoch
+                  ? {
+                      [prefix + "epoch"]: String(epoch),
+                      [prefix + "creation-epoch"]: String(epoch),
+                    }
+                  : {}),
               },
               ownerReferences: [
                 {
@@ -328,6 +333,11 @@ export function createKubernetesBackend(
         );
         uid = pod.metadata.uid;
         if (!uid) throw Error("browser_kubernetes_response_invalid");
+        if (
+          options.ownership &&
+          (await options.ownership.assertOwned(placement.executionId)) !== epoch
+        )
+          throw Error("browser_controller_fenced");
         while (true) {
           const state = await getPod(name, signal);
           if (!state) throw Error("browser_worker_lost");
@@ -379,9 +389,16 @@ export function createKubernetesBackend(
               isIP(state.status.podIP) === 6
                 ? `[${state.status.podIP}]`
                 : state.status.podIP;
+            if (
+              options.ownership &&
+              (await options.ownership.assertOwned(placement.executionId)) !== epoch
+            )
+              throw Error("browser_controller_fenced");
             const origin = `http://${host}:8081`;
             return {
               id: `${name}/${uid}`,
+              epoch,
+              creationEpoch: epoch,
               executionId: placement.executionId,
               incarnation: placement.incarnation,
               origin,
@@ -467,9 +484,24 @@ export function createKubernetesBackend(
             if (!isIP(ip)) throw Error("browser_worker_not_ready");
             return `http://${isIP(ip) === 6 ? `[${ip}]` : ip}:8081`;
           };
+          const epoch = Number(pod.metadata.annotations?.[prefix + "epoch"] ?? 0);
+          if (options.ownership && (!Number.isSafeInteger(epoch) || epoch < 0))
+            throw Error("browser_worker_discovery_failed");
+          const creationEpoch = Number(
+            pod.metadata.annotations?.[prefix + "creation-epoch"] ?? epoch,
+          );
+          if (
+            options.ownership &&
+            (!Number.isSafeInteger(creationEpoch) ||
+              creationEpoch < 0 ||
+              creationEpoch > epoch)
+          )
+            throw Error("browser_worker_discovery_failed");
           let runtime: ReturnType<typeof createControllerRuntime>;
           workers.push({
             id: `${pod.metadata.name}/${pod.metadata.uid}`,
+            epoch: options.ownership ? epoch : undefined,
+            creationEpoch: options.ownership ? creationEpoch : undefined,
             executionId,
             incarnation,
             profileId: profileId || undefined,
@@ -507,6 +539,9 @@ export function createKubernetesBackend(
       const previous = Number(pod.metadata.annotations?.[prefix + "epoch"] ?? 0);
       if (!Number.isSafeInteger(previous) || previous > epoch)
         throw Error("browser_controller_fenced");
+      const creationEpoch = Number(
+        pod.metadata.annotations?.[prefix + "creation-epoch"] ?? previous,
+      );
       if (previous < epoch)
         await api(
           `${base}/pods/${name}`,
@@ -514,11 +549,16 @@ export function createKubernetesBackend(
           {
             metadata: {
               resourceVersion: pod.metadata.resourceVersion,
-              annotations: { [prefix + "epoch"]: String(epoch) },
+              annotations: {
+                [prefix + "epoch"]: String(epoch),
+                [prefix + "creation-epoch"]: String(creationEpoch),
+              },
             },
           },
           signal,
         );
+      worker.epoch = epoch;
+      worker.creationEpoch = creationEpoch;
       worker.runtime.setEpoch?.(epoch);
       if (stopped) return;
       await worker.runtime.request(

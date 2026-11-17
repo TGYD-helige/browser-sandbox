@@ -1,4 +1,5 @@
 import type { AutomationCoordinator } from "./automation-control.js";
+import type { ExecutionRecord } from "./execution-journal.js";
 import type { BrowserRuntime, Placement } from "./runtime-provider.js";
 
 export const WORKER_ENVIRONMENT = [
@@ -18,6 +19,10 @@ export interface ManagedWorker {
   incarnation: string;
   origin: string;
   profileId?: string;
+  /** Controller epoch persisted on a shared-backend resource. */
+  epoch?: number;
+  /** Immutable allocation epoch, retained through failed cleanup. */
+  creationEpoch?: number;
   /** An owned cleanup resource with no surviving browser process or Profile disk. */
   infrastructureOnly?: boolean;
   runtime: BrowserRuntime & {
@@ -48,4 +53,40 @@ export interface ManagedBackend {
     stopped?: boolean,
   ): Promise<void>;
   remove(worker: ManagedWorker, signal: AbortSignal): Promise<void>;
+}
+
+export interface ExecutionOwner {
+  replica: string;
+  origin: string;
+  epoch: number;
+}
+
+/** Shared ownership contract; platform arbitration and persistence stay in its adapter. */
+export interface ExecutionOwnership {
+  lookup(id: string): ExecutionOwner | undefined;
+  resolve(id: string, create?: boolean): Promise<ExecutionOwner | undefined>;
+  assertOwned(id: string): Promise<number>;
+  epoch(id: string): number | undefined;
+  owns(id: string): boolean;
+  onLost(callback: (id: string) => void): void;
+  findCapability(token: string): string | undefined;
+  indexLegacy(record: ExecutionRecord): Promise<void>;
+  acquireProfile(id: string, profileId: string): Promise<void>;
+  complete(id: string): Promise<void>;
+  refresh(): Promise<string[]>;
+  watch(): Promise<void>;
+  release(): Promise<void>;
+  close(): Promise<void>;
+  journal: {
+    read(id: string): Promise<ExecutionRecord | undefined>;
+    has(id: string): boolean;
+    ids(): string[];
+    finishedIds(): string[];
+    create(id: string, data: Record<string, unknown>): Promise<ExecutionRecord>;
+    update(
+      id: string,
+      revision: number,
+      data: Record<string, unknown>,
+    ): Promise<ExecutionRecord>;
+  };
 }

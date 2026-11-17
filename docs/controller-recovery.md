@@ -2,7 +2,7 @@
 
 Docker and default Kubernetes mode use one controller per installation. Kubernetes can use [shared-state active-active controllers](./kubernetes.md#active-active-controllers); the private-journal instructions below apply to single-controller mode. Keep its private `/controller-data` volume across container replacement and keep `BROWSER_INSTALLATION` stable. The Helm chart creates a retained ReadWriteOnce PVC by default, uses `Recreate`, and mounts the volume only into the controller. `controllerData.existingClaim` selects an existing volume. The execution journal lives under `/controller-data/executions`. The optional Profile store retains its separate volume at `/var/lib/browser-sandbox/profiles`, configured through `profileStore.existingClaim`. Journal-volume access includes execution capabilities; Profile-volume access includes archive encryption metadata.
 
-Do not run multiple controllers against the same installation or journal. Shared storage does not provide controller HA or fencing between replicas. Managed endpoints remain internal-only while authentication is deferred.
+In private-journal mode, do not run multiple controllers against the same installation or journal: a shared volume does not provide ownership arbitration or fencing. Kubernetes shared-state mode is the supported exception; it uses Leases and Secrets instead of sharing a writable journal volume. Its ownership adapter renews leases from construction through migration, recovery and graceful cleanup, then conditionally releases them. Managed endpoints remain internal-only while authentication is deferred.
 
 ## Configuration
 

@@ -1,8 +1,10 @@
-import { constants } from "node:fs";
-import { open, opendir } from "node:fs/promises";
-import { join } from "node:path";
+import { opendir } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
-import type { ExecutionRecord } from "./execution-journal.js";
+import {
+  type ExecutionRecord,
+  isPendingExecutionFile,
+  readExecutionRecord,
+} from "./execution-journal.js";
 import type { KubernetesOwnership } from "./kubernetes-ownership.js";
 
 /** Read every old entry before publishing any state; never rewrite, compact, or chmod the source. */
@@ -12,15 +14,20 @@ export async function importExecutionJournal(options: {
   ownership: KubernetesOwnership;
   validate(data: unknown): void;
 }) {
+  if (await options.ownership.migrationComplete()) return 0;
   const entries: ExecutionRecord[] = [];
   let directory: Awaited<ReturnType<typeof opendir>>;
   try {
     directory = await opendir(options.directory);
   } catch (error) {
-    if (error.code === "ENOENT") return 0;
+    if (error.code === "ENOENT") {
+      await options.ownership.finishMigration();
+      return 0;
+    }
     throw error;
   }
   for await (const entry of directory) {
+    if (isPendingExecutionFile(entry.name)) continue;
     if (
       !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.json$/.test(
         entry.name,
@@ -28,41 +35,13 @@ export async function importExecutionJournal(options: {
       entries.length >= 65536
     )
       throw Error("browser_execution_journal_corrupt");
-    const file = await open(
-      join(options.directory, entry.name),
-      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    const { record } = await readExecutionRecord(
+      options.directory,
+      options.installationId,
+      entry.name.slice(0, -5),
     );
-    try {
-      const stat = await file.stat();
-      if (!stat.isFile() || stat.size > 65536)
-        throw Error("browser_execution_journal_corrupt");
-      let value: any;
-      try {
-        value = JSON.parse(await file.readFile("utf8"));
-      } catch {
-        throw Error("browser_execution_journal_corrupt");
-      }
-      if (
-        value.protocol !== "browser-sandbox.execution/v1" ||
-        value.installationId !== options.installationId ||
-        value.executionId !== entry.name.slice(0, -5) ||
-        !Number.isSafeInteger(value.revision) ||
-        value.revision < 1 ||
-        (value.finishedAt !== undefined &&
-          (value.data?.phase !== "finished" ||
-            !Number.isSafeInteger(value.finishedAt) ||
-            value.finishedAt < 0))
-      )
-        throw Error("browser_execution_journal_corrupt");
-      options.validate(value.data);
-      entries.push({
-        executionId: value.executionId,
-        revision: value.revision,
-        data: value.data,
-      });
-    } finally {
-      await file.close();
-    }
+    options.validate(record.data);
+    entries.push(record);
   }
   for (const record of entries) {
     const previous = await options.ownership.journal.read(record.executionId);
@@ -90,5 +69,6 @@ export async function importExecutionJournal(options: {
         String(record.data.profileId),
       );
   }
+  await options.ownership.finishMigration();
   return entries.length;
 }

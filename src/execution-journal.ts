@@ -11,6 +11,65 @@ export interface ExecutionRecord {
   data: Record<string, unknown>;
 }
 
+export const isPendingExecutionFile = (name: string) =>
+  name.startsWith(".pending-") && uuid.test(name.slice(9));
+
+export async function readExecutionRecord(
+  directory: string,
+  installationId: string,
+  id: string,
+) {
+  if (!uuid.test(id)) throw Error("browser_execution_id_invalid");
+  const file = await open(
+    join(directory, `${id}.json`),
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const stat = await file.stat();
+    if (!stat.isFile() || stat.size > MAX_RECORD_BYTES)
+      throw Error("browser_execution_journal_corrupt");
+    const text = await file.readFile("utf8");
+    let body: any;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      throw Error("browser_execution_journal_corrupt");
+    }
+    if (
+      body.protocol !== "browser-sandbox.execution/v1" ||
+      body.installationId !== installationId ||
+      body.executionId !== id ||
+      !Number.isSafeInteger(body.revision) ||
+      body.revision < 1 ||
+      !body.data ||
+      typeof body.data !== "object" ||
+      Array.isArray(body.data)
+    )
+      throw Error("browser_execution_journal_corrupt");
+    const finishedAt =
+      body.data.phase === "finished"
+        ? (body.finishedAt ?? Math.floor(stat.mtimeMs))
+        : undefined;
+    if (
+      body.finishedAt !== undefined &&
+      (body.data.phase !== "finished" ||
+        !Number.isSafeInteger(body.finishedAt) ||
+        body.finishedAt < 0)
+    )
+      throw Error("browser_execution_journal_corrupt");
+    return {
+      record: {
+        executionId: id,
+        revision: body.revision,
+        data: body.data,
+      } as ExecutionRecord,
+      finishedAt: finishedAt as number | undefined,
+    };
+  } finally {
+    await file.close();
+  }
+}
+
 /** Single-controller durable identities with bounded recent finished fences. */
 export async function createExecutionJournal({
   directory,
@@ -39,50 +98,7 @@ export async function createExecutionJournal({
     if (!uuid.test(id)) throw Error("browser_execution_id_invalid");
     return join(directory, `${id}.json`);
   };
-  const readRecord = async (id: string) => {
-    const file = await open(
-      filename(id),
-      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-    );
-    try {
-      const stat = await file.stat();
-      if (!stat.isFile() || stat.size > MAX_RECORD_BYTES)
-        throw Error("browser_execution_journal_corrupt");
-      const body = JSON.parse(await file.readFile("utf8"));
-      if (
-        body.protocol !== "browser-sandbox.execution/v1" ||
-        body.installationId !== installationId ||
-        body.executionId !== id ||
-        !Number.isSafeInteger(body.revision) ||
-        body.revision < 1 ||
-        !body.data ||
-        typeof body.data !== "object" ||
-        Array.isArray(body.data)
-      )
-        throw Error("browser_execution_journal_corrupt");
-      const finishedAt =
-        body.data.phase === "finished"
-          ? (body.finishedAt ?? Math.floor(stat.mtimeMs))
-          : undefined;
-      if (
-        body.finishedAt !== undefined &&
-        (body.data.phase !== "finished" ||
-          !Number.isSafeInteger(body.finishedAt) ||
-          body.finishedAt < 0)
-      )
-        throw Error("browser_execution_journal_corrupt");
-      return {
-        record: {
-          executionId: id,
-          revision: body.revision,
-          data: body.data,
-        } as ExecutionRecord,
-        finishedAt: finishedAt as number | undefined,
-      };
-    } finally {
-      await file.close();
-    }
-  };
+  const readRecord = (id: string) => readExecutionRecord(directory, installationId, id);
   const read = async (id: string): Promise<ExecutionRecord> =>
     (await readRecord(id)).record;
   const syncDirectory = async () => {
@@ -168,7 +184,7 @@ export async function createExecutionJournal({
   let removedPending = false;
   const entries = await opendir(directory);
   for await (const entry of entries) {
-    if (entry.name.startsWith(".pending-") && uuid.test(entry.name.slice(9))) {
+    if (isPendingExecutionFile(entry.name)) {
       await unlink(join(directory, entry.name));
       removedPending = true;
       continue;

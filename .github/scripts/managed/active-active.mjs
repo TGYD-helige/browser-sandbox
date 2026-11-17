@@ -3,6 +3,11 @@ import { randomUUID } from "node:crypto";
 import { readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import {
+  assertFencedOwner,
+  observeSingleRemoval,
+  summarizeFailover,
+} from "./active-active-checks.mjs";
 
 /** Runs inside the existing native-architecture k3d job and uses its isolated kubeconfig. */
 export async function activeActive({
@@ -196,6 +201,47 @@ export async function activeActive({
       },
     );
     await kubectl("delete", "pod", name, "--wait=true", "--timeout=30s");
+  }
+  const readEvents = async (pod) =>
+    (await kubectl("logs", pod.metadata.name)).split("\n").flatMap((line) => {
+      try {
+        return [JSON.parse(line)];
+      } catch {
+        return [];
+      }
+    });
+  async function startLive(id, pod) {
+    const file = `/tmp/ha-live-${id}.ready`;
+    await kubectl(
+      "exec",
+      "client",
+      "--",
+      "node",
+      "-e",
+      `require('node:fs').rmSync('${file}',{force:true})`,
+    );
+    const live = client("live", id, pod, undefined, 210000);
+    live.catch(() => {});
+    await wait(
+      "Live CDP connection was not ready",
+      async () => {
+        try {
+          await kubectl(
+            "exec",
+            "client",
+            "--",
+            "node",
+            "-e",
+            `require('node:fs').readFileSync('${file}')`,
+          );
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      Boolean,
+    );
+    return { closed: live };
   }
   const report = { architecture: process.arch };
   const controllerProcess = async (pod) => {
@@ -457,39 +503,11 @@ export async function activeActive({
     for (let sample = 0; sample < 5; sample++) {
       current = await peers(id);
       const epoch = Number(current.lease.metadata.annotations[prefix + "epoch"]);
-      await kubectl(
-        "exec",
-        "client",
-        "--",
-        "node",
-        "-e",
-        `require('node:fs').rmSync('/tmp/ha-live-${id}.ready',{force:true})`,
-      );
-      const live = client("live", id, current.pod, undefined, 60000);
-      live.catch(() => {});
-      await wait(
-        "Live CDP connection was not ready before owner kill",
-        async () => {
-          try {
-            await kubectl(
-              "exec",
-              "client",
-              "--",
-              "node",
-              "-e",
-              `require('node:fs').readFileSync('/tmp/ha-live-${id}.ready')`,
-            );
-            return true;
-          } catch {
-            return false;
-          }
-        },
-        Boolean,
-      );
+      const live = await startLive(id, current.pod);
       const killedProcess = await controllerProcess(current.pod);
       const started = performance.now();
       await signalProcess(killedProcess, "KILL");
-      await live;
+      await live.closed;
       await wait(
         "Owner kill did not transfer ownership",
         () => owner(id),
@@ -508,17 +526,16 @@ export async function activeActive({
       );
       await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
     }
-    failover.sort((a, b) => a - b);
     report.failover = {
-      medianMs: failover[2],
-      p95Ms: failover[4],
-      samples: failover.length,
+      ...summarizeFailover(failover),
       workerAndProfilePreserved: true,
     };
     current = await peers(id);
     stage = "SIGSTOP fencing";
     paused = current.pod.metadata.name;
     const oldEpoch = Number(current.lease.metadata.annotations[prefix + "epoch"]);
+    const beforePauseEvents = (await readEvents(current.pod)).length;
+    const pausedRestartCount = current.pod.status.containerStatuses[0].restartCount;
     const readyFile = `/tmp/ha-stale-${id}.ready`;
     const releaseFile = `/tmp/ha-stale-${id}.release`;
     // Keep the actual pre-takeover Secret resourceVersion in a waiting protocol client.
@@ -573,16 +590,6 @@ export async function activeActive({
       45000,
     );
     await client("verify", id, next.pod);
-    // Recovery has announced the new worker epoch before the old control probe is sent.
-    await kubectl(
-      "exec",
-      next.pod.metadata.name,
-      "--",
-      "node",
-      "--input-type=module",
-      "-e",
-      `import{createControllerRuntime}from'/opt/browser-sandbox/dist/network-control.js';const r=createControllerRuntime('http://${worker.status.podIP}:8081',{epoch:${oldEpoch}});try{await r.request({op:'finalize',executionId:'${id}'});process.exitCode=1}catch(e){if(e.message!=='browser_controller_fenced')throw e}finally{r.close()}`,
-    );
     await signalProcess(pausedProcess, "CONT");
     paused = undefined;
     pausedProcess = undefined;
@@ -596,6 +603,34 @@ export async function activeActive({
       `require('node:fs').writeFileSync('${releaseFile}','go')`,
     );
     await staleProbe;
+    await wait(
+      "Resumed controller did not report fencing",
+      () => readEvents(current.pod),
+      (events) =>
+        events
+          .slice(beforePauseEvents)
+          .some((event) => event.executionId === id && event.type === "fenced"),
+      15000,
+    );
+    const resumed = JSON.parse(
+      await kubectl("get", "pod", current.pod.metadata.name, "-o", "json"),
+    );
+    assert.equal(resumed.metadata.uid, current.pod.metadata.uid);
+    assert.equal(resumed.status.containerStatuses[0].restartCount, pausedRestartCount);
+    // The old process must run after SIGCONT, report its own fencing and avoid destructive work.
+    assertFencedOwner((await readEvents(current.pod)).slice(beforePauseEvents), id);
+    await kubectl(
+      "exec",
+      current.pod.metadata.name,
+      "--",
+      "node",
+      "--input-type=module",
+      "-e",
+      `import{createControllerRuntime}from'/opt/browser-sandbox/dist/network-control.js';const old=createControllerRuntime('http://${worker.status.podIP}:8081',{epoch:${oldEpoch}});const next=createControllerRuntime('http://${worker.status.podIP}:8081',{epoch:${Number(next.lease.metadata.annotations[prefix + "epoch"])}});try{try{await old.request({op:'finalize',executionId:'${id}'});throw Error('old_epoch_accepted')}catch(e){if(e.message!=='browser_controller_fenced')throw e}const status=await next.request({op:'worker_status',executionId:'${id}'});if(status.protocol!=='browser-sandbox.worker/v2')throw Error('worker_epoch_regressed')}finally{old.close();next.close()}`,
+    );
+    report.resumedOldControllerReportedFencingWithoutDestructiveEvents = true;
+    report.workerEpochDidNotRegressAfterResume = true;
+    assertFencedOwner((await readEvents(current.pod)).slice(beforePauseEvents), id);
     assert.equal(
       (await list("worker")).find(
         (pod) => pod.metadata.labels[prefix + "execution"] === id,
@@ -604,9 +639,36 @@ export async function activeActive({
     );
     report.splitBrainFenced = true;
     stage = "rolling update";
-    await kubectl("rollout", "restart", `deployment/${deployment}`);
+    current = await peers(id);
+    const live = await startLive(id, current.pod);
+    const rollingEpoch = Number(current.lease.metadata.annotations[prefix + "epoch"]);
+    const rollingStarted = performance.now();
+    const rolling = kubectl("rollout", "restart", `deployment/${deployment}`);
+    rolling.catch(() => {});
+    await live.closed;
+    await wait(
+      "Graceful rollout did not hand off execution ownership",
+      () => owner(id),
+      (value) =>
+        value.pod &&
+        Number(value.lease.metadata.annotations[prefix + "epoch"]) > rollingEpoch,
+      45000,
+    );
+    await client("verify", id);
+    report.gracefulRollout = {
+      takeoverMs: performance.now() - rollingStarted,
+      samples: 1,
+      liveCdpBeforeShutdown: true,
+    };
+    await rolling;
     await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=180s");
     await client("verify", id);
+    assert.equal(
+      (await list("worker")).find(
+        (pod) => pod.metadata.labels[prefix + "execution"] === id,
+      ).metadata.uid,
+      worker.metadata.uid,
+    );
     report.rollingUpdatePreservedOriginalPageAndWorker = true;
     await client("finish", id);
     // A worker created through the normal adapter with no record is an orphan, claimed by one Lease winner.
@@ -639,32 +701,32 @@ export async function activeActive({
         !items.some((pod) => pod.metadata.labels[prefix + "execution"] === orphanId),
       90000,
     );
+    const removalCount = async () => {
+      const logs = await Promise.all(
+        (await list("controller")).map((pod) => kubectl("logs", pod.metadata.name)),
+      );
+      const removed = logs
+        .flatMap((text) =>
+          text.split("\n").flatMap((line) => {
+            try {
+              return [JSON.parse(line)];
+            } catch {
+              return [];
+            }
+          }),
+        )
+        .filter((event) => event.executionId === orphanId && event.type === "removed");
+      return removed.length;
+    };
     await wait(
       "Orphan removal event was not reported exactly once",
-      async () => {
-        const logs = await Promise.all(
-          (await list("controller")).map((pod) => kubectl("logs", pod.metadata.name)),
-        );
-        const removed = logs
-          .flatMap((text) =>
-            text.split("\n").flatMap((line) => {
-              try {
-                return [JSON.parse(line)];
-              } catch {
-                return [];
-              }
-            }),
-          )
-          .filter(
-            (event) => event.executionId === orphanId && event.type === "removed",
-          );
-        return removed.length;
-      },
+      removalCount,
       (count) => {
         assert(count <= 1, "Orphan was reclaimed more than once");
         return count === 1;
       },
     );
+    report.orphanObservationMs = await observeSingleRemoval(removalCount);
     report.orphanReclaimedOnce = true;
     await writeFile(
       "managed-results/active-active-kubernetes.json",

@@ -2,6 +2,7 @@ import type { ControlPeer } from "./network-control.js";
 import type { SessionStatus } from "./session.js";
 import type { ControlState } from "./takeover.js";
 
+export const LEGACY_WORKER_PROTOCOL = "browser-sandbox.worker/v1";
 export const WORKER_PROTOCOL = "browser-sandbox.worker/v2";
 export interface WorkerStatus {
   protocol: typeof WORKER_PROTOCOL;
@@ -22,7 +23,7 @@ export function workerIdleProtection(
   if (
     !status ||
     (status.protocol !== WORKER_PROTOCOL &&
-      !(allowLegacy && (status.protocol as string) === "browser-sandbox.worker/v1"))
+      !(allowLegacy && (status.protocol as string) === LEGACY_WORKER_PROTOCOL))
   )
     return "unknown";
   const session = status.session;

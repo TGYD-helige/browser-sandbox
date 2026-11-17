@@ -9,11 +9,8 @@ import {
 } from "./kubernetes-api.js";
 import { validProfileId } from "./local-profiles.js";
 
-export interface ExecutionOwner {
-  replica: string;
-  origin: string;
-  epoch: number;
-}
+import type { ExecutionOwner } from "./managed-backend.js";
+
 const prefix = "browser-sandbox.io/";
 // Kubernetes MicroTime requires six fractional digits.
 const renewTime = () => new Date().toISOString().replace("Z", "000Z");
@@ -23,6 +20,17 @@ const absent = (error: unknown) =>
   error instanceof KubernetesError && error.status === 404;
 const conflict = (error: unknown) =>
   error instanceof KubernetesError && error.status === 409;
+
+const validPeerOrigin = (value: string) => {
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "http:" && url.origin === value && !url.username && !url.password
+    );
+  } catch {
+    return false;
+  }
+};
 
 /** Kubernetes conditional writes own arbitration; cached observations only determine expiry. */
 export function createKubernetesOwnership(
@@ -48,13 +56,7 @@ export function createKubernetesOwnership(
     leaseMs > 60000
   )
     throw Error("browser_controller_configuration_invalid");
-  const address = new URL(options.peerOrigin);
-  if (
-    address.protocol !== "http:" ||
-    address.origin !== options.peerOrigin ||
-    address.username ||
-    address.password
-  )
+  if (!validPeerOrigin(options.peerOrigin))
     throw Error("browser_controller_configuration_invalid");
   const api = createKubernetesClient(options);
   const leases = `/apis/coordination.k8s.io/v1/namespaces/${options.namespace}/leases`;
@@ -66,6 +68,9 @@ export function createKubernetesOwnership(
   const name = (id: string) => `bs-${salt}-e-${id}`;
   const profileName = (id: string) =>
     `bs-${salt}-p-${createHash("sha256").update(options.installation).update("\0").update(id).digest("hex").slice(0, 32)}`;
+  const selector = encodeURIComponent(
+    `${prefix}installation=${options.installation},${prefix}state=execution`,
+  );
   const labels = {
     [prefix + "installation"]: options.installation,
     [prefix + "state"]: "execution",
@@ -74,6 +79,11 @@ export function createKubernetesOwnership(
   const owned = new Map<string, { epoch: number; deadline: number; ready: boolean }>();
   const records = new Map<string, ExecutionRecord>();
   const legacyCapabilities = new Map<string, string>();
+  const legacyByExecution = new Map<string, Set<string>>();
+  const clearLegacy = (id: string) => {
+    for (const hash of legacyByExecution.get(id) ?? []) legacyCapabilities.delete(hash);
+    legacyByExecution.delete(id);
+  };
   const life = new AbortController();
   let watching: Promise<void>;
   let leaseVersion = "";
@@ -103,30 +113,11 @@ export function createKubernetesOwnership(
     if (
       !Number.isSafeInteger(epoch) ||
       epoch < 1 ||
+      !validPeerOrigin(lease.metadata.annotations?.[prefix + "peer"]) ||
       !Number.isSafeInteger(lease.spec?.leaseDurationSeconds) ||
       lease.spec.leaseDurationSeconds < 1
     )
       throw Error("browser_controller_state_corrupt");
-    const legacy = lease.metadata.annotations[prefix + "legacy-capabilities"];
-    if (legacy !== undefined) {
-      let hashes: unknown;
-      try {
-        hashes = JSON.parse(legacy);
-      } catch {
-        throw Error("browser_controller_state_corrupt");
-      }
-      if (
-        !Array.isArray(hashes) ||
-        hashes.length > 2000 ||
-        hashes.some((hash) => typeof hash !== "string" || !/^[a-f0-9]{64}$/.test(hash))
-      )
-        throw Error("browser_controller_state_corrupt");
-      for (const hash of hashes) {
-        if (!legacyCapabilities.has(hash) && legacyCapabilities.size >= 200000)
-          throw Error("browser_execution_capacity_exceeded");
-        legacyCapabilities.set(hash, id);
-      }
-    }
     const previous = observed.get(id);
     if (previous) {
       const priorEpoch = Number(previous.lease.metadata.annotations[prefix + "epoch"]);
@@ -137,6 +128,33 @@ export function createKubernetesOwnership(
           epoch: priorEpoch,
         } as ExecutionOwner;
     }
+    const legacy = lease.metadata.annotations[prefix + "legacy-capabilities"];
+    let hashes: unknown = [];
+    try {
+      if (legacy !== undefined) hashes = JSON.parse(legacy);
+    } catch {
+      throw Error("browser_controller_state_corrupt");
+    }
+    if (
+      !Array.isArray(hashes) ||
+      hashes.length > 2000 ||
+      hashes.some(
+        (hash) =>
+          typeof hash !== "string" ||
+          !/^[a-f0-9]{64}$/.test(hash) ||
+          (legacyCapabilities.has(hash) && legacyCapabilities.get(hash) !== id),
+      )
+    )
+      throw Error("browser_controller_state_corrupt");
+    const next = new Set<string>(hashes);
+    if (
+      legacyCapabilities.size - (legacyByExecution.get(id)?.size ?? 0) + next.size >
+      200000
+    )
+      throw Error("browser_execution_capacity_exceeded");
+    clearLegacy(id);
+    legacyByExecution.set(id, next);
+    for (const hash of next) legacyCapabilities.set(hash, id);
     if (previous?.lease.metadata.resourceVersion !== lease.metadata.resourceVersion)
       observed.set(id, { lease, changedAt: now() });
     if (
@@ -219,13 +237,66 @@ export function createKubernetesOwnership(
       throw Error("browser_execution_record_too_large");
     return { record: Buffer.from(json).toString("base64") };
   };
+  const fenceProfile = async (id: string, epoch: number, record?: ExecutionRecord) => {
+    const profileId = record?.data.profileId;
+    if (profileId === undefined) return;
+    if (typeof profileId !== "string" || !validProfileId(profileId))
+      throw Error("browser_profile_id_invalid");
+    const key = profileName(profileId),
+      path = `${leases}/${key}`;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const previous = await get(path);
+      if (previous) {
+        verify(previous, key, "profile");
+        if (previous.spec?.holderIdentity && previous.spec.holderIdentity !== id) {
+          if (record.data.phase === "finished" || record.data.profileAcquired === false)
+            return;
+          throw Error("browser_profile_busy");
+        }
+        const same = previous.metadata.annotations?.[prefix + "execution"] === id;
+        const priorEpoch = Number(previous.metadata.annotations?.[prefix + "epoch"]);
+        if (same && priorEpoch > epoch) throw Error("browser_controller_fenced");
+        if (same && priorEpoch === epoch) return;
+      }
+      try {
+        await api(
+          previous ? path : leases,
+          previous ? "PUT" : "POST",
+          {
+            apiVersion: "coordination.k8s.io/v1",
+            kind: "Lease",
+            metadata: {
+              name: key,
+              labels: { ...labels, [prefix + "state"]: "profile" },
+              annotations: {
+                [prefix + "epoch"]: String(epoch),
+                [prefix + "execution"]: id,
+              },
+              ...(previous
+                ? { resourceVersion: previous.metadata.resourceVersion }
+                : {}),
+            },
+            spec: { holderIdentity: previous?.spec?.holderIdentity ?? "" },
+          },
+          signal(),
+        );
+        return;
+      } catch (error) {
+        if (!conflict(error)) throw error;
+      }
+    }
+    throw Error("browser_controller_owner_moved");
+  };
   const handoff = async (id: string, epoch: number) => {
     for (let attempt = 0; attempt < 16; attempt++) {
       await assertOwned(id);
       const secret = await get(`${secrets}/${name(id)}`);
       const body = secret && decode(secret, id);
       if (body && body.epoch > epoch) throw Error("browser_controller_fenced");
-      if (body?.epoch === epoch) return;
+      if (body?.epoch === epoch) {
+        await fenceProfile(id, epoch, body.record);
+        return;
+      }
       try {
         await api(
           secret ? `${secrets}/${name(id)}` : secrets,
@@ -243,6 +314,7 @@ export function createKubernetesOwnership(
           },
           signal(),
         );
+        await fenceProfile(id, epoch, body?.record);
         return;
       } catch (error) {
         if (!conflict(error)) throw error;
@@ -341,15 +413,18 @@ export function createKubernetesOwnership(
     if (body.record) records.set(id, body.record);
     return body.record;
   };
-  const write = async (id: string, revision: number, data: Record<string, unknown>) => {
-    const epoch = await assertOwned(id);
+  const readOwnedRecord = async (id: string, allowMissing = false) => {
+    const { epoch, lease } = await readOwnedLease(id);
     const secret = await get(`${secrets}/${name(id)}`);
-    if (!secret) throw Error("browser_controller_state_corrupt");
-    const body = decode(secret, id);
-    if (body.epoch !== epoch) {
+    const body = secret && decode(secret, id);
+    if ((!body && !allowMissing) || (body && body.epoch !== epoch)) {
       forget(id);
       throw Error("browser_controller_fenced");
     }
+    return { epoch, lease, secret, body };
+  };
+  const write = async (id: string, revision: number, data: Record<string, unknown>) => {
+    const { epoch, secret, body } = await readOwnedRecord(id);
     if ((body.record?.revision ?? 0) !== revision)
       throw Error(
         revision ? "browser_execution_record_changed" : "browser_execution_revoked",
@@ -376,10 +451,7 @@ export function createKubernetesOwnership(
     if (!validProfileId(profileId)) throw Error("browser_profile_id_invalid");
     const path = `${leases}/${profileName(profileId)}`;
     const previous = await get(path);
-    const epoch = await assertOwned(id);
-    const recordSecret = await get(`${secrets}/${name(id)}`);
-    const body = recordSecret && decode(recordSecret, id);
-    if (!body || body.epoch !== epoch) throw Error("browser_controller_fenced");
+    const { epoch, body } = await readOwnedRecord(id);
     if (!body.record || body.record.data.profileId !== profileId)
       throw Error("browser_profile_binding_invalid");
     if (
@@ -436,7 +508,7 @@ export function createKubernetesOwnership(
   };
   const indexLegacy = async (record: ExecutionRecord) => {
     const id = record.executionId;
-    const { epoch, lease } = await readOwnedLease(id);
+    const { lease } = await readOwnedLease(id);
     const grants = Array.isArray(record.data.grants) ? record.data.grants : [];
     const hashes = grants.map((grant: any) => {
       if (!/^[a-f0-9]{64}$/.test(grant.token))
@@ -461,8 +533,8 @@ export function createKubernetesOwnership(
     observe(updated);
   };
   const complete = async (id: string) => {
-    const { epoch, lease } = await readOwnedLease(id);
-    const record = await read(id);
+    const { epoch, lease, body } = await readOwnedRecord(id);
+    const record = body.record;
     if (record?.data.phase !== "finished")
       throw Error("browser_execution_record_changed");
     if (record.data.profileId) await profile(id, String(record.data.profileId), true);
@@ -502,14 +574,8 @@ export function createKubernetesOwnership(
     for (const [id] of finished.slice(0, Math.max(0, finished.length - maxFinished))) {
       await resolve(id);
       if (!owned.has(id)) continue;
-      const { epoch, lease } = await readOwnedLease(id);
-      const secret = await get(`${secrets}/${name(id)}`);
-      const body = secret && decode(secret, id);
-      if (
-        secret &&
-        (body.epoch !== epoch || (body.record && body.record.data.phase !== "finished"))
-      )
-        continue;
+      const { lease, secret, body } = await readOwnedRecord(id, true);
+      if (body?.record && body.record.data.phase !== "finished") continue;
       if (body?.record?.data.profileId)
         await profile(id, String(body.record.data.profileId), true);
       if (secret)
@@ -531,8 +597,7 @@ export function createKubernetesOwnership(
       );
       observed.delete(id);
       records.delete(id);
-      for (const [hash, executionId] of legacyCapabilities)
-        if (executionId === id) legacyCapabilities.delete(hash);
+      clearLegacy(id);
       forget(id);
     }
   };
@@ -570,7 +635,20 @@ export function createKubernetesOwnership(
     })().finally(() => {
       renewing = undefined;
     }));
+  const renewal = setInterval(() => {
+    void renew().catch(() => {});
+  }, leaseMs / 3);
+  renewal.unref();
   return {
+    lookup(id: string): ExecutionOwner | undefined {
+      const lease = observed.get(id)?.lease;
+      if (!lease) return;
+      return {
+        replica: lease.spec.holderIdentity,
+        origin: lease.metadata.annotations[prefix + "peer"],
+        epoch: Number(lease.metadata.annotations[prefix + "epoch"]),
+      };
+    },
     resolve,
     assertOwned,
     complete,
@@ -580,13 +658,46 @@ export function createKubernetesOwnership(
       return legacyCapabilities.get(createHash("sha256").update(token).digest("hex"));
     },
     indexLegacy,
+    async migrationComplete() {
+      const marker = await get(`${secrets}/bs-${salt}-journal-import`);
+      if (!marker) return false;
+      verify(marker, `bs-${salt}-journal-import`, "migration");
+      if (
+        marker.data?.protocol !==
+        Buffer.from("browser-sandbox.journal-import/v1").toString("base64")
+      )
+        throw Error("browser_controller_state_corrupt");
+      return true;
+    },
+    async finishMigration() {
+      try {
+        await api(
+          secrets,
+          "POST",
+          {
+            apiVersion: "v1",
+            kind: "Secret",
+            type: "Opaque",
+            metadata: {
+              name: `bs-${salt}-journal-import`,
+              labels: { ...labels, [prefix + "state"]: "migration" },
+            },
+            data: {
+              protocol: Buffer.from("browser-sandbox.journal-import/v1").toString(
+                "base64",
+              ),
+            },
+          },
+          signal(),
+        );
+      } catch (error) {
+        if (!conflict(error)) throw error;
+      }
+    },
     async importRecord(record: ExecutionRecord) {
       const id = record.executionId;
-      const epoch = await assertOwned(id);
-      const secret = await get(`${secrets}/${name(id)}`);
-      const body = secret && decode(secret, id);
-      if (!body || body.epoch !== epoch || body.record)
-        throw Error("browser_execution_migration_conflict");
+      const { epoch, secret, body } = await readOwnedRecord(id);
+      if (body.record) throw Error("browser_execution_migration_conflict");
       await api(
         `${secrets}/${name(id)}`,
         "PUT",
@@ -619,7 +730,7 @@ export function createKubernetesOwnership(
       let count = 0;
       do {
         const page = await api(
-          `${leases}?labelSelector=${encodeURIComponent(`${prefix}installation=${options.installation},${prefix}state=execution`)}&limit=100&continue=${encodeURIComponent(cursor)}`,
+          `${leases}?labelSelector=${selector}&limit=100&continue=${encodeURIComponent(cursor)}`,
           "GET",
           undefined,
           signal(),
@@ -644,7 +755,7 @@ export function createKubernetesOwnership(
         while (!life.signal.aborted) {
           try {
             await api(
-              `${leases}?watch=true&allowWatchBookmarks=true&timeoutSeconds=10&labelSelector=${encodeURIComponent(`${prefix}installation=${options.installation},${prefix}state=execution`)}&resourceVersion=${encodeURIComponent(leaseVersion)}`,
+              `${leases}?watch=true&allowWatchBookmarks=true&timeoutSeconds=10&labelSelector=${selector}&resourceVersion=${encodeURIComponent(leaseVersion)}`,
               "GET",
               undefined,
               signal(),
@@ -658,6 +769,7 @@ export function createKubernetesOwnership(
                 if (event.type === "DELETED") {
                   const id = event.object?.metadata?.labels?.[prefix + "execution"];
                   observed.delete(id);
+                  clearLegacy(id);
                   records.delete(id);
                   forget(id);
                 }
@@ -672,11 +784,14 @@ export function createKubernetesOwnership(
     },
     async close() {
       clearInterval(expiry);
+      clearInterval(renewal);
       life.abort();
       await watching;
       await renewing;
     },
     async release() {
+      clearInterval(renewal);
+      await renewing;
       for (const id of [...owned.keys()]) {
         try {
           const { lease } = await readOwnedLease(id);
