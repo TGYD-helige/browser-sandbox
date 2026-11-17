@@ -29,10 +29,14 @@ export function createKubernetesOwnership(
     replica: string;
     peerOrigin: string;
     leaseMs?: number;
+    maxFinished?: number;
     now?: () => number;
   },
 ) {
   const leaseMs = options.leaseMs ?? 15000;
+  const maxFinished = options.maxFinished ?? 65536;
+  if (!Number.isSafeInteger(maxFinished) || maxFinished < 1 || maxFinished > 65536)
+    throw Error("browser_controller_configuration_invalid");
   const now = options.now ?? (() => performance.now());
   if (
     !options.installation ||
@@ -84,6 +88,10 @@ export function createKubernetesOwnership(
   const forget = (id: string) => {
     if (owned.delete(id)) lost(id);
   };
+  const expiry = setInterval(() => {
+    for (const [id, local] of owned) if (now() >= local.deadline) forget(id);
+  }, 100);
+  expiry.unref();
   const observe = (lease: any) => {
     const id = lease.metadata?.labels?.[prefix + "execution"];
     if (!validId(id)) throw Error("browser_controller_state_corrupt");
@@ -328,11 +336,17 @@ export function createKubernetesOwnership(
   const profile = async (id: string, profileId: string, release: boolean) => {
     if (!validProfileId(profileId)) throw Error("browser_profile_id_invalid");
     const epoch = await assertOwned(id);
+    const recordSecret = await get(`${secrets}/${name(id)}`);
+    if (!recordSecret || decode(recordSecret, id).epoch !== epoch)
+      throw Error("browser_controller_fenced");
     const path = `${leases}/${profileName(profileId)}`;
     const previous = await get(path);
     if (previous) {
       verify(previous, profileName(profileId), "profile");
-      if (previous.spec?.holderIdentity !== id) throw Error("browser_profile_busy");
+      if (previous.spec?.holderIdentity !== id) {
+        if (release) return;
+        throw Error("browser_profile_busy");
+      }
       if (Number(previous.metadata.annotations?.[prefix + "epoch"]) > epoch)
         throw Error("browser_controller_fenced");
     }
@@ -372,9 +386,128 @@ export function createKubernetesOwnership(
       throw error;
     }
   };
+  const complete = async (id: string) => {
+    const epoch = await assertOwned(id);
+    const record = await read(id);
+    if (record?.data.phase !== "finished")
+      throw Error("browser_execution_record_changed");
+    if (record.data.profileId) await profile(id, String(record.data.profileId), true);
+    const lease = observed.get(id).lease;
+    const updated = await api(
+      `${leases}/${name(id)}`,
+      "PUT",
+      {
+        ...lease,
+        metadata: {
+          ...lease.metadata,
+          annotations: {
+            ...lease.metadata.annotations,
+            [prefix + "phase"]: "finished",
+            [prefix + "finished-at"]:
+              lease.metadata.annotations[prefix + "finished-at"] ?? String(Date.now()),
+            [prefix + "epoch"]: String(epoch),
+          },
+        },
+        spec: { ...lease.spec, holderIdentity: "" },
+      },
+      signal(),
+    );
+    observe(updated);
+    forget(id);
+  };
+  const compact = async () => {
+    const finished = [...observed.entries()]
+      .filter(
+        ([, entry]) =>
+          entry.lease.metadata.annotations[prefix + "phase"] === "finished",
+      )
+      .sort(
+        (a, b) =>
+          Number(a[1].lease.metadata.annotations[prefix + "finished-at"]) -
+          Number(b[1].lease.metadata.annotations[prefix + "finished-at"]),
+      );
+    for (const [id] of finished.slice(0, Math.max(0, finished.length - maxFinished))) {
+      await resolve(id);
+      if (!owned.has(id)) continue;
+      const epoch = await assertOwned(id);
+      const secret = await get(`${secrets}/${name(id)}`);
+      const body = secret && decode(secret, id);
+      if (body?.epoch !== epoch || body.record?.data.phase !== "finished") continue;
+      if (body.record.data.profileId)
+        await profile(id, String(body.record.data.profileId), true);
+      await api(
+        `${secrets}/${name(id)}`,
+        "DELETE",
+        { preconditions: { resourceVersion: secret.metadata.resourceVersion } },
+        signal(),
+      );
+      await api(
+        `${leases}/${name(id)}`,
+        "DELETE",
+        {
+          preconditions: {
+            resourceVersion: observed.get(id).lease.metadata.resourceVersion,
+          },
+        },
+        signal(),
+      );
+      observed.delete(id);
+      records.delete(id);
+      forget(id);
+    }
+  };
+  let renewing: Promise<void>;
+  const renew = () =>
+    (renewing ??= (async () => {
+      const entries = [...owned];
+      for (let start = 0; start < entries.length; start += 8)
+        await Promise.all(
+          entries.slice(start, start + 8).map(async ([id, local]) => {
+            try {
+              await assertOwned(id);
+              const started = now();
+              const lease = observed.get(id).lease;
+              const updated = await api(
+                `${leases}/${name(id)}`,
+                "PUT",
+                {
+                  ...lease,
+                  spec: { ...lease.spec, renewTime: new Date().toISOString() },
+                },
+                signal(),
+              );
+              observe(updated);
+              if (owned.get(id) === local) local.deadline = started + leaseMs;
+            } catch (error) {
+              if (
+                conflict(error) ||
+                now() >= local.deadline ||
+                (error as Error).message === "browser_controller_fenced"
+              )
+                forget(id);
+            }
+          }),
+        );
+    })().finally(() => {
+      renewing = undefined;
+    }));
   return {
     resolve,
     assertOwned,
+    complete,
+    compact,
+    async findCapability(token: string) {
+      if (!/^[a-f0-9]{64}$/.test(token)) return undefined;
+      // shortcut: pre-routing URLs require a bounded legacy scan; renew grants to use execution-scoped routing.
+      for (const id of observed.keys()) {
+        const record = await read(id);
+        if (
+          Array.isArray(record?.data.grants) &&
+          record.data.grants.some((grant: any) => grant.token === token)
+        )
+          return id;
+      }
+    },
     async importRecord(record: ExecutionRecord) {
       const id = record.executionId;
       const epoch = await assertOwned(id);
@@ -418,38 +551,21 @@ export function createKubernetesOwnership(
           undefined,
           signal(),
         );
-        if (!Array.isArray(page.items) || (count += page.items.length) > 65536)
+        if (!Array.isArray(page.items) || (count += page.items.length) > 131072)
           throw Error("browser_execution_capacity_exceeded");
         for (const lease of page.items) observe(lease);
         leaseVersion = page.metadata?.resourceVersion ?? leaseVersion;
         cursor = page.metadata?.continue ?? "";
       } while (cursor);
-      return [...observed.keys()];
+      await compact();
+      return [...observed]
+        .filter(
+          ([, entry]) =>
+            entry.lease.metadata.annotations[prefix + "phase"] !== "finished",
+        )
+        .map(([id]) => id);
     },
-    async renew() {
-      for (const [id, local] of [...owned]) {
-        try {
-          await assertOwned(id);
-          const started = now();
-          const lease = observed.get(id).lease;
-          const updated = await api(
-            `${leases}/${name(id)}`,
-            "PUT",
-            { ...lease, spec: { ...lease.spec, renewTime: new Date().toISOString() } },
-            signal(),
-          );
-          observe(updated);
-          if (owned.get(id) === local) local.deadline = started + leaseMs;
-        } catch (error) {
-          if (
-            conflict(error) ||
-            now() >= local.deadline ||
-            (error as Error).message === "browser_controller_fenced"
-          )
-            forget(id);
-        }
-      }
-    },
+    renew,
     watch() {
       return (watching ??= (async () => {
         while (!life.signal.aborted) {
@@ -482,8 +598,10 @@ export function createKubernetesOwnership(
       })());
     },
     async close() {
+      clearInterval(expiry);
       life.abort();
       await watching;
+      await renewing;
     },
     async release() {
       for (const id of [...owned.keys()]) {

@@ -372,6 +372,38 @@ export async function activeActive({
     current = await peers(id);
     paused = current.pod.metadata.name;
     const oldEpoch = Number(current.lease.metadata.annotations[prefix + "epoch"]);
+    const readyFile = `/tmp/ha-stale-${id}.ready`;
+    const releaseFile = `/tmp/ha-stale-${id}.release`;
+    // Keep the actual pre-takeover Secret resourceVersion in a waiting protocol client.
+    const staleProbe = kubectl(
+      "exec",
+      paused,
+      "--",
+      "node",
+      "--input-type=module",
+      "-e",
+      `import{readFile,writeFile}from'node:fs/promises';import{setTimeout as delay}from'node:timers/promises';import{createKubernetesClient,readKubernetesAccess,KubernetesError}from'/opt/browser-sandbox/dist/kubernetes-api.js';const access=await readKubernetesAccess();const api=createKubernetesClient(access);const path='/api/v1/namespaces/'+access.namespace+'/secrets/${current.lease.metadata.name}';const secret=await api(path,'GET',undefined,AbortSignal.timeout(5000));await writeFile('${readyFile}','ready');const deadline=Date.now()+60000;while(true){try{await readFile('${releaseFile}');break}catch(e){if(e.code!=='ENOENT')throw e}if(Date.now()>deadline)throw Error('probe_timeout');await delay(25)}try{await api(path,'PUT',secret,AbortSignal.timeout(5000));throw Error('stale_write_accepted')}catch(e){if(!(e instanceof KubernetesError)||e.status!==409)throw e}`,
+    );
+    staleProbe.catch(() => {});
+    await wait(
+      "Stale writer did not capture the old Secret",
+      async () => {
+        try {
+          await kubectl(
+            "exec",
+            paused,
+            "--",
+            "node",
+            "-e",
+            `require('node:fs').readFileSync('${readyFile}')`,
+          );
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      Boolean,
+    );
     await kubectl("exec", paused, "--", "node", "-e", "process.kill(1,'SIGSTOP')");
     const next = await wait(
       "Paused owner was not fenced by takeover",
@@ -394,16 +426,15 @@ export async function activeActive({
     await kubectl("exec", paused, "--", "node", "-e", "process.kill(1,'SIGCONT')");
     paused = undefined;
     await client("verify", id);
-    const staleWrite = await kubectl(
+    await kubectl(
       "exec",
       current.pod.metadata.name,
       "--",
       "node",
-      "--input-type=module",
       "-e",
-      `import{createKubernetesOwnership}from'/opt/browser-sandbox/dist/kubernetes-ownership.js';import{readKubernetesAccess}from'/opt/browser-sandbox/dist/kubernetes-api.js';const o=createKubernetesOwnership({...await readKubernetesAccess(),installation:'ha',replica:'${current.pod.metadata.uid}',peerOrigin:'http://${current.pod.status.podIP}:8084'});try{await o.journal.update('${id}',1,{phase:'finished'});process.exitCode=1}catch(e){if(e.message!=='browser_controller_fenced')throw e}finally{await o.close()}`,
+      `require('node:fs').writeFileSync('${releaseFile}','go')`,
     );
-    assert.equal(staleWrite, "");
+    await staleProbe;
     assert.equal(
       (await list("worker")).find(
         (pod) => pod.metadata.labels[prefix + "execution"] === id,

@@ -9,6 +9,7 @@ import { waitForControl } from "./automation-control.js";
 import {
   createHostForwarding,
   forwardControllerRequest,
+  forwardControllerViewer,
 } from "./controller-forwarding.js";
 import { createExecutionJournal } from "./execution-journal.js";
 import { MAX_FILE_BYTES } from "./files.js";
@@ -1210,8 +1211,7 @@ export async function createController(options: ControllerOptions) {
       }
       binding.phase = "finished";
       await persist(binding);
-      if (binding.profileId && ownership)
-        await ownership.releaseProfile(id, binding.profileId);
+      if (ownership) await ownership.complete(id);
       binding.storageDisconnect?.();
       binding.storageConnection?.close();
       await binding.volumeAdapter?.close();
@@ -1443,6 +1443,18 @@ export async function createController(options: ControllerOptions) {
                 auth = JSON.parse(String(raw));
               } catch {
                 throw Error("browser_access_denied");
+              }
+              if (ownership && !req.executionId && auth?.type === "authenticate") {
+                const id = await ownership.findCapability(auth.token);
+                if (id) {
+                  const owner = await ownership.resolve(id);
+                  if (owner && !ownership.owns(id)) {
+                    if (forwarded) throw Error("browser_controller_owner_moved");
+                    forwardControllerViewer(client, owner.origin, id, auth.token);
+                    return;
+                  }
+                  await loadOwned(id);
+                }
               }
               grant =
                 auth?.type === "authenticate" &&
@@ -1746,6 +1758,7 @@ export async function createController(options: ControllerOptions) {
         const record = await ownership.journal.read(id);
         if (!record) return;
         if (record.data.phase === "finished") {
+          await ownership.complete(id);
           rememberFinished(id);
           return;
         }
@@ -1790,8 +1803,10 @@ export async function createController(options: ControllerOptions) {
   async function routeAgent(req, destination, head?: Buffer, forwarded = false) {
     if (!ownership) return false;
     const match = /^\/execution\/([a-f0-9-]{36})\/(.+)$/.exec(req.url ?? "");
-    if (!match) return false;
-    const id = match[1];
+    const legacy = /^\/execution\/([a-f0-9]{64})(?:\/|$)/.exec(req.url ?? "");
+    const id =
+      match?.[1] ?? (legacy ? await ownership.findCapability(legacy[1]) : undefined);
+    if (!id) return false;
     const owner = await ownership.resolve(id);
     if (!owner) throw Error("browser_access_denied");
     if (!ownership.owns(id)) {
@@ -1801,7 +1816,8 @@ export async function createController(options: ControllerOptions) {
     }
     await loadOwned(id);
     req.executionId = id;
-    req.url = match[2] === "view/socket" ? "/view/socket" : `/execution/${match[2]}`;
+    if (match)
+      req.url = match[2] === "view/socket" ? "/view/socket" : `/execution/${match[2]}`;
     return false;
   }
   const peerServer = ownership

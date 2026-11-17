@@ -9,16 +9,17 @@ import { importExecutionJournal } from "../dist/kubernetes-migration.js";
 import { createKubernetesOwnership } from "../dist/kubernetes-ownership.js";
 import { createControllerRuntime } from "../dist/network-control.js";
 
-async function fixture(t) {
+async function fixture(t, extra = {}) {
   const objects = new Map();
   const cleanups = [];
+  const state = {};
   let version = 0;
   const server = createServer(async (req, res) => {
     let input = "";
     for await (const chunk of req) input += chunk;
     const body = input ? JSON.parse(input) : undefined;
     const path = req.url.split("?")[0];
-    const previous = objects.get(path);
+    let previous = objects.get(path);
     const reply = (status, value = {}) =>
       res
         .writeHead(status, { "content-type": "application/json" })
@@ -46,6 +47,8 @@ async function fixture(t) {
     }
     if (!previous) return reply(404);
     if (req.method === "PUT") {
+      await state.beforeWrite?.(path, body);
+      previous = objects.get(path);
       if (body.metadata.resourceVersion !== previous.metadata.resourceVersion)
         return reply(409);
       body.metadata.resourceVersion = String(++version);
@@ -75,6 +78,7 @@ async function fixture(t) {
     apiServer: `http://127.0.0.1:${server.address().port}`,
     leaseMs: 15000,
     now: () => now,
+    ...extra,
   };
   const ports = [];
   for (let i = 0; i < 2; i++) {
@@ -101,6 +105,7 @@ async function fixture(t) {
     a,
     b,
     objects,
+    state,
     ports,
     cleanups,
     advance: (ms) => {
@@ -236,6 +241,11 @@ test("host and HTTP requests forward once, and the same capability URL survives 
   const response = await fetch(`${controllers[peerIndex].origin}${path}/session`);
   assert.equal(response.status, 200);
   assert.equal((await response.json()).state, "unused");
+  const legacyPath = `/execution/${path.split("/").at(-1)}/session`;
+  assert.equal(
+    (await fetch(`${controllers[peerIndex].origin}${legacyPath}`)).status,
+    200,
+  );
   const twice = await fetch(`http://127.0.0.1:${ports[peerIndex]}${path}/session`);
   assert.equal(twice.status, 503);
   assert.equal((await twice.json()).error, "browser_controller_owner_moved");
@@ -254,4 +264,74 @@ test("host and HTTP requests forward once, and the same capability URL survives 
     action: "status",
   });
   assert.equal(forwarded.state, "unused");
+});
+
+test("an in-flight old-epoch Secret write loses its conditional update across takeover", async (t) => {
+  const { a, b, state, advance } = await fixture(t);
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "registered" });
+  await b.resolve(id);
+  const entered = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  state.beforeWrite = async (path) => {
+    if (!path.includes("/secrets/")) return;
+    state.beforeWrite = undefined;
+    entered.resolve();
+    await resume.promise;
+  };
+  const pending = a.journal.update(id, 1, { phase: "finished" });
+  const rejected = assert.rejects(pending, /browser_controller_fenced/);
+  await entered.promise;
+  advance(15001);
+  await b.resolve(id);
+  resume.resolve();
+  await rejected;
+  assert.equal((await b.journal.read(id)).data.phase, "registered");
+});
+
+test("finished recovery releases a stranded Profile lease and bounds shared finished fences", async (t) => {
+  const { a, b, advance, objects } = await fixture(t, { maxFinished: 1 });
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "registered", profileId: "stranded" });
+  await a.acquireProfile(id, "stranded");
+  await a.journal.update(id, 1, { phase: "finished", profileId: "stranded" });
+  await b.resolve(id);
+  advance(15001);
+  await b.resolve(id);
+  await b.complete(id);
+  await b.resolve(other, true);
+  await b.journal.create(other, { phase: "finished", profileId: "stranded" });
+  await b.acquireProfile(other, "stranded");
+  await b.complete(other);
+  await b.refresh();
+  assert.equal(await b.journal.read(id), undefined);
+  assert.equal((await b.journal.read(other)).data.phase, "finished");
+  const state = [...objects.values()].filter(
+    (object) => object.metadata.labels["browser-sandbox.io/state"] === "execution",
+  );
+  assert.equal(
+    state.length,
+    2,
+    "One retained finished fence has one Lease and one Secret",
+  );
+});
+
+test("lease renewal passes share one bounded operation", async (t) => {
+  const { a, state } = await fixture(t);
+  await a.resolve(id, true);
+  const entered = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  state.beforeWrite = async (path) => {
+    if (!path.includes("/leases/")) return;
+    state.beforeWrite = undefined;
+    entered.resolve();
+    await resume.promise;
+  };
+  const first = a.renew();
+  await entered.promise;
+  const second = a.renew();
+  assert.equal(first, second);
+  resume.resolve();
+  await Promise.all([first, second]);
+  assert.equal(a.owns(id), true);
 });

@@ -1,7 +1,7 @@
 import { type IncomingMessage, request, type ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import { pipeline } from "node:stream";
-import WebSocket from "ws";
+import WebSocket, { createWebSocketStream } from "ws";
 import { type ControlPeer, connectPeer } from "./network-control.js";
 
 /** A separate listener, rather than a caller-controlled header, is the one-hop marker. */
@@ -51,7 +51,10 @@ export function forwardControllerRequest(
 }
 
 export function createHostForwarding() {
-  const peers = new WeakMap<ControlPeer, Map<string, ReturnType<typeof connectPeer>>>();
+  const peers = new WeakMap<
+    ControlPeer,
+    Map<string, { rpc: ReturnType<typeof connectPeer>; ready: Promise<void> }>
+  >();
   const sockets = new Set<WebSocket>();
   return {
     async request(
@@ -66,8 +69,8 @@ export function createHostForwarding() {
         owners = new Map();
         peers.set(peer, owners);
       }
-      let rpc = owners.get(origin);
-      if (!rpc || rpc.signal.aborted) {
+      let connection = owners.get(origin);
+      if (!connection || connection.rpc.signal.aborted) {
         const url = new URL("/host", origin);
         url.protocol = "ws:";
         const socket = new WebSocket(url, {
@@ -81,20 +84,62 @@ export function createHostForwarding() {
           sockets.delete(socket);
           peer.signal.removeEventListener("abort", close);
         });
-        rpc = connectPeer(socket, (input, callbackSignal) =>
+        const rpc = connectPeer(socket, (input, callbackSignal) =>
           peer.callback(input.op, input, callbackSignal),
         );
-        owners.set(origin, rpc);
-        await new Promise<void>((resolve, reject) => {
+        const ready = new Promise<void>((resolve, reject) => {
           socket.once("open", resolve);
           socket.once("error", () => reject(Error("browser_controller_owner_moved")));
           socket.once("close", () => reject(Error("browser_controller_owner_moved")));
         });
+        ready.catch(() => {});
+        connection = { rpc, ready };
+        owners.set(origin, connection);
       }
-      return rpc.call(request, { signal });
+      await connection.ready;
+      return connection.rpc.call(request, { signal });
     },
     close() {
       for (const socket of sockets) socket.terminate();
     },
   };
+}
+
+/** Legacy viewers reveal their routing identity in the first authenticated frame. */
+export function forwardControllerViewer(
+  client: WebSocket,
+  origin: string,
+  executionId: string,
+  token: string,
+) {
+  const upstream = new WebSocket(
+    `${origin.replace(/^http/, "ws")}/execution/${executionId}/view/socket`,
+    { maxPayload: 32 * 1024 * 1024, handshakeTimeout: 10000 },
+  );
+  const downstream = createWebSocketStream(client, {
+    readableObjectMode: true,
+    decodeStrings: false,
+    highWaterMark: 1,
+  });
+  const incoming = createWebSocketStream(upstream, {
+    readableObjectMode: true,
+    decodeStrings: false,
+    highWaterMark: 1,
+  });
+  const close = () => {
+    downstream.destroy();
+    incoming.destroy();
+    client.terminate();
+    upstream.terminate();
+  };
+  client.once("error", close);
+  client.once("close", close);
+  upstream.once("error", close);
+  upstream.once("close", close);
+  upstream.once("open", () => {
+    upstream.send(JSON.stringify({ type: "authenticate", token }));
+    pipeline(downstream, incoming, close);
+    pipeline(incoming, downstream, close);
+    client.resume();
+  });
 }
