@@ -1941,6 +1941,7 @@ test("a late absent Secret POST retains old UID and handoff removes it", async (
   assert.notEqual(next.uid, oldUid);
   const fresh = [...objects.values()].find((value) => value.kind === "Secret");
   assert.equal(fresh.metadata.ownerReferences[0].uid, next.uid);
+  assert.notEqual(fresh.metadata.uid, stale.metadata.uid);
   await b.journal.create(id, { phase: "registered" });
 });
 
@@ -2343,4 +2344,36 @@ test("failed shared recovery closes the worker channel restored before a later c
     /browser_execution_journal_corrupt/,
   );
   assert(closed > 0);
+});
+
+test("a recreated Lease cannot inherit an old UID Secret’s record or grants while GC is pending", async (t) => {
+  const { a, b, objects } = await fixture(t);
+  const prior = await a.resolve(id, true);
+  // Synthetic retained old record: GC has not removed this UID's Secret yet.
+  await a.journal.create(id, {
+    phase: "registered",
+    grants: [{ token: "a".repeat(64) }],
+    marker: "old-identity",
+  });
+  const oldSecret = [...objects.values()].find((value) => value.kind === "Secret");
+  const leasePath = [...objects].find(
+    ([, value]) => value.kind === "Lease" && value.metadata.uid === prior.uid,
+  )[0];
+  objects.delete(leasePath);
+  const current = await b.resolve(id, true);
+  assert.equal(current.epoch, 1);
+  assert.notEqual(current.uid, prior.uid);
+  assert.equal(await b.journal.read(id), undefined);
+  const newSecret = [...objects.values()].find((value) => value.kind === "Secret");
+  assert.notEqual(newSecret.metadata.uid, oldSecret.metadata.uid);
+  await b.journal.create(id, {
+    phase: "registered",
+    grants: [],
+    marker: "new-identity",
+  });
+  await assert.rejects(
+    a.journal.update(id, 1, { phase: "registered", marker: "stale" }),
+    /browser_controller_fenced/,
+  );
+  assert.deepEqual((await b.journal.read(id)).data.grants, []);
 });

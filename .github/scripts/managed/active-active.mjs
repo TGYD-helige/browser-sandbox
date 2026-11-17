@@ -871,7 +871,6 @@ export async function activeActive({
         (pod) => pod.metadata.labels[prefix + "execution"] === drainId,
       ),
     );
-    await client("finish", drainId);
     report.sharedStateDrainWithoutForce = true;
 
     stage = "shared state uninstall";
