@@ -1807,12 +1807,21 @@ export async function createController(options: ControllerOptions) {
         if (bindings.has(worker.executionId)) continue;
         await ownership.resolve(worker.executionId, true);
         if (!ownership.owns(worker.executionId)) continue;
+        const record = await journal.read(worker.executionId);
+        if (record?.data.phase === "finished") {
+          const current = await options.backend.list(AbortSignal.timeout(30000));
+          try {
+            const remaining = current.find((item) => item.id === worker.id);
+            if (remaining) await restoreOrphan(remaining, record.revision);
+            else await ownership.complete(worker.executionId);
+          } finally {
+            closeUnusedDiscovery(current);
+          }
+          continue;
+        }
         await loadOwned(worker.executionId);
-        if (!bindings.has(worker.executionId))
-          await restoreOrphan(
-            worker,
-            (await journal.read(worker.executionId))?.revision ?? 0,
-          );
+        if (ownership.owns(worker.executionId) && !bindings.has(worker.executionId))
+          await restoreOrphan(worker, record?.revision ?? 0);
       }
     } finally {
       closeUnusedDiscovery(discovered);

@@ -215,6 +215,7 @@ export async function activeActive({
   let paused;
   let pausedProcess;
   let installed = false;
+  let stage = "journal corruption";
   try {
     installed = true;
     await helm(1, false, true);
@@ -252,12 +253,20 @@ export async function activeActive({
       0,
       "Corrupt import published partial ownership",
     );
-    const rejectedPod = (await list("controller"))[0];
-    assert(
-      (await kubectl("logs", rejectedPod.metadata.name, "--previous")).includes(
-        "browser_execution_journal_corrupt",
-      ),
-      "Startup failed for a reason other than corrupt journal input",
+    await wait(
+      "Corrupt journal rejection was not reported",
+      async () => {
+        const rejected = (await list("controller"))[0];
+        const current = await kubectl("logs", rejected.metadata.name).catch(() => "");
+        const previous = await kubectl(
+          "logs",
+          rejected.metadata.name,
+          "--previous",
+        ).catch(() => "");
+        return current + previous;
+      },
+      (logs) => logs.includes("browser_execution_journal_corrupt"),
+      15000,
     );
     await kubectl("scale", `deployment/${deployment}`, "--replicas=0");
     await wait(
@@ -266,6 +275,7 @@ export async function activeActive({
       (items) => items.length === 0,
     );
     await journalJob("repair");
+    stage = "journal import";
     await helm(1);
     const migrated = await wait("v1 journal was not imported", leases, (items) =>
       items.some(
@@ -280,15 +290,18 @@ export async function activeActive({
       idempotent: true,
       corruptSourcePreserved: true,
     };
+    stage = "three replicas";
     await helm(3);
     assert.equal((await list("controller")).length, 3);
     const replicas = await list("controller");
+    stage = "concurrent registration";
     const same = randomUUID();
     const registrations = await Promise.all(
       replicas.slice(0, 2).map((pod) => client("register", same, pod)),
     );
     assert.equal(registrations[0].path, registrations[1].path);
     await client("finish", same);
+    stage = "Profile contention";
     const profileIds = [randomUUID(), randomUUID()];
     const contention = await Promise.allSettled(
       profileIds.map((id, i) => client("profile-contend", id, replicas[i])),
@@ -306,6 +319,7 @@ export async function activeActive({
       "ha-contended",
     );
     report.concurrentRegistrationAndProfileExclusivity = true;
+    stage = "non-owner forwarding";
     const id = randomUUID();
     const prepared = await client("prepare", id);
     let current = await peers(id);
@@ -330,6 +344,7 @@ export async function activeActive({
       `fetch('http://${current.other.status.podIP}:8084${prepared.path}/session',{signal:AbortSignal.timeout(5000)}).then(async r=>{if(r.status!==503||(await r.json()).error!=='browser_controller_owner_moved')process.exit(1)})`,
     );
     report.forwardedRequestNeverForwardedTwice = true;
+    stage = "forwarding measurement";
     const snapshot = async (pod) =>
       JSON.parse(
         await kubectl(
@@ -365,11 +380,11 @@ export async function activeActive({
     const worker = (await list("worker")).find(
       (pod) => pod.metadata.labels[prefix + "execution"] === id,
     );
+    stage = "owner kills";
     const failover = [];
     for (let sample = 0; sample < 5; sample++) {
       current = await peers(id);
       const epoch = Number(current.lease.metadata.annotations[prefix + "epoch"]);
-      const started = performance.now();
       await kubectl(
         "exec",
         "client",
@@ -399,7 +414,9 @@ export async function activeActive({
         },
         Boolean,
       );
-      await signalProcess(await controllerProcess(current.pod), "KILL");
+      const killedProcess = await controllerProcess(current.pod);
+      const started = performance.now();
+      await signalProcess(killedProcess, "KILL");
       await live;
       await wait(
         "Owner kill did not transfer ownership",
@@ -427,6 +444,7 @@ export async function activeActive({
       workerAndProfilePreserved: true,
     };
     current = await peers(id);
+    stage = "SIGSTOP fencing";
     paused = current.pod.metadata.name;
     const oldEpoch = Number(current.lease.metadata.annotations[prefix + "epoch"]);
     const readyFile = `/tmp/ha-stale-${id}.ready`;
@@ -513,12 +531,14 @@ export async function activeActive({
       worker.metadata.uid,
     );
     report.splitBrainFenced = true;
+    stage = "rolling update";
     await kubectl("rollout", "restart", `deployment/${deployment}`);
     await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=180s");
     await client("verify", id);
     report.rollingUpdatePreservedOriginalPageAndWorker = true;
     await client("finish", id);
     // A worker created through the normal adapter with no record is an orphan, claimed by one Lease winner.
+    stage = "orphan reclamation";
     const orphanId = randomUUID();
     const orphan = {
       apiVersion: "v1",
@@ -547,27 +567,67 @@ export async function activeActive({
         !items.some((pod) => pod.metadata.labels[prefix + "execution"] === orphanId),
       90000,
     );
-    const logs = await Promise.all(
-      (await list("controller")).map((pod) => kubectl("logs", pod.metadata.name)),
+    await wait(
+      "Orphan removal event was not reported exactly once",
+      async () => {
+        const logs = await Promise.all(
+          (await list("controller")).map((pod) => kubectl("logs", pod.metadata.name)),
+        );
+        const removed = logs
+          .flatMap((text) =>
+            text.split("\n").flatMap((line) => {
+              try {
+                return [JSON.parse(line)];
+              } catch {
+                return [];
+              }
+            }),
+          )
+          .filter(
+            (event) => event.executionId === orphanId && event.type === "removed",
+          );
+        return removed.length;
+      },
+      (count) => {
+        assert(count <= 1, "Orphan was reclaimed more than once");
+        return count === 1;
+      },
     );
-    const removed = logs
-      .flatMap((text) =>
-        text.split("\n").flatMap((line) => {
-          try {
-            return [JSON.parse(line)];
-          } catch {
-            return [];
-          }
-        }),
-      )
-      .filter((event) => event.executionId === orphanId && event.type === "removed");
-    assert.equal(removed.length, 1);
     report.orphanReclaimedOnce = true;
     await writeFile(
       "managed-results/active-active-kubernetes.json",
       JSON.stringify(report, null, 2) + "\n",
     );
     return report;
+  } catch (error) {
+    const diagnostic = { stage, controllers: [] };
+    for (const pod of await list("controller").catch(() => [])) {
+      const logs = await kubectl("logs", pod.metadata.name, "--tail=50").catch(
+        () => "",
+      );
+      const previous = await kubectl(
+        "logs",
+        pod.metadata.name,
+        "--previous",
+        "--tail=50",
+      ).catch(() => "");
+      diagnostic.controllers.push({
+        phase: pod.status.phase,
+        codes: [
+          ...new Set(
+            (logs + previous).match(
+              /\bbrowser_[a-z_]+\b|\b(?:EACCES|ENOENT|EPERM|SyntaxError|TypeError|RangeError)\b|status: [0-9]{3}/g,
+            ) ?? [],
+          ),
+        ],
+      });
+    }
+    await writeFile(
+      "managed-results/active-active-diagnostics.json",
+      JSON.stringify(diagnostic, null, 2) + "\n",
+    );
+    console.error(JSON.stringify({ activeActiveFailed: diagnostic }));
+    throw error;
   } finally {
     if (pausedProcess) await signalProcess(pausedProcess, "CONT").catch(() => {});
     if (installed)

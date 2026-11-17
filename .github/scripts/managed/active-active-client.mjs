@@ -193,7 +193,7 @@ try {
         samples.sort((a, b) => a - b);
         console.log(
           JSON.stringify({
-            medianMs: samples[24],
+            medianMs: (samples[24] + samples[25]) / 2,
             p95Ms: samples[47],
             samples: 50,
             payloadBytes: 65536,

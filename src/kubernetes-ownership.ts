@@ -346,7 +346,10 @@ export function createKubernetesOwnership(
     const secret = await get(`${secrets}/${name(id)}`);
     if (!secret) throw Error("browser_controller_state_corrupt");
     const body = decode(secret, id);
-    if (body.epoch !== epoch) throw Error("browser_controller_fenced");
+    if (body.epoch !== epoch) {
+      forget(id);
+      throw Error("browser_controller_fenced");
+    }
     if ((body.record?.revision ?? 0) !== revision)
       throw Error(
         revision ? "browser_execution_record_changed" : "browser_execution_revoked",
@@ -360,7 +363,10 @@ export function createKubernetesOwnership(
         signal(),
       );
     } catch (error) {
-      if (conflict(error)) throw Error("browser_controller_fenced");
+      if (conflict(error)) {
+        forget(id);
+        throw Error("browser_controller_fenced");
+      }
       throw error;
     }
     records.set(id, record);
