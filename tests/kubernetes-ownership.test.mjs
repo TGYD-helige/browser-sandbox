@@ -542,3 +542,75 @@ test("a stale owner cannot acquire a free Profile reused by another completed ex
   resume.resolve();
   await rejected;
 });
+
+test("a stale orphan discovery after another owner finished does not reclaim twice", async (t) => {
+  const { a, b, ports, cleanups } = await fixture(t);
+  const worker = {
+    executionId: id,
+    incarnation: other,
+    id: "pod/owned-worker",
+    origin: "http://127.0.0.1:1",
+    runtime: {
+      close() {},
+      async request(request) {
+        return request.op === "worker_status"
+          ? {
+              protocol: "browser-sandbox.worker/v2",
+              session: { state: "unused", connectedClients: 0 },
+              takeover: "automation",
+              pendingAuth: 0,
+            }
+          : { stopped: true, used: false };
+      },
+    },
+  };
+  let present = true;
+  let stale = false;
+  let removals = 0;
+  const events = [];
+  const backend = {
+    async list() {
+      if (stale) {
+        stale = false;
+        return [worker];
+      }
+      return present ? [worker] : [];
+    },
+    async create() {
+      throw Error("unexpected");
+    },
+    async remove() {
+      removals++;
+      present = false;
+    },
+  };
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "finished" });
+  await a.complete(id);
+  const first = await createController({
+    ownership: a,
+    backend,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    onWorkerEvent: (event) => events.push(event),
+  });
+  await first.reconcile();
+  assert.equal(removals, 1);
+  stale = true;
+  const second = await createController({
+    ownership: b,
+    backend,
+    peerPort: ports[1],
+    port: 0,
+    reconciliationMs: 60000,
+    onWorkerEvent: (event) => events.push(event),
+  });
+  cleanups.unshift(async () => {
+    await first.stop({ finalize: false });
+    await second.stop({ finalize: false });
+  });
+  assert.equal((await second.command({ op: "controller_status" })).executions, 0);
+  assert.equal(removals, 1);
+  assert.equal(events.filter((event) => event.type === "removed").length, 1);
+});

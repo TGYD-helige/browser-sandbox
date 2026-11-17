@@ -353,7 +353,7 @@ export async function activeActive({
           "--",
           "node",
           "-e",
-          "const fs=require('node:fs');const s=fs.readFileSync('/proc/1/stat','utf8').split(' ');const n=fs.readFileSync('/proc/net/dev','utf8').split('\\n').filter(x=>x.includes('eth0:'))[0].split(':')[1].trim().split(/\\s+/).map(Number);console.log(JSON.stringify({cpuTicks:Number(s[13])+Number(s[14]),rx:n[0],tx:n[8]}))",
+          String.raw`const fs=require('node:fs');const s=fs.readFileSync('/proc/1/stat','utf8').split(' ');const n=fs.readFileSync('/proc/net/dev','utf8').split('\n').find(x=>x.includes('eth0:')).split(':')[1].trim().split(/\s+/).map(Number);const result={cpuTicks:Number(s[13])+Number(s[14]),rx:n[0],tx:n[8]};if(!Object.values(result).every(Number.isFinite))throw Error('counter_invalid');console.log(JSON.stringify(result))`,
         ),
       );
     const measure = async (pod) => {
