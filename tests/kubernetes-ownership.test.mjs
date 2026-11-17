@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -613,4 +614,23 @@ test("a stale orphan discovery after another owner finished does not reclaim twi
   assert.equal((await second.command({ op: "controller_status" })).executions, 0);
   assert.equal(removals, 1);
   assert.equal(events.filter((event) => event.type === "removed").length, 1);
+});
+
+test("controller startup rejects a volume Profile store with multiple replicas before reading cluster credentials", () => {
+  const child = spawnSync(
+    process.execPath,
+    [new URL("../dist/controller-main.js", import.meta.url).pathname],
+    {
+      env: {
+        PATH: process.env.PATH,
+        BROWSER_BACKEND: "kubernetes",
+        BROWSER_CONTROLLER_REPLICAS: "3",
+        BROWSER_PROFILE_STORE_ROOT: "/unused-profile-store",
+      },
+      encoding: "utf8",
+      timeout: 5000,
+    },
+  );
+  assert.equal(child.status, 1);
+  assert.match(child.stderr, /browser_profile_store_replicas_unsupported/);
 });
