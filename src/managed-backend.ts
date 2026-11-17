@@ -21,13 +21,11 @@ export interface ManagedWorker {
   profileId?: string;
   /** Controller epoch persisted on a shared-backend resource. */
   epoch?: number;
-  /** Immutable allocation epoch, retained through failed cleanup. */
-  creationEpoch?: number;
   /** An owned cleanup resource with no surviving browser process or Profile disk. */
   infrastructureOnly?: boolean;
   runtime: BrowserRuntime & {
     close?(): void;
-    setEpoch?(epoch: number): void;
+    setEpoch?(epoch: number, ownerUid?: string): void;
     setAutomation?(automation: AutomationCoordinator): void;
   };
 }
@@ -59,13 +57,14 @@ export interface ExecutionOwner {
   replica: string;
   origin: string;
   epoch: number;
+  uid: string;
 }
 
 /** Shared ownership contract; platform arbitration and persistence stay in its adapter. */
 export interface ExecutionOwnership {
   lookup(id: string): ExecutionOwner | undefined;
   resolve(id: string, create?: boolean): Promise<ExecutionOwner | undefined>;
-  assertOwned(id: string): Promise<number>;
+  assertOwned(id: string): Promise<{ epoch: number; uid: string }>;
   epoch(id: string): number | undefined;
   owns(id: string): boolean;
   onLost(callback: (id: string) => void): void;

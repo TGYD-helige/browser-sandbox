@@ -21,9 +21,10 @@ if (backendName === "kubernetes") {
   const access = await readKubernetesAccess();
   if (replicas > 1 || process.env.BROWSER_SHARED_STATE === "true") {
     const { createKubernetesOwnership } = await import("./kubernetes-ownership.js");
-    ownership = createKubernetesOwnership({
+    ownership = await createKubernetesOwnership({
       ...access,
       installation: process.env.BROWSER_INSTALLATION ?? "default",
+      ownerName: process.env.BROWSER_KUBERNETES_OWNER,
       replica: process.env.BROWSER_CONTROLLER_ID,
       peerOrigin: process.env.BROWSER_PEER_ORIGIN,
     });
@@ -38,7 +39,7 @@ if (backendName === "kubernetes") {
       });
     }
   }
-  backend = createKubernetesBackend({
+  backend = await createKubernetesBackend({
     ownership,
     installation: process.env.BROWSER_INSTALLATION ?? "default",
     ...access,

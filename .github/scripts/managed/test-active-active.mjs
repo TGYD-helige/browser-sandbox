@@ -5,7 +5,7 @@ import { sessionRequest } from "../../../dist/session.js";
 import {
   assertFencedOwner,
   observeSingleRemoval,
-  readStatusDuringTakeover,
+  readVerifiedStatus,
   summarizeFailover,
 } from "./active-active-checks.mjs";
 
@@ -83,7 +83,8 @@ test("takeover status reconnects after a controlled HTTP connection loss without
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   // Synthetic rollout window: the selected replica closes after receiving the status request.
   const endpoint = `ws://127.0.0.1:${server.address().port}/execution/${"a".repeat(64)}`;
-  const result = await readStatusDuringTakeover(
+  const result = await readVerifiedStatus(
+    "verify-rollout",
     (signal) => sessionRequest(endpoint, "status", undefined, signal),
     AbortSignal.timeout(5000),
   );
@@ -93,10 +94,14 @@ test("takeover status reconnects after a controlled HTTP connection loss without
 
 test("takeover status retries only owner movement and connection loss within one deadline", async () => {
   let reads = 0;
-  const status = await readStatusDuringTakeover(async () => {
-    if (++reads === 1) throw Error("browser_controller_owner_moved");
-    return { generation: "original" };
-  }, AbortSignal.timeout(5000));
+  const status = await readVerifiedStatus(
+    "verify-rollout",
+    async () => {
+      if (++reads === 1) throw Error("browser_controller_owner_moved");
+      return { generation: "original" };
+    },
+    AbortSignal.timeout(5000),
+  );
   assert.equal(status.generation, "original");
   assert.equal(reads, 2);
   for (const error of [
@@ -106,10 +111,14 @@ test("takeover status retries only owner movement and connection loss within one
   ]) {
     reads = 0;
     await assert.rejects(
-      readStatusDuringTakeover(async () => {
-        reads++;
-        throw error;
-      }, AbortSignal.timeout(5000)),
+      readVerifiedStatus(
+        "verify-rollout",
+        async () => {
+          reads++;
+          throw error;
+        },
+        AbortSignal.timeout(5000),
+      ),
       (value) => value === error,
     );
     assert.equal(reads, 1);
@@ -117,10 +126,14 @@ test("takeover status retries only owner movement and connection loss within one
   reads = 0;
   await assert.rejects(
     async () => {
-      const result = await readStatusDuringTakeover(async () => {
-        reads++;
-        return { generation: "changed" };
-      }, AbortSignal.timeout(5000));
+      const result = await readVerifiedStatus(
+        "verify-rollout",
+        async () => {
+          reads++;
+          return { generation: "changed" };
+        },
+        AbortSignal.timeout(5000),
+      );
       assert.equal(result.generation, "original");
     },
     { code: "ERR_ASSERTION" },
@@ -129,13 +142,38 @@ test("takeover status retries only owner movement and connection loss within one
   reads = 0;
   const deadline = new AbortController();
   await assert.rejects(
-    readStatusDuringTakeover(async (signal) => {
-      assert.equal(signal, deadline.signal);
-      reads++;
-      deadline.abort(Error("test deadline"));
-      throw Error("browser_controller_owner_moved");
-    }, deadline.signal),
+    readVerifiedStatus(
+      "verify-rollout",
+      async (signal) => {
+        assert.equal(signal, deadline.signal);
+        reads++;
+        deadline.abort(Error("test deadline"));
+        throw Error("browser_controller_owner_moved");
+      },
+      deadline.signal,
+    ),
     /test deadline/,
   );
   assert.equal(reads, 1, "an expired shared deadline cannot start another request");
+});
+
+test("steady-state verification never reconnects even for retryable transport or owner errors", async () => {
+  for (const error of [
+    Error("browser_controller_owner_moved"),
+    new TypeError("fetch failed", { cause: { code: "UND_ERR_SOCKET" } }),
+  ]) {
+    let reads = 0;
+    await assert.rejects(
+      readVerifiedStatus(
+        "verify",
+        async () => {
+          if (++reads === 1) throw error;
+          return { generation: "original" };
+        },
+        AbortSignal.timeout(5000),
+      ),
+      (value) => value === error,
+    );
+    assert.equal(reads, 1);
+  }
 });

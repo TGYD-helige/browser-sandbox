@@ -146,3 +146,88 @@ export function createKubernetesClient(options: KubernetesAccess) {
     });
   };
 }
+
+export function kubernetesOwnerReference(
+  kind: "ConfigMap" | "Lease",
+  name: string,
+  uid: string,
+) {
+  return {
+    apiVersion: kind === "Lease" ? "coordination.k8s.io/v1" : "v1",
+    kind,
+    name,
+    uid,
+    controller: true,
+    blockOwnerDeletion: false,
+  };
+}
+
+export function hasKubernetesOwner(
+  resource: any,
+  expected: ReturnType<typeof kubernetesOwnerReference>,
+) {
+  const refs = resource?.metadata?.ownerReferences;
+  return (
+    refs?.length === 1 &&
+    refs[0]?.controller === true &&
+    ["apiVersion", "kind", "name", "uid"].every((key) => refs[0][key] === expected[key])
+  );
+}
+
+export async function readKubernetesOwner(
+  api: ReturnType<typeof createKubernetesClient>,
+  options: KubernetesAccess & { installation: string; ownerName: string },
+  signal: AbortSignal,
+) {
+  const owner = await api(
+    `/api/v1/namespaces/${options.namespace}/configmaps/${options.ownerName}`,
+    "GET",
+    undefined,
+    signal,
+  );
+  if (
+    !owner.metadata?.uid ||
+    owner.metadata.labels?.["app.kubernetes.io/instance"] !== options.installation ||
+    owner.metadata.labels["app.kubernetes.io/name"] !== "browser-sandbox"
+  )
+    throw Error("browser_worker_ownership_mismatch");
+  return kubernetesOwnerReference("ConfigMap", options.ownerName, owner.metadata.uid);
+}
+
+/** Resolve the single controller chain; a missing/replaced Lease belongs to GC. */
+export async function readKubernetesWorkerOwner(
+  api: ReturnType<typeof createKubernetesClient>,
+  namespace: string,
+  pod: any,
+  parent: ReturnType<typeof kubernetesOwnerReference>,
+  signal: AbortSignal,
+): Promise<ReturnType<typeof kubernetesOwnerReference> | undefined> {
+  const refs = pod.metadata?.ownerReferences;
+  const ref = refs?.[0];
+  if (refs?.length !== 1 || !ref.controller)
+    throw Error("browser_worker_ownership_mismatch");
+  if (hasKubernetesOwner(pod, parent)) return ref;
+  if (ref.apiVersion !== "coordination.k8s.io/v1" || ref.kind !== "Lease")
+    throw Error("browser_worker_ownership_mismatch");
+  let lease: any;
+  try {
+    lease = await api(
+      `/apis/coordination.k8s.io/v1/namespaces/${namespace}/leases/${encodeURIComponent(ref.name)}`,
+      "GET",
+      undefined,
+      signal,
+    );
+  } catch (error) {
+    if (error instanceof KubernetesError && error.status === 404) return;
+    throw error;
+  }
+  if (lease.metadata?.uid !== ref.uid) return;
+  if (
+    lease.metadata.labels?.["browser-sandbox.io/state"] !== "execution" ||
+    lease.metadata.labels?.["browser-sandbox.io/execution"] !==
+      pod.metadata.labels?.["browser-sandbox.io/execution"] ||
+    !hasKubernetesOwner(lease, parent)
+  )
+    throw Error("browser_worker_ownership_mismatch");
+  return ref;
+}

@@ -20,7 +20,9 @@ async function fixture(t) {
     owner: "release-uid",
     workerReads: 0,
     profileId: "",
+    leaseOwner: false,
   };
+  const leaseObserved = Promise.withResolvers();
   const server = createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -35,6 +37,28 @@ async function fixture(t) {
               "app.kubernetes.io/name": "browser-sandbox",
               "app.kubernetes.io/instance": "trial",
             },
+          },
+        }),
+      );
+    } else if (request.url.includes("/leases/")) {
+      leaseObserved.resolve();
+      response.end(
+        JSON.stringify({
+          metadata: {
+            uid: "execution-uid",
+            labels: {
+              "browser-sandbox.io/execution": "execution",
+              "browser-sandbox.io/state": "execution",
+            },
+            ownerReferences: [
+              {
+                apiVersion: "v1",
+                kind: "ConfigMap",
+                name: "trial-browser-workers",
+                uid: state.owner,
+                controller: true,
+              },
+            ],
           },
         }),
       );
@@ -76,6 +100,7 @@ async function fixture(t) {
                     uid: "worker-uid",
                     deletionTimestamp: state.deleted ? "now" : undefined,
                     labels: {
+                      "browser-sandbox.io/execution": "execution",
                       "app.kubernetes.io/name": "browser-sandbox",
                       "app.kubernetes.io/instance": "trial",
                       "app.kubernetes.io/component": "worker",
@@ -85,10 +110,12 @@ async function fixture(t) {
                     },
                     ownerReferences: [
                       {
-                        apiVersion: "v1",
-                        kind: "ConfigMap",
-                        name: "trial-browser-workers",
-                        uid: state.owner,
+                        apiVersion: state.leaseOwner ? "coordination.k8s.io/v1" : "v1",
+                        kind: state.leaseOwner ? "Lease" : "ConfigMap",
+                        name: state.leaseOwner
+                          ? "execution-lease"
+                          : "trial-browser-workers",
+                        uid: state.leaseOwner ? "execution-uid" : state.owner,
                         controller: true,
                       },
                     ],
@@ -107,6 +134,7 @@ async function fixture(t) {
   await once(server, "listening");
   return {
     state,
+    leaseObserved,
     controllerObserved,
     deletionObserved,
     options: {
@@ -171,5 +199,29 @@ test("uninstall refuses persistent workers before removing their controller or r
     /browser_profile_busy/,
   );
   assert.equal(state.scaled, false);
+  assert.equal(state.deleted, false);
+});
+
+test("uninstall drain accepts a worker's execution Lease and validated release owner chain", async (t) => {
+  const { state, options, deletionObserved } = await fixture(t);
+  state.leaseOwner = true;
+  state.controllerGone = true;
+  const draining = drainKubernetesWorkers(options, AbortSignal.timeout(5000));
+  draining.catch(() => {});
+  await Promise.race([deletionObserved, draining]);
+  state.workerGone = true;
+  await draining;
+  assert.equal(state.deleted, true);
+});
+
+test("uninstall drain rejects an execution Lease owned by another release incarnation", async (t) => {
+  const { state, options } = await fixture(t);
+  state.leaseOwner = true;
+  state.owner = "foreign-release";
+  state.controllerGone = true;
+  await assert.rejects(
+    drainKubernetesWorkers(options, AbortSignal.timeout(5000)),
+    /browser_worker_ownership_mismatch/,
+  );
   assert.equal(state.deleted, false);
 });

@@ -56,6 +56,7 @@ export function workerIdle(value: unknown, now = Date.now()): boolean {
 export function createWorkerFence(
   dispatch: (request: any, peer: ControlPeer, signal: AbortSignal) => Promise<any>,
   executionId: string,
+  ownerUid?: string,
 ) {
   let highest = 0;
   let ownership = new AbortController();
@@ -65,7 +66,14 @@ export function createWorkerFence(
     const epoch = request.epoch ?? 0;
     if (!Number.isSafeInteger(epoch) || epoch < 0)
       throw Error("browser_controller_epoch_invalid");
-    if (epoch < highest) throw Error("browser_controller_fenced");
+    if (
+      request.ownerUid !== undefined &&
+      (typeof request.ownerUid !== "string" || !request.ownerUid)
+    )
+      throw Error("browser_identity_mismatch");
+    if ((ownerUid && request.ownerUid !== ownerUid) || epoch < highest)
+      throw Error("browser_controller_fenced");
+    ownerUid ??= request.ownerUid;
     if (epoch > highest) {
       highest = epoch;
       ownership.abort();

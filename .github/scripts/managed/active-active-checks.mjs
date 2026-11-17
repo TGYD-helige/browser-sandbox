@@ -38,7 +38,8 @@ export function summarizeFailover(values) {
 }
 
 // Rollout can close a Service-selected replica after CDP checks but before status.
-export async function readStatusDuringTakeover(read, signal) {
+export async function readVerifiedStatus(action, read, signal) {
+  if (action !== "verify-rollout") return read(signal);
   while (true) {
     signal.throwIfAborted();
     try {

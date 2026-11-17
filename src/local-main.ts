@@ -134,15 +134,19 @@ const workerStorage = createWorkerStorage(
 const networkControl = workerExecutionId
   ? createNetworkHostControl({
       server: gateway.workerServer,
-      dispatch: createWorkerFence(async (request, peer, signal) => {
-        if (!controllerPeer || controllerPeer.signal.aborted || request.automation)
-          controllerPeer = peer;
-        if (request.op === "register")
-          controllerAutomation = request.automation === true;
-        const storageResult = await workerStorage(request, peer, signal);
-        if (storageResult) return storageResult;
-        return gateway.workerCommand(request, signal);
-      }, workerExecutionId),
+      dispatch: createWorkerFence(
+        async (request, peer, signal) => {
+          if (!controllerPeer || controllerPeer.signal.aborted || request.automation)
+            controllerPeer = peer;
+          if (request.op === "register")
+            controllerAutomation = request.automation === true;
+          const storageResult = await workerStorage(request, peer, signal);
+          if (storageResult) return storageResult;
+          return gateway.workerCommand(request, signal);
+        },
+        workerExecutionId,
+        process.env.BROWSER_OWNER_UID,
+      ),
     })
   : undefined;
 for (const signal of ["SIGINT", "SIGTERM"])

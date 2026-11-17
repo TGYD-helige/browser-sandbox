@@ -9,7 +9,7 @@ const { createControllerRuntime, sessionRequest } = await import(
   `${root}/dist/index.js`
 );
 const { connectCdp } = await import(`${root}/dist/cdp.js`);
-const { readStatusDuringTakeover } = await import(
+const { readVerifiedStatus } = await import(
   `${root}/.github/scripts/managed/active-active-checks.mjs`
 );
 const require = createRequire(`${root}/package.json`);
@@ -175,13 +175,11 @@ try {
           (cookie) => cookie.name === "ha-profile" && cookie.value === "preserved",
         ),
       );
-      const status =
-        action === "verify"
-          ? await readStatusDuringTakeover(
-              (signal) => sessionRequest(url.href, "status", undefined, signal),
-              AbortSignal.timeout(30000),
-            )
-          : await sessionRequest(url.href);
+      const status = await readVerifiedStatus(
+        action,
+        (signal) => sessionRequest(url.href, "status", undefined, signal),
+        AbortSignal.timeout(30000),
+      );
       assert.equal(status.generation, state.generation);
       if (action === "live") {
         await writeFile(`/tmp/ha-live-${executionId}.ready`, "ready");

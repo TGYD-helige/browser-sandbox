@@ -17,6 +17,38 @@ async function fixture(t, extra = {}) {
   const objects = new Map();
   const cleanups = [];
   const state = { requests: 0 };
+  const gc = () => {
+    let changed;
+    do {
+      changed = false;
+      for (const [path, object] of objects) {
+        const refs = object.metadata.ownerReferences;
+        if (
+          !refs?.length ||
+          refs.some((ref) => {
+            const base =
+              ref.kind === "Lease"
+                ? "/apis/coordination.k8s.io/v1/namespaces/test/leases/"
+                : "/api/v1/namespaces/test/configmaps/";
+            return objects.get(base + ref.name)?.metadata.uid === ref.uid;
+          })
+        )
+          continue;
+        objects.delete(path);
+        changed = true;
+      }
+    } while (changed);
+  };
+  objects.set("/api/v1/namespaces/test/configmaps/workers", {
+    metadata: {
+      name: "workers",
+      uid: "release-uid",
+      labels: {
+        "app.kubernetes.io/name": "browser-sandbox",
+        "app.kubernetes.io/instance": "test",
+      },
+    },
+  });
   let version = 0;
   const server = createServer(async (req, res) => {
     if (!req.url.includes("watch=true")) state.requests++;
@@ -68,6 +100,7 @@ async function fixture(t, extra = {}) {
         metadata: {},
       });
     if (req.method === "GET") {
+      if (state.failGet && path.endsWith(state.failGet)) return reply(503);
       await state.beforeGet?.(path);
       if (state.readAfterGet) previous = objects.get(path);
       return reply(previous ? 200 : 404, previous);
@@ -81,6 +114,7 @@ async function fixture(t, extra = {}) {
       const key = `${path}/${body.metadata.name}`;
       if (objects.has(key)) return reply(409);
       body.metadata.resourceVersion = String(++version);
+      body.metadata.uid = `object-${version}`;
       if (path.endsWith("/pods")) {
         body.metadata.uid = `pod-${version}`;
         body.status = {
@@ -94,17 +128,11 @@ async function fixture(t, extra = {}) {
     }
     if (!previous) return reply(404);
     if (req.method === "PUT") {
-      if (
-        body.metadata.labels["browser-sandbox.io/state"] === "epoch" &&
-        state.failLeaseRetire
-      ) {
-        state.failLeaseRetire = false;
-        return reply(503);
-      }
       await state.beforeWrite?.(path, body);
       previous = objects.get(path);
       if (body.metadata.resourceVersion !== previous.metadata.resourceVersion)
         return reply(409);
+      body.metadata.uid = previous.metadata.uid;
       body.metadata.resourceVersion = String(++version);
       objects.set(path, body);
       return reply(200, body);
@@ -127,6 +155,10 @@ async function fixture(t, extra = {}) {
       return reply(200, updated);
     }
     if (req.method === "DELETE") {
+      if (path.includes("/leases/") && state.failLeaseDelete) {
+        state.failLeaseDelete = false;
+        return reply(503);
+      }
       if (
         body.preconditions.resourceVersion
           ? body.preconditions.resourceVersion !== previous.metadata.resourceVersion
@@ -134,22 +166,32 @@ async function fixture(t, extra = {}) {
       )
         return reply(409);
       objects.delete(path);
+      if (!state.pauseGc) gc();
       return reply(200);
     }
     reply(400);
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(async () => {
-    for (const cleanup of cleanups) await cleanup();
+    let failure;
+    for (const cleanup of cleanups) {
+      try {
+        await cleanup();
+      } catch (error) {
+        failure ??= error;
+      }
+    }
     await new Promise((resolve) => {
       server.closeAllConnections();
       server.close(resolve);
     });
+    if (failure) throw failure;
   });
   let now = 0;
   const options = {
     namespace: "test",
     installation: "test",
+    ownerName: "workers",
     apiServer: `http://127.0.0.1:${server.address().port}`,
     leaseMs: 15000,
     now: () => now,
@@ -162,12 +204,12 @@ async function fixture(t, extra = {}) {
     ports.push(listener.address().port);
     await new Promise((resolve) => listener.close(resolve));
   }
-  const a = createKubernetesOwnership({
+  const a = await createKubernetesOwnership({
     ...options,
     replica: "a",
     peerOrigin: `http://127.0.0.1:${ports[0]}`,
   });
-  const b = createKubernetesOwnership({
+  const b = await createKubernetesOwnership({
     ...options,
     replica: "b",
     peerOrigin: `http://127.0.0.1:${ports[1]}`,
@@ -180,6 +222,7 @@ async function fixture(t, extra = {}) {
     a,
     b,
     objects,
+    gc,
     state,
     ports,
     cleanups,
@@ -466,15 +509,15 @@ test("a stale completion cannot use a watch-updated Lease version to release the
   assert.equal((await a.resolve(id)).epoch, 2);
 });
 
-test("interrupted finished-fence compaction resumes after its Secret was deleted", async (t) => {
+test("interrupted conditional Lease deletion retries maintenance without blocking startup", async (t) => {
   const { a, b, state, advance, objects } = await fixture(t, { maxFinished: 1 });
   for (const executionId of [id, other]) {
     await a.resolve(executionId, true);
     await a.journal.create(executionId, { phase: "finished" });
     await a.complete(executionId);
   }
-  state.failLeaseRetire = true;
-  await assert.rejects(a.refresh());
+  state.failLeaseDelete = true;
+  await a.refresh();
   await b.refresh();
   advance(15001);
   await b.refresh();
@@ -902,10 +945,8 @@ test("takeover fences a Profile PUT already past the old owner's authorization c
   const entered = Promise.withResolvers(),
     resume = Promise.withResolvers();
   state.beforeWrite = async (path, body) => {
-    if (
-      path.includes("-p-") &&
-      body.metadata.annotations["browser-sandbox.io/epoch"] === "1"
-    ) {
+    if (path.includes("-p-") && body.spec?.holderIdentity === "") {
+      state.beforeWrite = undefined;
       entered.resolve();
       await resume.promise;
     }
@@ -1010,12 +1051,11 @@ for (const deletionFails of [false, true])
       create: async () => {
         throw Error("unexpected");
       },
-      fence: async (worker, epoch, _signal, stopped) => {
-        assert.equal(stopped, true);
-        worker.epoch = epoch;
+      fence: async () => {
+        throw Error("unpublished Pod must not be adopted");
       },
       remove: async (worker) => {
-        assert.equal(worker.epoch, 2);
+        assert.equal(worker.epoch, 1);
         removed++;
         if (deletionFails && removed === 1) throw Error("transient_delete_failure");
         late = undefined;
@@ -1452,7 +1492,7 @@ test("an older LIST snapshot does not erase or replace a newer local observation
   assert.equal(a.owns(id), true);
 });
 
-test("compaction skips an execution fenced during its record read and continues", async (t) => {
+test("compaction skips a candidate changed during its record read and continues", async (t) => {
   const { a, b, state, advance } = await fixture(t, { maxFinished: 1 });
   const third = "33333333-3333-4333-8333-333333333333";
   for (const executionId of [id, other, third]) {
@@ -1463,9 +1503,8 @@ test("compaction skips an execution fenced during its record read and continues"
   const entered = Promise.withResolvers(),
     resume = Promise.withResolvers();
   state.readAfterGet = true;
-  let reads = 0;
   state.beforeGet = async (path) => {
-    if (!path.includes("/secrets/") || !path.endsWith(id) || ++reads < 2) return;
+    if (!path.includes("/secrets/") || !path.endsWith(id)) return;
     state.beforeGet = undefined;
     entered.resolve();
     await resume.promise;
@@ -1487,14 +1526,20 @@ test("compaction skips an execution fenced during its record read and continues"
   assert.equal((await a.journal.read(third)).data.phase, "finished");
 });
 
-test("compaction retains the epoch floor for the same execution and Profile", async (t) => {
+test("compaction removes execution Leases and recreated ids start at epoch one with a different UID", async (t) => {
   const { a, b, objects, advance } = await fixture(t, { maxFinished: 1 });
   await a.resolve(id, true);
   await a.journal.create(id, { phase: "registered", profileId: "epoch-floor" });
   await a.acquireProfile(id, "epoch-floor");
+  const first = [...objects.values()].find(
+    (value) =>
+      value.kind === "Lease" &&
+      value.metadata.labels["browser-sandbox.io/execution"] === id,
+  );
   await b.resolve(id);
   advance(15001);
   const old = await b.resolve(id);
+  assert.equal(old.epoch, 2);
   await b.journal.update(id, 1, { phase: "finished", profileId: "epoch-floor" });
   await b.complete(id);
   await b.resolve(other, true);
@@ -1502,37 +1547,27 @@ test("compaction retains the epoch floor for the same execution and Profile", as
   await b.complete(other);
   await b.refresh();
   assert.equal(await b.journal.read(id), undefined);
+  assert.equal(await b.resolve(id), undefined);
   assert.equal(
-    await b.resolve(id),
-    undefined,
-    "read-only lookup must not revive a tombstone",
+    [...objects.values()].some(
+      (value) =>
+        value.kind === "Lease" &&
+        value.metadata.labels["browser-sandbox.io/execution"] === id,
+    ),
+    false,
   );
-  const tombstone = [...objects.values()].find(
-    (value) => value.metadata.labels["browser-sandbox.io/state"] === "epoch",
-  );
-  assert.ok(tombstone);
-  assert.deepEqual(Object.keys(tombstone.metadata.annotations), [
-    "browser-sandbox.io/epoch",
-  ]);
   const next = await b.resolve(id, true);
-  assert.ok(next.epoch > old.epoch);
+  assert.equal(next.epoch, 1);
+  assert.notEqual(next.uid, first.metadata.uid);
   await b.journal.create(id, { phase: "registered", profileId: "epoch-floor" });
   await b.acquireProfile(id, "epoch-floor");
 });
 
-test("a Pod POST landing after compaction is fenced and removed by the next execution epoch", async (t) => {
-  const { a, b, objects, state, advance, apiServer } = await fixture(t, {
+test("a Pod POST landing after compaction retains the old Lease UID and is skipped for GC", async (t) => {
+  const { a, b, objects, gc, state, advance, apiServer } = await fixture(t, {
     maxFinished: 1,
   });
-  objects.set("/api/v1/namespaces/test/configmaps/workers", {
-    metadata: {
-      uid: "release",
-      labels: {
-        "app.kubernetes.io/name": "browser-sandbox",
-        "app.kubernetes.io/instance": "test",
-      },
-    },
-  });
+  state.pauseGc = true;
   const backend = (ownership) =>
     createKubernetesBackend({
       namespace: "test",
@@ -1556,6 +1591,11 @@ test("a Pod POST landing after compaction is fenced and removed by the next exec
   advance(15001);
   const old = await b.resolve(id);
   assert.equal(old.epoch, 2);
+  const oldLease = [...objects.values()].find(
+    (value) =>
+      value.kind === "Lease" &&
+      value.metadata.labels["browser-sandbox.io/execution"] === id,
+  );
   const entered = Promise.withResolvers(),
     resume = Promise.withResolvers();
   state.beforePost = async (path) => {
@@ -1564,7 +1604,7 @@ test("a Pod POST landing after compaction is fenced and removed by the next exec
     entered.resolve();
     await resume.promise;
   };
-  const pending = backend(b).create(
+  const pending = (await backend(b)).create(
     { executionId: id, incarnation: other },
     AbortSignal.timeout(10000),
   );
@@ -1589,22 +1629,33 @@ test("a Pod POST landing after compaction is fenced and removed by the next exec
     [...objects.keys()].some((path) => path.includes("/pods/")),
     false,
   );
+  const current = await a.resolve(id, true);
+  assert.equal(current.epoch, 1);
+  assert.notEqual(current.uid, oldLease.metadata.uid);
   resume.resolve();
   await rejected;
-  const current = await a.resolve(id, true);
-  const next = backend(a);
-  const workers = await next.list(AbortSignal.timeout(5000));
+  const pod = [...objects.values()].find((value) => value.kind === "Pod");
+  assert.deepEqual(pod.metadata.ownerReferences, [
+    {
+      apiVersion: "coordination.k8s.io/v1",
+      kind: "Lease",
+      name: oldLease.metadata.name,
+      uid: oldLease.metadata.uid,
+      controller: true,
+      blockOwnerDeletion: false,
+    },
+  ]);
   assert.equal(
-    workers.length,
-    1,
-    "fenced creator must leave the late Pod for its successor",
+    (await (await backend(a)).list(AbortSignal.timeout(5000))).length,
+    0,
+    "old-UID Pods are skipped without a fencing error",
   );
-  t.after(() => workers[0].runtime.close());
-  assert.equal(workers[0].epoch, old.epoch);
-  assert.ok(current.epoch > old.epoch);
-  await next.fence(workers[0], current.epoch, AbortSignal.timeout(5000), true);
-  await next.remove(workers[0], AbortSignal.timeout(5000));
-  assert.equal((await next.list(AbortSignal.timeout(5000))).length, 0);
+  gc();
+  assert.equal(
+    [...objects.values()].some((value) => value.kind === "Pod"),
+    false,
+  );
+  await a.journal.create(id, { phase: "registered" });
 });
 
 function watchSentinel(objects, executionId) {
@@ -1674,19 +1725,37 @@ test("a stale LIST cannot restore a route added and deleted by watch while it wa
   assert.equal(a.findCapability(token), undefined);
 });
 
-test("a delayed tombstone watch deletion preserves a revived higher execution epoch", async (t) => {
+test("a delayed old-UID watch deletion cannot evict a recreated epoch-one execution", async (t) => {
   const { a, objects, state } = await fixture(t, { maxFinished: 1 });
   for (const executionId of [id, other]) {
     await a.resolve(executionId, true);
     await a.journal.create(executionId, { phase: "finished" });
     await a.complete(executionId);
   }
-  await a.compact();
-  const retired = structuredClone(
+  const old = structuredClone(
     [...objects.values()].find(
-      (value) => value.metadata.labels["browser-sandbox.io/state"] === "epoch",
+      (value) =>
+        value.kind === "Lease" &&
+        value.metadata.labels["browser-sandbox.io/execution"] === id,
     ),
   );
+  await a.compact();
+  const next = await a.resolve(id, true);
+  assert.equal(next.epoch, 1);
+  assert.notEqual(old.metadata.uid, next.uid);
+  await a.resolve(other, true);
+  const processed = Promise.withResolvers();
+  a.onLost((executionId) => {
+    if (executionId === other) processed.resolve();
+  });
+  state.watchEvents = [{ type: "DELETED", object: old }, watchSentinel(objects, other)];
+  void a.watch();
+  await waitForControl(processed.promise, AbortSignal.timeout(5000));
+  assert.equal(a.owns(id), true);
+});
+
+test("malformed watch deletions are ignored without discarding valid subsequent events", async (t) => {
+  const { a, objects, state } = await fixture(t);
   await a.resolve(id, true);
   await a.resolve(other, true);
   const processed = Promise.withResolvers();
@@ -1694,10 +1763,584 @@ test("a delayed tombstone watch deletion preserves a revived higher execution ep
     if (executionId === other) processed.resolve();
   });
   state.watchEvents = [
-    { type: "DELETED", object: retired },
+    {
+      type: "DELETED",
+      object: {
+        metadata: {
+          labels: { "browser-sandbox.io/execution": id },
+          annotations: { "browser-sandbox.io/epoch": "invalid" },
+        },
+      },
+    },
     watchSentinel(objects, other),
   ];
   void a.watch();
   await waitForControl(processed.promise, AbortSignal.timeout(5000));
   assert.equal(a.owns(id), true);
+});
+
+test("shared execution resources belong to the release and Secrets follow the execution Lease UID", async (t) => {
+  const { a, objects } = await fixture(t);
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "registered", profileId: "owned-profile" });
+  await a.acquireProfile(id, "owned-profile");
+  await a.finishMigration();
+  const resources = [...objects.values()];
+  const lease = resources.find(
+    (value) =>
+      value.kind === "Lease" &&
+      value.metadata.labels["browser-sandbox.io/state"] === "execution",
+  );
+  const secret = resources.find(
+    (value) =>
+      value.kind === "Secret" &&
+      value.metadata.labels["browser-sandbox.io/state"] === "execution",
+  );
+  for (const resource of resources.filter(
+    (value) => ["Lease", "Secret"].includes(value.kind) && value !== secret,
+  )) {
+    assert.deepEqual(resource.metadata.ownerReferences, [
+      {
+        apiVersion: "v1",
+        kind: "ConfigMap",
+        name: "workers",
+        uid: "release-uid",
+        controller: true,
+        blockOwnerDeletion: false,
+      },
+    ]);
+  }
+  assert.deepEqual(secret.metadata.ownerReferences, [
+    {
+      apiVersion: "coordination.k8s.io/v1",
+      kind: "Lease",
+      name: lease.metadata.name,
+      uid: lease.metadata.uid,
+      controller: true,
+      blockOwnerDeletion: false,
+    },
+  ]);
+});
+
+test("maintenance cleanup does not claim unready executions and API failures do not stop recovery", async (t) => {
+  const { a, state, objects } = await fixture(t, { maxFinished: 1 });
+  const third = "33333333-3333-4333-8333-333333333333";
+  for (const executionId of [id, other, third]) {
+    await a.resolve(executionId, true);
+    await a.journal.create(executionId, { phase: "finished" });
+    await a.complete(executionId);
+  }
+  // A controlled API failure on the first candidate must not block the next one.
+  state.failGet = id;
+  assert.deepEqual(await a.refresh(), []);
+  assert.equal(a.owns(id), false);
+  assert.equal(await a.journal.read(other), undefined);
+  state.failGet = undefined;
+  const secret = [...objects.values()].find(
+    (value) => value.kind === "Secret" && value.metadata.name.endsWith(id),
+  );
+  const body = JSON.parse(Buffer.from(secret.data.record, "base64").toString());
+  body.record.data.phase = "registered";
+  secret.data.record = Buffer.from(JSON.stringify(body)).toString("base64");
+  await a.refresh();
+  assert.equal(
+    a.owns(id),
+    false,
+    "maintenance must never keep an unloaded binding owned",
+  );
+  assert.equal((await a.journal.read(id)).data.phase, "registered");
+});
+
+test("Secret snapshot precedes fresh Lease check even when the response arrives after handoff", async (t) => {
+  const { a, b, state, objects } = await fixture(t);
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "registered", marker: "original" });
+  await b.resolve(id);
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  state.readAfterGet = true;
+  state.beforeGet = async (path) => {
+    if (!path.includes("/secrets/") || !path.endsWith(id)) return;
+    state.beforeGet = undefined;
+    entered.resolve();
+    await resume.promise;
+  };
+  const old = a.journal.update(id, 1, { phase: "registered", marker: "stale" });
+  const rejection = assert.rejects(old, /browser_controller_fenced/);
+  await entered.promise;
+  // Synthetic release visible in the API before the old controller drops local state.
+  const lease = [...objects.values()].find(
+    (v) =>
+      v.kind === "Lease" && v.metadata.labels["browser-sandbox.io/execution"] === id,
+  );
+  lease.spec.holderIdentity = "";
+  lease.metadata.resourceVersion += "-released";
+  await b.refresh();
+  await b.resolve(id);
+  resume.resolve();
+  await rejection;
+  assert.equal((await b.journal.read(id)).data.marker, "original");
+});
+
+test("handoff CAS retries preserve a concurrent local record revision", async (t) => {
+  const { a, b, state, objects } = await fixture(t);
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "registered", marker: "original" });
+  await b.resolve(id);
+  const lease = [...objects.values()].find(
+    (v) =>
+      v.kind === "Lease" && v.metadata.labels["browser-sandbox.io/execution"] === id,
+  );
+  lease.spec.holderIdentity = "";
+  lease.metadata.resourceVersion += "-released";
+  await b.refresh();
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  state.beforeWrite = async (path) => {
+    if (!path.includes("/secrets/")) return;
+    state.beforeWrite = undefined;
+    entered.resolve();
+    await resume.promise;
+  };
+  const claiming = b.resolve(id);
+  await entered.promise;
+  await b.journal.update(id, 1, { phase: "registered", marker: "concurrent" });
+  resume.resolve();
+  await claiming;
+  const saved = await b.journal.read(id);
+  assert.equal(saved.revision, 2);
+  assert.equal(saved.data.marker, "concurrent");
+});
+
+test("a late absent Secret POST retains old UID and handoff removes it", async (t) => {
+  const { a, b, objects, state } = await fixture(t);
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  state.beforePost = async (path) => {
+    if (!path.endsWith("/secrets")) return;
+    state.beforePost = undefined;
+    entered.resolve();
+    await resume.promise;
+  };
+  const old = a.resolve(id, true);
+  const rejected = assert.rejects(old, /browser_controller_fenced/);
+  await entered.promise;
+  const leaseEntry = [...objects].find(
+    ([, value]) =>
+      value.kind === "Lease" &&
+      value.metadata.labels["browser-sandbox.io/execution"] === id,
+  );
+  const oldUid = leaseEntry[1].metadata.uid;
+  objects.delete(leaseEntry[0]);
+  resume.resolve();
+  await rejected;
+  const stale = [...objects.values()].find((value) => value.kind === "Secret");
+  assert.equal(stale.metadata.ownerReferences[0].uid, oldUid);
+  const next = await b.resolve(id, true);
+  assert.equal(next.epoch, 1);
+  assert.notEqual(next.uid, oldUid);
+  const fresh = [...objects.values()].find((value) => value.kind === "Secret");
+  assert.equal(fresh.metadata.ownerReferences[0].uid, next.uid);
+  await b.journal.create(id, { phase: "registered" });
+});
+
+test("recreated UID fences an old Profile PUT after a free tombstone", async (t) => {
+  const { a, b, objects, state, gc } = await fixture(t);
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "registered", profileId: "same-id" });
+  await a.acquireProfile(id, "same-id");
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  state.beforeWrite = async (path) => {
+    if (!path.includes("-p-")) return;
+    state.beforeWrite = undefined;
+    entered.resolve();
+    await resume.promise;
+  };
+  await a.journal.update(id, 1, { phase: "finished", profileId: "same-id" });
+  const old = a.releaseProfile(id, "same-id");
+  const rejected = assert.rejects(
+    old,
+    /browser_profile_busy|browser_controller_fenced/,
+  );
+  await entered.promise;
+  const leaseEntry = [...objects].find(
+    ([, value]) =>
+      value.kind === "Lease" &&
+      value.metadata.labels["browser-sandbox.io/execution"] === id,
+  );
+  const oldUid = leaseEntry[1].metadata.uid;
+  objects.delete(leaseEntry[0]);
+  gc();
+  const profile = [...objects.values()].find(
+    (value) =>
+      value.kind === "Lease" &&
+      value.metadata.labels["browser-sandbox.io/state"] === "profile",
+  );
+  profile.spec.holderIdentity = "";
+  profile.metadata.resourceVersion += "-free";
+  const next = await b.resolve(id, true);
+  assert.equal(next.epoch, 1);
+  assert.notEqual(next.uid, oldUid);
+  await b.journal.create(id, { phase: "registered", profileId: "same-id" });
+  await b.acquireProfile(id, "same-id");
+  resume.resolve();
+  await rejected;
+  const held = [...objects.values()].find(
+    (value) =>
+      value.kind === "Lease" &&
+      value.metadata.labels["browser-sandbox.io/state"] === "profile",
+  );
+  assert.equal(held.spec.holderIdentity, id);
+  assert.equal(held.metadata.annotations["browser-sandbox.io/execution-uid"], next.uid);
+});
+
+test("recovery cannot reinsert a binding after ownership loss", async (t) => {
+  const { a, b, ports, advance, cleanups } = await fixture(t);
+  await a.resolve(id, true);
+  await a.journal.create(id, {
+    phase: "active",
+    incarnation: other,
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+    workerProtocol: "browser-sandbox.worker/v2",
+    workerId: "worker/uid",
+    generation: "original",
+    endpoint: {
+      cdpUrl: `ws://127.0.0.1:1/execution/${"a".repeat(64)}`,
+      viewerToken: "b".repeat(64),
+    },
+  });
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  const worker = {
+    id: "worker/uid",
+    executionId: id,
+    incarnation: other,
+    origin: "http://127.0.0.1:1",
+    epoch: 1,
+    runtime: {
+      close() {},
+      setEpoch() {},
+      setAutomation() {},
+      async request() {
+        entered.resolve();
+        await resume.promise;
+        return {
+          protocol: "browser-sandbox.worker/v2",
+          session: { generation: "original", state: "live" },
+        };
+      },
+    },
+  };
+  const starting = createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    backend: {
+      list: async () => [worker],
+      fence: async () => {},
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {},
+    },
+  });
+  cleanups.unshift(async () => {
+    resume.resolve();
+    const c = await starting;
+    await c.stop({ finalize: false });
+  });
+  await waitForControl(entered.promise, AbortSignal.timeout(5000));
+  await b.resolve(id);
+  advance(15001);
+  await b.resolve(id);
+  await a.refresh();
+  assert.equal(a.owns(id), false);
+  resume.resolve();
+  const c = await starting;
+  assert.equal(c.bindings.has(id), false);
+});
+
+test("ambiguous Secret owners fail closed and never delete the persisted record", async (t) => {
+  const { a, objects, advance, b } = await fixture(t);
+  await a.resolve(id, true);
+  const record = await a.journal.create(id, {
+    phase: "registered",
+    marker: "preserved",
+  });
+  const secret = [...objects.values()].find(
+    (value) => value.kind === "Secret" && value.metadata.name.endsWith(id),
+  );
+  secret.metadata.ownerReferences.push({
+    apiVersion: "v1",
+    kind: "ConfigMap",
+    name: "workers",
+    uid: "release-uid",
+    controller: false,
+  });
+  await b.resolve(id);
+  advance(15001);
+  await assert.rejects(b.resolve(id), /browser_controller_state_corrupt/);
+  assert.equal([...objects.values()].includes(secret), true);
+  assert.deepEqual(
+    JSON.parse(Buffer.from(secret.data.record, "base64").toString()).record,
+    record,
+  );
+});
+
+test("orphan recovery releases its binding and admission slot when ownership is lost during status", async (t) => {
+  const { a, b, ports, advance, cleanups } = await fixture(t);
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  let workers = [],
+    closed = 0;
+  const worker = {
+    id: "orphan/uid",
+    executionId: id,
+    incarnation: other,
+    origin: "http://127.0.0.1:1",
+    epoch: 1,
+    runtime: {
+      close() {
+        closed++;
+      },
+      setEpoch() {},
+      setAutomation() {},
+      async request() {
+        entered.resolve();
+        await resume.promise;
+        return { protocol: "browser-sandbox.worker/v2" };
+      },
+    },
+  };
+  const c = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => workers,
+      fence: async () => {},
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {},
+    },
+  });
+  cleanups.unshift(async () => {
+    resume.resolve();
+    await c.stop({ finalize: false }).catch(() => {});
+  });
+  workers = [worker];
+  const recovering = c.reconcile();
+  recovering.catch(() => {});
+  await waitForControl(entered.promise, AbortSignal.timeout(5000));
+  await b.resolve(id);
+  advance(15001);
+  await b.resolve(id);
+  await a.refresh();
+  resume.resolve();
+  await recovering.catch(() => {});
+  assert.equal(c.bindings.has(id), false);
+  assert.equal(c.capacity().workers, 0);
+  assert(closed > 0);
+});
+
+for (const restoring of [false, true])
+  test(`a delayed successful Profile acquisition cannot restore local state (${restoring ? "recovery" : "registration"})`, async (t) => {
+    const { a, b, ports, advance, cleanups } = await fixture(t);
+    const entered = Promise.withResolvers(),
+      resume = Promise.withResolvers();
+    const ownership = {
+      ...a,
+      async acquireProfile(...args) {
+        await a.acquireProfile(...args);
+        entered.resolve();
+        await resume.promise;
+      },
+    };
+    if (restoring) {
+      await a.resolve(id, true);
+      await a.journal.create(id, {
+        phase: "registered",
+        profileId: "delayed",
+        profileAcquired: true,
+        storageMode: "volume",
+        incarnation: other,
+        allowedDomains: [],
+        registeredAt: Date.now(),
+        lastActivityAt: Date.now(),
+        grants: [],
+      });
+    }
+    let busy;
+    const creating = createController({
+      ownership,
+      peerPort: ports[0],
+      port: 0,
+      reconciliationMs: 60000,
+      profileStore: {
+        open: () => ({}),
+        expire: async (_signal, isBusy) => {
+          busy = isBusy("delayed");
+          return 0;
+        },
+      },
+      backend: {
+        list: async () => [],
+        create: async () => {
+          throw Error("unexpected");
+        },
+        remove: async () => {},
+      },
+    });
+    let c;
+    cleanups.unshift(async () => {
+      resume.resolve();
+      c ??= await creating;
+      await c.stop({ finalize: false });
+    });
+    const registering = restoring
+      ? creating
+      : creating.then((value) => {
+          c = value;
+          return c.command({ op: "register", executionId: id, profileId: "delayed" });
+        });
+    registering.catch(() => {});
+    await waitForControl(entered.promise, AbortSignal.timeout(5000));
+    await b.resolve(id);
+    advance(15001);
+    await b.resolve(id);
+    await a.refresh();
+    resume.resolve();
+    await registering.catch(() => {});
+    c ??= await creating;
+    assert.equal(c.bindings.has(id), false);
+    await c.expireProfiles();
+    assert.equal(busy, false);
+  });
+
+test("a controller can register a compacted finished id under its new Lease UID", async (t) => {
+  const { a, ports, cleanups } = await fixture(t, { maxFinished: 1 });
+  const c = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => [],
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {},
+    },
+  });
+  cleanups.unshift(() => c.stop({ finalize: false }));
+  const peer = { signal: new AbortController().signal, callback: async () => {} };
+  for (const executionId of [id, other]) {
+    await c.command({ op: "register", executionId }, peer);
+    await c.command({ op: "finalize", executionId }, peer);
+  }
+  const oldUid = a.lookup(id).uid;
+  await a.compact();
+  assert.equal(a.lookup(id), undefined);
+  await c.command({ op: "register", executionId: id }, peer);
+  assert.equal(a.lookup(id).epoch, 1);
+  assert.notEqual(a.lookup(id).uid, oldUid);
+  assert.equal(c.bindings.get(id).phase, "registered");
+});
+
+test("a recreated record from another replica clears the former controller’s finished cache", async (t) => {
+  const { a, b, ports, advance, cleanups } = await fixture(t, { maxFinished: 1 });
+  const backend = {
+    list: async () => [],
+    create: async () => {
+      throw Error("unexpected");
+    },
+    remove: async () => {},
+  };
+  const c = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend,
+  });
+  cleanups.unshift(() => c.stop({ finalize: false }));
+  const peer = { signal: new AbortController().signal, callback: async () => {} };
+  for (const executionId of [id, other]) {
+    await c.command({ op: "register", executionId }, peer);
+    await c.command({ op: "finalize", executionId }, peer);
+  }
+  await a.compact();
+  await b.resolve(id, true);
+  await b.journal.create(id, {
+    phase: "registered",
+    incarnation: other,
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+  });
+  await a.refresh();
+  advance(15001);
+  await a.resolve(id);
+  await c.command({ op: "register", executionId: id }, peer);
+  assert.equal(c.bindings.get(id).phase, "registered");
+});
+
+test("failed shared recovery closes the worker channel restored before a later corrupt record", async (t) => {
+  const { a, ports } = await fixture(t);
+  for (const executionId of [id, other]) await a.resolve(executionId, true);
+  await a.journal.create(id, {
+    phase: "active",
+    incarnation: other,
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+    workerProtocol: "browser-sandbox.worker/v2",
+    workerId: "worker/uid",
+    generation: "original",
+  });
+  await a.journal.create(other, { phase: "active" });
+  let closed = 0;
+  const worker = {
+    id: "worker/uid",
+    executionId: id,
+    incarnation: other,
+    origin: "http://127.0.0.1:1",
+    epoch: 1,
+    runtime: {
+      close() {
+        closed++;
+      },
+      setEpoch() {},
+      setAutomation() {},
+      request: async () => ({
+        protocol: "browser-sandbox.worker/v2",
+        session: { state: "live", generation: "original" },
+      }),
+    },
+  };
+  await assert.rejects(
+    createController({
+      ownership: a,
+      peerPort: ports[0],
+      port: 0,
+      backend: {
+        list: async () => [worker],
+        fence: async () => {},
+        create: async () => {
+          throw Error("unexpected");
+        },
+        remove: async () => {},
+      },
+    }),
+    /browser_execution_journal_corrupt/,
+  );
+  assert(closed > 0);
 });

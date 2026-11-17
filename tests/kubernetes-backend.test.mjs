@@ -55,7 +55,7 @@ test("Kubernetes creates an owned single-execution Pod and fences deletion by UI
   });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
-  const backend = createKubernetesBackend({
+  const backend = await createKubernetesBackend({
     apiServer: `http://127.0.0.1:${server.address().port}`,
     namespace: "test",
     ownerName: "trial-browser-workers",
@@ -135,6 +135,27 @@ async function fixture(
           },
         }),
       );
+    } else if (request.url.includes("/leases/")) {
+      response.end(
+        JSON.stringify({
+          metadata: {
+            uid: "execution-uid",
+            labels: {
+              "browser-sandbox.io/execution": executionId,
+              "browser-sandbox.io/state": "execution",
+            },
+            ownerReferences: [
+              {
+                apiVersion: "v1",
+                kind: "ConfigMap",
+                name: "trial-browser-workers",
+                uid: "release-uid",
+                controller: true,
+              },
+            ],
+          },
+        }),
+      );
     } else if (request.url.includes("/pods?")) {
       if (state.listFailure) response.writeHead(503).end("{}");
       else
@@ -179,6 +200,8 @@ async function fixture(
         ...state.pod.metadata.annotations,
         ...body.metadata.annotations,
       };
+      if (body.metadata.ownerReferences)
+        state.pod.metadata.ownerReferences = body.metadata.ownerReferences;
       state.pod.metadata.resourceVersion = "2";
       response.end(JSON.stringify(state.pod));
     } else if (request.method === "DELETE") {
@@ -229,7 +252,7 @@ async function fixture(
   });
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
-  const backend = createKubernetesBackend({
+  const backend = await createKubernetesBackend({
     ownership,
     apiServer: `http://127.0.0.1:${server.address().port}`,
     namespace: "test",
@@ -398,7 +421,7 @@ test("Kubernetes discovery retains Profile ownership from labels and annotations
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   t.after(() => new Promise((resolve) => server.close(resolve)));
-  const backend = createKubernetesBackend({
+  const backend = await createKubernetesBackend({
     apiServer: `http://127.0.0.1:${server.address().port}`,
     namespace: "test",
     ownerName: "trial-browser-workers",
@@ -439,7 +462,7 @@ test("Kubernetes discovery recovers exact UID and rejects foreign release owners
   state.listOwner = "foreign-release";
   await assert.rejects(
     backend.list(AbortSignal.timeout(5000)),
-    /browser_worker_discovery_failed/,
+    /browser_worker_ownership_mismatch/,
   );
   state.listFailure = true;
   await assert.rejects(
@@ -490,7 +513,9 @@ test("Kubernetes quota rejection reports the cause without allocating a Pod", as
 
 test("Kubernetes epoch fencing prevents stale deletion and permits confirmed stopped cleanup", async (t) => {
   let epoch = 1;
-  const ownership = { assertOwned: async () => epoch };
+  const ownership = {
+    assertOwned: async () => ({ epoch, uid: "execution-uid", name: "execution-lease" }),
+  };
   const { backend, state } = await fixture(t, { ownership });
   const worker = await backend.create(
     { executionId, incarnation },
@@ -498,19 +523,16 @@ test("Kubernetes epoch fencing prevents stale deletion and permits confirmed sto
   );
   t.after(() => worker.runtime.close());
   assert.equal(state.pod.metadata.annotations["browser-sandbox.io/epoch"], "1");
-  epoch = 2;
+  state.pod.metadata.annotations["browser-sandbox.io/epoch"] = "2";
   await assert.rejects(
     backend.remove(worker, AbortSignal.timeout(5000)),
     /browser_controller_fenced/,
   );
   assert.equal(state.deleted, false);
-  delete state.pod.metadata.annotations["browser-sandbox.io/creation-epoch"];
+  epoch = 2;
   await backend.fence(worker, epoch, AbortSignal.timeout(5000), true);
   assert.equal(state.pod.metadata.annotations["browser-sandbox.io/epoch"], "2");
-  assert.equal(
-    state.pod.metadata.annotations["browser-sandbox.io/creation-epoch"],
-    "1",
-  );
+  assert.equal(state.pod.metadata.ownerReferences[0].uid, "execution-uid");
   epoch = 1;
   await assert.rejects(
     backend.remove(worker, AbortSignal.timeout(5000)),
@@ -527,7 +549,7 @@ test("a Pod POST paused across takeover cannot publish a stale worker", async (t
   const ownership = {
     assertOwned: async () => {
       if (epoch !== 1) throw Error("browser_controller_fenced");
-      return epoch;
+      return { epoch, uid: "execution-uid", name: "execution-lease" };
     },
   };
   const { backend, state } = await fixture(t, { ownership });
@@ -556,5 +578,69 @@ test("a Pod POST paused across takeover cannot publish a stale worker", async (t
     false,
     "stale owner cannot delete across the handoff either",
   );
+  assert.equal(state.pod.metadata.annotations["browser-sandbox.io/epoch"], "1");
+});
+
+for (const invalidEpoch of ["malformed", -1, 1.5])
+  test(`Kubernetes refuses deletion with invalid Pod epoch ${invalidEpoch}`, async (t) => {
+    const ownership = {
+      assertOwned: async () => ({
+        epoch: 1,
+        uid: "execution-uid",
+        name: "execution-lease",
+      }),
+    };
+    const { backend, state } = await fixture(t, { ownership });
+    const worker = await backend.create(
+      { executionId, incarnation },
+      AbortSignal.timeout(5000),
+    );
+    t.after(() => worker.runtime.close());
+    state.pod.metadata.annotations["browser-sandbox.io/epoch"] = invalidEpoch;
+    await assert.rejects(
+      backend.remove(worker, AbortSignal.timeout(5000)),
+      /browser_controller_fenced/,
+    );
+    assert.equal(state.deleted, false);
+  });
+
+test("shared fencing adopts a compatible release-owned worker into its execution Lease", async (t) => {
+  const ownership = {
+    assertOwned: async () => ({
+      epoch: 1,
+      uid: "execution-uid",
+      name: "execution-lease",
+    }),
+  };
+  const { backend, state } = await fixture(t, { ownership });
+  const worker = await backend.create(
+    { executionId, incarnation },
+    AbortSignal.timeout(5000),
+  );
+  t.after(() => worker.runtime.close());
+  state.pod.metadata.ownerReferences = [
+    {
+      apiVersion: "v1",
+      kind: "ConfigMap",
+      name: "trial-browser-workers",
+      uid: "release-uid",
+      controller: true,
+      blockOwnerDeletion: false,
+    },
+  ];
+  delete state.pod.metadata.annotations["browser-sandbox.io/epoch"];
+  const [discovered] = await backend.list(AbortSignal.timeout(5000));
+  t.after(() => discovered.runtime.close());
+  await backend.fence(discovered, 1, AbortSignal.timeout(5000), true);
+  assert.deepEqual(state.pod.metadata.ownerReferences, [
+    {
+      apiVersion: "coordination.k8s.io/v1",
+      kind: "Lease",
+      name: "execution-lease",
+      uid: "execution-uid",
+      controller: true,
+      blockOwnerDeletion: false,
+    },
+  ]);
   assert.equal(state.pod.metadata.annotations["browser-sandbox.io/epoch"], "1");
 });

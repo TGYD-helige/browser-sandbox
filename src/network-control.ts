@@ -188,11 +188,47 @@ export function createNetworkHostControl({
   };
 }
 
+/** One bounded connection; callers own its lifetime and protocol payloads. */
+export function connectControl(
+  origin: string,
+  dispatch: Parameters<typeof connectPeer>[1],
+  handshakeTimeout = 30000,
+) {
+  const url = new URL("/host", origin);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(url, { maxPayload: 32 * 1024 * 1024, handshakeTimeout });
+  const rpc = connectPeer(socket, dispatch);
+  const ready = new Promise<void>((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", () => reject(Error("browser_control_unavailable")));
+    socket.once("close", () => reject(Error("browser_control_disconnected")));
+  });
+  ready.catch(() => {});
+  return {
+    signal: rpc.signal,
+    async call<T>(
+      input: Record<string, unknown>,
+      options?: { signal?: AbortSignal; timeoutMs?: number },
+    ): Promise<T> {
+      if (rpc.signal.aborted) throw Error("browser_control_disconnected");
+      const signal = AbortSignal.any([
+        ...(options?.signal ? [options.signal] : []),
+        AbortSignal.timeout(options?.timeoutMs ?? CONTROL_TIMEOUT_MS),
+      ]);
+      await waitForControl(ready, signal);
+      return rpc.call<T>(input, { ...options, signal });
+    },
+    close() {
+      socket.terminate();
+    },
+  };
+}
+
 export interface ControllerRuntime extends BrowserRuntime {
   identity: "managed";
   close(): void;
   setAutomation(automation: AutomationCoordinator): void;
-  setEpoch(epoch: number): void;
+  setEpoch(epoch: number, ownerUid?: string): void;
 }
 
 /** Internal trusted networks only; host authentication is reserved at /host. */
@@ -201,18 +237,14 @@ export function createControllerRuntime(
   {
     automation: initialAutomation,
     epoch: initialEpoch,
-  }: { automation?: AutomationCoordinator; epoch?: number } = {},
+    ownerUid: initialOwnerUid,
+  }: { automation?: AutomationCoordinator; epoch?: number; ownerUid?: string } = {},
 ): ControllerRuntime {
   let automation = initialAutomation;
   let epoch = initialEpoch;
+  let ownerUid = initialOwnerUid;
   const storage = new Map<string, StorageAdapter>();
-  const url = new URL("/host", origin);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  const socket = new WebSocket(url, {
-    maxPayload: 32 * 1024 * 1024,
-    handshakeTimeout: 30000,
-  });
-  const rpc = connectPeer(socket, async (request, signal) => {
+  const rpc = connectControl(origin, async (request, signal) => {
     if (["pause", "resume"].includes(request.op)) {
       if (!automation) throw Error("browser_automation_stop_required");
       await automation[request.op](request.executionId, signal);
@@ -225,31 +257,25 @@ export function createControllerRuntime(
     if (request.op === "commit") return adapter.commit(request.payload, signal);
     throw Error("browser_control_operation_invalid");
   });
-  const ready = new Promise<void>((resolve, reject) => {
-    socket.once("open", resolve);
-    socket.once("error", () => reject(Error("browser_control_unavailable")));
-    socket.once("close", () => reject(Error("browser_control_disconnected")));
-  });
-  ready.catch(() => {});
   const request = async <T>(
     input: Record<string, unknown>,
     options?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<T> => {
-    if (rpc.signal.aborted) throw Error("browser_control_disconnected");
-    const signal = AbortSignal.any([
-      ...(options?.signal ? [options.signal] : []),
-      AbortSignal.timeout(options?.timeoutMs ?? CONTROL_TIMEOUT_MS),
-    ]);
-    await waitForControl(ready, signal);
     return rpc.call<T>(
-      { ...input, ...(epoch === undefined ? {} : { epoch }), automation: !!automation },
-      { ...options, signal },
+      {
+        ...input,
+        ...(epoch === undefined ? {} : { epoch }),
+        ...(ownerUid ? { ownerUid } : {}),
+        automation: !!automation,
+      },
+      options,
     );
   };
   return {
     identity: "managed",
-    setEpoch(value) {
+    setEpoch(value, uid) {
       epoch = value;
+      ownerUid = uid;
     },
     setAutomation(value) {
       automation = value;
@@ -283,8 +309,6 @@ export function createControllerRuntime(
         },
       };
     },
-    close() {
-      socket.terminate();
-    },
+    close: rpc.close,
   };
 }

@@ -2,7 +2,7 @@ import { type IncomingMessage, request, type ServerResponse } from "node:http";
 import type { Duplex } from "node:stream";
 import { pipeline } from "node:stream";
 import WebSocket, { createWebSocketStream } from "ws";
-import { type ControlPeer, connectPeer } from "./network-control.js";
+import { type ControlPeer, connectControl } from "./network-control.js";
 
 /** A separate listener, rather than a caller-controlled header, is the one-hop marker. */
 export function forwardControllerRequest(
@@ -87,9 +87,9 @@ export function forwardControllerRequest(
 export function createHostForwarding() {
   const peers = new WeakMap<
     ControlPeer,
-    Map<string, { rpc: ReturnType<typeof connectPeer>; ready: Promise<void> }>
+    Map<string, ReturnType<typeof connectControl>>
   >();
-  const sockets = new Set<WebSocket>();
+  const connections = new Set<ReturnType<typeof connectControl>>();
   return {
     async request(
       origin: string,
@@ -98,44 +98,40 @@ export function createHostForwarding() {
       signal?: AbortSignal,
     ) {
       if (!peer) throw Error("browser_host_authority_required");
+      if (peer.signal.aborted) throw Error("browser_controller_owner_moved");
       let owners = peers.get(peer);
-      if (!owners) {
-        owners = new Map();
-        peers.set(peer, owners);
-      }
+      if (!owners) peers.set(peer, (owners = new Map()));
       let connection = owners.get(origin);
-      if (!connection || connection.rpc.signal.aborted) {
-        const url = new URL("/host", origin);
-        url.protocol = "ws:";
-        const socket = new WebSocket(url, {
-          maxPayload: 32 * 1024 * 1024,
-          handshakeTimeout: 10000,
-        });
-        sockets.add(socket);
-        const close = () => socket.terminate();
-        peer.signal.addEventListener("abort", close, { once: true });
-        socket.once("close", () => {
-          sockets.delete(socket);
-          if (owners.get(origin)?.rpc === rpc) owners.delete(origin);
-          peer.signal.removeEventListener("abort", close);
-        });
-        const rpc = connectPeer(socket, (input, callbackSignal) =>
-          peer.callback(input.op, input, callbackSignal),
+      if (!connection || connection.signal.aborted) {
+        connection = connectControl(
+          origin,
+          (input, signal) => peer.callback(input.op, input, signal),
+          10000,
         );
-        const ready = new Promise<void>((resolve, reject) => {
-          socket.once("open", resolve);
-          socket.once("error", () => reject(Error("browser_controller_owner_moved")));
-          socket.once("close", () => reject(Error("browser_controller_owner_moved")));
-        });
-        ready.catch(() => {});
-        connection = { rpc, ready };
-        owners.set(origin, connection);
+        const current = connection;
+        connections.add(current);
+        owners.set(origin, current);
+        peer.signal.addEventListener("abort", current.close, { once: true });
+        current.signal.addEventListener(
+          "abort",
+          () => {
+            connections.delete(current);
+            if (owners.get(origin) === current) owners.delete(origin);
+            peer.signal.removeEventListener("abort", current.close);
+          },
+          { once: true },
+        );
       }
-      await connection.ready;
-      return connection.rpc.call(request, { signal });
+      try {
+        return await connection.call(request, { signal });
+      } catch (error) {
+        if (/^browser_control_(unavailable|disconnected)$/.test(error.message))
+          throw Error("browser_controller_owner_moved");
+        throw error;
+      }
     },
     close() {
-      for (const socket of sockets) socket.terminate();
+      for (const connection of connections) connection.close();
     },
   };
 }

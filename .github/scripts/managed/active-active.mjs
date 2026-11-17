@@ -273,6 +273,8 @@ export async function activeActive({
   let paused;
   let pausedProcess;
   let installed = false;
+  let cordoned;
+  const heldGcResources = [];
   let stage = "journal corruption";
   try {
     installed = true;
@@ -626,7 +628,7 @@ export async function activeActive({
       "node",
       "--input-type=module",
       "-e",
-      `import{createControllerRuntime}from'/opt/browser-sandbox/dist/network-control.js';const old=createControllerRuntime('http://${worker.status.podIP}:8081',{epoch:${oldEpoch}});const next=createControllerRuntime('http://${worker.status.podIP}:8081',{epoch:${Number(next.lease.metadata.annotations[prefix + "epoch"])}});try{try{await old.request({op:'finalize',executionId:'${id}'});throw Error('old_epoch_accepted')}catch(e){if(e.message!=='browser_controller_fenced')throw e}const status=await next.request({op:'worker_status',executionId:'${id}'});if(status.protocol!=='browser-sandbox.worker/v2')throw Error('worker_epoch_regressed')}finally{old.close();next.close()}`,
+      `import{createControllerRuntime}from'/opt/browser-sandbox/dist/network-control.js';const old=createControllerRuntime('http://${worker.status.podIP}:8081',{epoch:${oldEpoch},ownerUid:${JSON.stringify(current.lease.metadata.uid)}});const next=createControllerRuntime('http://${worker.status.podIP}:8081',{epoch:${Number(next.lease.metadata.annotations[prefix + "epoch"])},ownerUid:${JSON.stringify(next.lease.metadata.uid)}});try{try{await old.request({op:'finalize',executionId:'${id}'});throw Error('old_epoch_accepted')}catch(e){if(e.message!=='browser_controller_fenced')throw e}const status=await next.request({op:'worker_status',executionId:'${id}'});if(status.protocol!=='browser-sandbox.worker/v2')throw Error('worker_epoch_regressed')}finally{old.close();next.close()}`,
     );
     report.resumedOldControllerReportedFencingWithoutRemoval = true;
     report.workerEpochDidNotRegressAfterResume = true;
@@ -654,7 +656,7 @@ export async function activeActive({
         Number(value.lease.metadata.annotations[prefix + "epoch"]) > rollingEpoch,
       45000,
     );
-    await client("verify", id);
+    await client("verify-rollout", id);
     report.gracefulRollout = {
       takeoverMs: performance.now() - rollingStarted,
       samples: 1,
@@ -685,12 +687,26 @@ export async function activeActive({
           [prefix + "incarnation"]: randomUUID(),
         },
         annotations: { [prefix + "profile-id"]: "" },
-        ownerReferences: worker.metadata.ownerReferences,
+        ownerReferences: [
+          {
+            apiVersion: "v1",
+            kind: "ConfigMap",
+            name: `${deployment}-workers`,
+            uid: JSON.parse(
+              await kubectl("get", "configmap", `${deployment}-workers`, "-o", "json"),
+            ).metadata.uid,
+            controller: true,
+            blockOwnerDeletion: false,
+          },
+        ],
       },
       spec: structuredClone(worker.spec),
     };
     const environment = orphan.spec.containers[0].env;
     environment.find((entry) => entry.name === "BROWSER_EXECUTION_ID").value = orphanId;
+    orphan.spec.containers[0].env = environment.filter(
+      (entry) => entry.name !== "BROWSER_OWNER_UID",
+    );
     await run("kubectl", ["-n", namespace, "apply", "-f", "-"], {
       input: JSON.stringify(orphan),
     });
@@ -728,6 +744,159 @@ export async function activeActive({
     );
     report.orphanObservationMs = await observeSingleRemoval(removalCount);
     report.orphanReclaimedOnce = true;
+    stage = "Lease UID garbage collection";
+    const gcId = randomUUID();
+    await client("register", gcId);
+    const prior = await peers(gcId);
+    await kubectl("delete", "lease", prior.lease.metadata.name, "--wait=true");
+    await wait(
+      "Deleted Lease did not fence its controller",
+      () => readEvents(prior.pod),
+      (events) =>
+        events.some((event) => event.executionId === gcId && event.type === "fenced"),
+    );
+    await client("register", gcId);
+    const recreated = await peers(gcId);
+    assert.notEqual(recreated.lease.metadata.uid, prior.lease.metadata.uid);
+    assert.equal(Number(recreated.lease.metadata.annotations[prefix + "epoch"]), 1);
+    const staleOwner = {
+      apiVersion: "coordination.k8s.io/v1",
+      kind: "Lease",
+      name: prior.lease.metadata.name,
+      uid: prior.lease.metadata.uid,
+      controller: true,
+      blockOwnerDeletion: false,
+    };
+    const lateName = `ha-late-${gcId.slice(0, 8)}`;
+    const metadata = {
+      name: lateName,
+      labels: {
+        ...worker.metadata.labels,
+        [prefix + "execution"]: gcId,
+        [prefix + "incarnation"]: randomUUID(),
+      },
+      annotations: { [prefix + "profile-id"]: "", [prefix + "epoch"]: "1" },
+      ownerReferences: [staleOwner],
+      finalizers: ["browser-sandbox.io/gc-probe"],
+    };
+    const lateSpec = structuredClone(worker.spec);
+    for (const entry of lateSpec.containers[0].env) {
+      if (entry.name === "BROWSER_EXECUTION_ID") entry.value = gcId;
+      if (entry.name === "BROWSER_OWNER_UID") entry.value = prior.lease.metadata.uid;
+    }
+    for (const resource of [
+      { apiVersion: "v1", kind: "Pod", metadata, spec: lateSpec },
+      {
+        apiVersion: "v1",
+        kind: "Secret",
+        metadata,
+        type: "Opaque",
+        stringData: { probe: "old-uid" },
+      },
+    ]) {
+      heldGcResources.push(`${resource.kind.toLowerCase()}/${lateName}`);
+      await run("kubectl", ["-n", namespace, "create", "-f", "-"], {
+        input: JSON.stringify(resource),
+      });
+    }
+    for (const resource of heldGcResources)
+      await wait(
+        "GC did not mark the late old-UID dependent for deletion",
+        async () => JSON.parse(await kubectl("get", resource, "-o", "json")),
+        (item) => Boolean(item.metadata.deletionTimestamp),
+      );
+    await kubectl(
+      "exec",
+      recreated.pod.metadata.name,
+      "--",
+      "node",
+      "--input-type=module",
+      "-e",
+      `import assert from 'node:assert/strict';import{readFile}from'node:fs/promises';import{readKubernetesAccess}from'/opt/browser-sandbox/dist/kubernetes-api.js';import{createKubernetesOwnership}from'/opt/browser-sandbox/dist/kubernetes-ownership.js';import{createKubernetesBackend}from'/opt/browser-sandbox/dist/kubernetes-backend.js';const env=process.env;const options={...await readKubernetesAccess(),installation:env.BROWSER_INSTALLATION,ownerName:env.BROWSER_KUBERNETES_OWNER};const ownership=await createKubernetesOwnership({...options,replica:env.BROWSER_CONTROLLER_ID,peerOrigin:env.BROWSER_PEER_ORIGIN});try{const backend=await createKubernetesBackend({...options,ownership,image:env.BROWSER_IMAGE,template:JSON.parse(await readFile(env.BROWSER_WORKER_TEMPLATE??'/etc/browser-sandbox/worker-template.json','utf8'))});assert(!(await backend.list(AbortSignal.timeout(15000))).some(w=>w.id.startsWith('${lateName}/')))}finally{await ownership.close()}`,
+    );
+    for (const resource of heldGcResources) {
+      await kubectl(
+        "patch",
+        resource,
+        "--type=merge",
+        "-p",
+        JSON.stringify({ metadata: { finalizers: [] } }),
+      );
+      await kubectl("wait", "--for=delete", resource, "--timeout=60s");
+    }
+    heldGcResources.length = 0;
+    const liveLease = JSON.parse(
+      await kubectl("get", "lease", recreated.lease.metadata.name, "-o", "json"),
+    );
+    const liveSecret = JSON.parse(
+      await kubectl("get", "secret", recreated.lease.metadata.name, "-o", "json"),
+    );
+    assert.equal(liveLease.metadata.uid, recreated.lease.metadata.uid);
+    assert.equal(
+      liveSecret.metadata.ownerReferences[0].uid,
+      recreated.lease.metadata.uid,
+    );
+    await client("finish", gcId);
+    report.lateOldUidPodAndSecretGarbageCollected = true;
+    report.discoverySkippedOldUidPod = true;
+    report.recreatedExecutionEpochOneHasNewUid = true;
+
+    stage = "shared worker drain without force";
+    const drainId = randomUUID();
+    await client("prepare", drainId);
+    const drainOwner = await peers(drainId);
+    const draining = (await list("worker")).find(
+      (pod) => pod.metadata.labels[prefix + "execution"] === drainId,
+    );
+    assert.equal(draining.metadata.ownerReferences.length, 1);
+    assert.equal(draining.metadata.ownerReferences[0].kind, "Lease");
+    assert.equal(draining.metadata.ownerReferences[0].controller, true);
+    assert.equal(
+      draining.metadata.ownerReferences[0].uid,
+      drainOwner.lease.metadata.uid,
+    );
+    cordoned = draining.spec.nodeName;
+    await kubectl(
+      "drain",
+      cordoned,
+      "--ignore-daemonsets",
+      "--delete-emptydir-data",
+      `--pod-selector=app.kubernetes.io/instance=${release},app.kubernetes.io/component=worker,${prefix}execution=${drainId}`,
+      "--timeout=90s",
+    );
+    await kubectl("uncordon", cordoned);
+    cordoned = undefined;
+    assert(
+      !(await list("worker")).some(
+        (pod) => pod.metadata.labels[prefix + "execution"] === drainId,
+      ),
+    );
+    await client("finish", drainId);
+    report.sharedStateDrainWithoutForce = true;
+
+    stage = "shared state uninstall";
+    await run(
+      "helm",
+      ["uninstall", release, "-n", namespace, "--wait", "--timeout", "120s"],
+      { timeout: 150000 },
+    );
+    installed = false;
+    await wait(
+      "Uninstall retained shared Leases or Secrets",
+      async () =>
+        JSON.parse(
+          await kubectl(
+            "get",
+            "leases,secrets",
+            "-l",
+            `${prefix}installation=${release}`,
+            "-o",
+            "json",
+          ),
+        ).items,
+      (items) => items.length === 0,
+    );
+    report.uninstallRemovedAllSharedLeasesAndSecrets = true;
     await writeFile(
       "managed-results/active-active-kubernetes.json",
       JSON.stringify(report, null, 2) + "\n",
@@ -764,6 +933,15 @@ export async function activeActive({
     throw error;
   } finally {
     if (pausedProcess) await signalProcess(pausedProcess, "CONT").catch(() => {});
+    if (cordoned) await kubectl("uncordon", cordoned).catch(() => {});
+    for (const resource of heldGcResources)
+      await kubectl(
+        "patch",
+        resource,
+        "--type=merge",
+        "-p",
+        JSON.stringify({ metadata: { finalizers: [] } }),
+      ).catch(() => {});
     if (installed)
       await run(
         "helm",

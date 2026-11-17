@@ -223,3 +223,31 @@ test("a raw upgrade response deadline never appends a second HTTP response insid
   await closed;
   assert.equal(body, "partial-body");
 });
+
+test("an already disconnected forwarding peer cannot execute commands on the owner", async (t) => {
+  let calls = 0;
+  const server = createServer();
+  const host = createNetworkHostControl({
+    server,
+    dispatch: async () => ({ called: ++calls }),
+  });
+  const forwarding = createHostForwarding();
+  t.after(async () => {
+    forwarding.close();
+    host.close();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const life = new AbortController();
+  life.abort();
+  await assert.rejects(
+    forwarding.request(
+      `http://127.0.0.1:${server.address().port}`,
+      { op: "session" },
+      { signal: life.signal, callback: async () => {} },
+    ),
+    /browser_controller_owner_moved/,
+  );
+  assert.equal(calls, 0);
+});

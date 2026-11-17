@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { createServer, request as httpRequest } from "node:http";
+import { createServer, request as httpRequest, STATUS_CODES } from "node:http";
 import type { AddressInfo } from "node:net";
 import { pipeline, Transform } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
@@ -651,34 +651,19 @@ export async function createController(options: ControllerOptions) {
   function bindStorage(binding: ExecutionBinding) {
     if (!binding.profileId && binding.storageMode !== "host") return;
     if (binding.storageMode === "host") {
+      const call = (op: string, payload: unknown, signal?: AbortSignal) => {
+        if (!binding.storagePeer || binding.storagePeer.signal.aborted)
+          throw Error("browser_storage_disconnected");
+        return binding.storagePeer.callback(
+          op,
+          { executionId: binding.executionId, payload },
+          signal,
+        );
+      };
       binding.storage = {
-        load: (signal) => {
-          if (!binding.storagePeer || binding.storagePeer.signal.aborted)
-            throw Error("browser_storage_disconnected");
-          return binding.storagePeer.callback(
-            "load",
-            { executionId: binding.executionId },
-            signal,
-          );
-        },
-        save: (signal) => {
-          if (!binding.storagePeer || binding.storagePeer.signal.aborted)
-            throw Error("browser_storage_disconnected");
-          return binding.storagePeer.callback(
-            "save",
-            { executionId: binding.executionId },
-            signal,
-          );
-        },
-        commit: (payload, signal) => {
-          if (!binding.storagePeer || binding.storagePeer.signal.aborted)
-            throw Error("browser_storage_disconnected");
-          return binding.storagePeer.callback(
-            "commit",
-            { executionId: binding.executionId, payload },
-            signal,
-          );
-        },
+        load: (signal) => call("load", undefined, signal),
+        save: (signal) => call("save", undefined, signal),
+        commit: (payload, signal) => call("commit", payload, signal),
       };
     } else {
       if (!options.profileStore) throw Error("browser_profile_storage_unavailable");
@@ -742,7 +727,10 @@ export async function createController(options: ControllerOptions) {
   }
   function adoptRecoveredWorker(binding: ExecutionBinding, worker?: ManagedWorker) {
     if (worker && ownership)
-      worker.runtime.setEpoch?.(ownership.epoch(binding.executionId));
+      worker.runtime.setEpoch?.(
+        ownership.epoch(binding.executionId),
+        ownership.lookup(binding.executionId)?.uid,
+      );
     if (
       worker &&
       (worker.profileId !== binding.profileId ||
@@ -760,11 +748,13 @@ export async function createController(options: ControllerOptions) {
     const live = new Set([...bindings.values()].map((binding) => binding.worker?.id));
     for (const worker of workers) if (!live.has(worker.id)) closeWorkerChannel(worker);
   }
-  async function checkGeneration(binding: ExecutionBinding, signal?: AbortSignal) {
-    const status = await binding.worker.runtime.request<any>(
-      { op: "worker_status", executionId: binding.executionId },
+  const readWorkerStatus = (worker: ManagedWorker, signal?: AbortSignal) =>
+    worker.runtime.request<any>(
+      { op: "worker_status", executionId: worker.executionId },
       { signal, timeoutMs: 10000 },
     );
+  async function checkGeneration(binding: ExecutionBinding, signal?: AbortSignal) {
+    const status = await readWorkerStatus(binding.worker, signal);
     if (!supportedProtocol(status?.protocol))
       throw Error("browser_worker_protocol_unsupported");
     if (!status.session || typeof status.session.state !== "string")
@@ -857,7 +847,10 @@ export async function createController(options: ControllerOptions) {
             creationSignal,
           );
           binding.worker = worker;
-          worker.runtime.setEpoch?.(ownership?.epoch(binding.executionId));
+          worker.runtime.setEpoch?.(
+            ownership?.epoch(binding.executionId),
+            ownership?.lookup(binding.executionId)?.uid,
+          );
           creationSignal.throwIfAborted();
           const result = await worker.runtime.request<{
             cdpUrl: string;
@@ -1065,6 +1058,7 @@ export async function createController(options: ControllerOptions) {
       if (ownership && binding.profileId && !binding.profileAcquired) {
         await persist(binding);
         await ownership.acquireProfile(id, binding.profileId);
+        if (bindings.get(id) !== binding) throw Error("browser_controller_fenced");
         binding.profileAcquired = true;
         profileLeases.set(binding.profileId, binding);
       }
@@ -1530,14 +1524,8 @@ export async function createController(options: ControllerOptions) {
     } catch (error) {
       const status = errorStatus(error, grant);
       const body = JSON.stringify({ error: errorCode(error, grant) });
-      const reason =
-        status === 403
-          ? "Forbidden"
-          : status === 503
-            ? "Service Unavailable"
-            : "Bad Gateway";
       socket.end(
-        `HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+        `HTTP/1.1 ${status} ${STATUS_CODES[status]}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
       );
     }
   };
@@ -1555,14 +1543,6 @@ export async function createController(options: ControllerOptions) {
       finishedRevisions.set(id, record.revision);
       return;
     }
-    if (
-      typeof data.incarnation !== "string" ||
-      !Array.isArray(data.allowedDomains) ||
-      !Number.isSafeInteger(data.registeredAt) ||
-      !Number.isSafeInteger(data.lastActivityAt) ||
-      !Array.isArray(data.grants)
-    )
-      throw Error("browser_execution_journal_corrupt");
     let worker =
       owned.get(data.workerId) ??
       discovered.find(
@@ -1580,8 +1560,6 @@ export async function createController(options: ControllerOptions) {
       owned.delete(worker.id);
       worker = undefined;
     }
-    if (ownership && data.profileId && data.profileAcquired !== false)
-      await ownership.acquireProfile(id, data.profileId);
     const binding: ExecutionBinding = {
       executionId: id,
       incarnation: data.incarnation,
@@ -1625,10 +1603,12 @@ export async function createController(options: ControllerOptions) {
       !binding.infrastructureOnly &&
       binding.profileAcquired !== false
     ) {
-      if (!validProfileId(binding.profileId) || profileLeases.has(binding.profileId))
+      if (profileLeases.has(binding.profileId))
         throw Error("browser_profile_lease_recovery_failed");
       profileLeases.set(binding.profileId, binding);
       bindStorage(binding);
+      if (ownership) await ownership.acquireProfile(id, binding.profileId);
+      if (binding.revoked) return;
     }
     if (worker) {
       owned.delete(worker.id);
@@ -1651,10 +1631,7 @@ export async function createController(options: ControllerOptions) {
           binding.stopConfirmed ||
           ["finalizing", "recovery-blocked"].includes(data.phase)
             ? { protocol: WORKER_PROTOCOL }
-            : await worker.runtime.request<any>(
-                { op: "worker_status", executionId: id },
-                { timeoutMs: 10000 },
-              );
+            : await readWorkerStatus(worker);
         if (!supportedProtocol(status.protocol))
           throw Error("browser_worker_protocol_unsupported");
         if (
@@ -1689,11 +1666,8 @@ export async function createController(options: ControllerOptions) {
       ].includes(data.phase)
     )
       binding.revoked = true;
-    bindings.set(id, binding);
     if (binding.revoked) return;
     for (const grant of data.grants) {
-      if (!/^[a-f0-9]{64}$/.test(grant.token) || !["cdp", "view"].includes(grant.kind))
-        throw Error("browser_execution_journal_corrupt");
       if (!grant.expiresAt || grant.expiresAt > Date.now())
         issue(
           binding,
@@ -1730,6 +1704,7 @@ export async function createController(options: ControllerOptions) {
       life: new AbortController(),
       revoked: true,
     };
+    bindings.set(binding.executionId, binding);
     if (binding.profileId && !binding.infrastructureOnly) {
       if (profileLeases.has(binding.profileId))
         throw Error("browser_profile_lease_recovery_failed");
@@ -1748,15 +1723,11 @@ export async function createController(options: ControllerOptions) {
           AbortSignal.timeout(15000),
         );
       if (worker.infrastructureOnly) {
-        bindings.set(binding.executionId, binding);
         await persist(binding);
         return;
       }
       await attachWorkerStorage(binding);
-      const status = await worker.runtime.request<any>(
-        { op: "worker_status", executionId: worker.executionId },
-        { timeoutMs: 10000 },
-      );
+      const status = await readWorkerStatus(worker);
       if (typeof status.protocol === "string") binding.workerProtocol = status.protocol;
       if (!supportedProtocol(status.protocol))
         throw Error("browser_worker_protocol_unsupported");
@@ -1764,7 +1735,6 @@ export async function createController(options: ControllerOptions) {
     } catch (error) {
       binding.recoveryError = errorCode(error);
     }
-    bindings.set(binding.executionId, binding);
     await persist(binding);
   }
   function dropOwned(id: string) {
@@ -1788,12 +1758,13 @@ export async function createController(options: ControllerOptions) {
       pending = (async () => {
         await ownership.assertOwned(id);
         const record = await ownership.journal.read(id);
-        if (!record) return;
-        if (record.data.phase === "finished") {
+        if (record?.data.phase === "finished") {
           await ownership.complete(id);
           rememberFinished(id);
           return;
         }
+        finished.delete(id);
+        if (!record) return;
         if (Array.isArray(record.data.grants) && record.data.grants.length)
           await ownership.indexLegacy(record);
         const discovered =
@@ -1814,18 +1785,11 @@ export async function createController(options: ControllerOptions) {
   }
   const staleCreation = (worker: ManagedWorker) =>
     ownership &&
-    (worker.creationEpoch ?? worker.epoch) !== undefined &&
-    (worker.creationEpoch ?? worker.epoch) < ownership.epoch(worker.executionId);
+    worker.epoch !== undefined &&
+    worker.epoch < ownership.epoch(worker.executionId);
   async function discardStaleCreation(worker: ManagedWorker) {
     const signal = AbortSignal.timeout(30000);
-    worker.creationEpoch ??= worker.epoch;
-    // Only an unpublished old-epoch creation is discarded; exact recorded workers are reattached.
-    await options.backend.fence(
-      worker,
-      ownership.epoch(worker.executionId),
-      signal,
-      true,
-    );
+    // Only unpublished old-epoch resources are discarded; exact recorded workers are reattached.
     await removeWorker(worker, signal);
     event(worker, "removed", { reason: "stale-creation" });
   }
@@ -1911,28 +1875,37 @@ export async function createController(options: ControllerOptions) {
   peerServer?.on("upgrade", (req, socket, head) => {
     if (req.url !== "/host") void handleUpgrade(req, socket, head, true);
   });
-  let discoveredWorkers: ManagedWorker[] = [];
-  async function constructionFailed(error: unknown): Promise<never> {
-    closing = true;
-    control.close();
+  async function closeListeners() {
     forwarding.close();
     peerControl?.close();
-    await ownership?.close();
+    control.close();
     for (const grant of [...grants.values()]) revoke(grant);
+    for (const client of [...viewers.clients, ...cdp.clients]) client.terminate();
     viewers.close();
     cdp.close();
     for (const socket of rawConnections) socket.destroy();
-    for (const worker of discoveredWorkers) closeWorkerChannel(worker);
-    await Promise.allSettled(
-      [...bindings.values()].map((binding) => binding.volumeAdapter?.close()),
-    );
+    controlServer.closeAllConnections();
+    peerServer?.closeAllConnections();
     await Promise.all(
       [server, controlServer, peerServer]
-        .filter((listener) => listener)
-        .filter((listener) => listener.listening)
+        .filter((listener) => listener?.listening)
         .map(
           (listener) => new Promise<void>((resolve) => listener.close(() => resolve())),
         ),
+    );
+  }
+  let discoveredWorkers: ManagedWorker[] = [];
+  async function constructionFailed(error: unknown): Promise<never> {
+    closing = true;
+    await ownership?.close();
+    await closeListeners();
+    const workers = new Set([
+      ...discoveredWorkers,
+      ...[...bindings.values()].map((binding) => binding.worker),
+    ]);
+    for (const worker of workers) closeWorkerChannel(worker);
+    await Promise.allSettled(
+      [...bindings.values()].map((binding) => binding.volumeAdapter?.close()),
     );
     throw error;
   }
@@ -2057,10 +2030,7 @@ export async function createController(options: ControllerOptions) {
                       );
                       // A failed save has already revoked the worker's live session.
                       if (!retryingSave) {
-                        const status = await currentWorker.runtime.request<any>(
-                          { op: "worker_status", executionId: binding.executionId },
-                          { timeoutMs: 10000 },
-                        );
+                        const status = await readWorkerStatus(currentWorker);
                         if (!supportedProtocol(status.protocol))
                           throw Error("browser_worker_protocol_unsupported");
                       }
@@ -2126,10 +2096,7 @@ export async function createController(options: ControllerOptions) {
                 await dispatch({ op: "finalize", executionId: binding.executionId });
                 return;
               }
-              const status = await binding.worker.runtime.request<any>(
-                { op: "worker_status", executionId: binding.executionId },
-                { timeoutMs: 10000 },
-              );
+              const status = await readWorkerStatus(binding.worker);
               binding.checkedAt = Date.now();
               binding.statusError = undefined;
               binding.idleProtection = workerIdleProtection(status, now, !ownership);
@@ -2306,24 +2273,7 @@ export async function createController(options: ControllerOptions) {
           await ownership.close();
         }
       }
-      forwarding.close();
-      peerControl?.close();
-      control.close();
-      for (const grant of [...grants.values()]) revoke(grant);
-      for (const client of [...viewers.clients, ...cdp.clients]) client.terminate();
-      viewers.close();
-      cdp.close();
-      for (const socket of rawConnections) socket.destroy();
-      controlServer.closeAllConnections();
-      peerServer?.closeAllConnections();
-      await Promise.all(
-        [server, controlServer, peerServer]
-          .filter(Boolean)
-          .map(
-            (listener) =>
-              new Promise<void>((resolve) => listener.close(() => resolve())),
-          ),
-      );
+      await closeListeners();
       if (failure) throw failure;
     },
   };
