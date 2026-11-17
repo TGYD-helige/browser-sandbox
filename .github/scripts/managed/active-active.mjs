@@ -252,6 +252,13 @@ export async function activeActive({
       0,
       "Corrupt import published partial ownership",
     );
+    const rejectedPod = (await list("controller"))[0];
+    assert(
+      (await kubectl("logs", rejectedPod.metadata.name, "--previous")).includes(
+        "browser_execution_journal_corrupt",
+      ),
+      "Startup failed for a reason other than corrupt journal input",
+    );
     await kubectl("scale", `deployment/${deployment}`, "--replicas=0");
     await wait(
       "Failed controller did not exit",

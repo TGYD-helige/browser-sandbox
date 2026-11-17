@@ -15,6 +15,8 @@ export interface ExecutionOwner {
   epoch: number;
 }
 const prefix = "browser-sandbox.io/";
+// Kubernetes MicroTime requires six fractional digits.
+const renewTime = () => new Date().toISOString().replace("Z", "000Z");
 const validId = (id: string) =>
   /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(id);
 const absent = (error: unknown) =>
@@ -290,7 +292,7 @@ export function createKubernetesOwnership(
             spec: {
               holderIdentity: options.replica,
               leaseDurationSeconds: Math.ceil(leaseMs / 1000),
-              renewTime: new Date().toISOString(),
+              renewTime: renewTime(),
             },
           },
           signal(),
@@ -544,7 +546,7 @@ export function createKubernetesOwnership(
                 "PUT",
                 {
                   ...lease,
-                  spec: { ...lease.spec, renewTime: new Date().toISOString() },
+                  spec: { ...lease.spec, renewTime: renewTime() },
                 },
                 signal(),
               );

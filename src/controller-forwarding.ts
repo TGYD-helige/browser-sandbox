@@ -14,7 +14,7 @@ export function forwardControllerRequest(
   const upstream = request(new URL(req.url, origin), {
     method: req.method,
     headers: { ...req.headers, host: new URL(origin).host },
-    timeout: 180000,
+    timeout: req.url?.endsWith("/auth") ? 620000 : 180000,
   });
   const close = () => upstream.destroy();
   destination.once("close", close);

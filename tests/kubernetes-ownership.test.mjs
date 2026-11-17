@@ -18,6 +18,14 @@ async function fixture(t, extra = {}) {
     let input = "";
     for await (const chunk of req) input += chunk;
     const body = input ? JSON.parse(input) : undefined;
+    if (body?.spec?.renewTime && !/\.[0-9]{6}Z$/.test(body.spec.renewTime)) {
+      res
+        .writeHead(400)
+        .end(
+          JSON.stringify({ message: "Lease renewTime requires Kubernetes MicroTime" }),
+        );
+      return;
+    }
     const path = req.url.split("?")[0];
     let previous = objects.get(path);
     const reply = (status, value = {}) =>

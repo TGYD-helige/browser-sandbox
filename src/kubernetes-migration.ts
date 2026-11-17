@@ -36,7 +36,12 @@ export async function importExecutionJournal(options: {
       const stat = await file.stat();
       if (!stat.isFile() || stat.size > 65536)
         throw Error("browser_execution_journal_corrupt");
-      const value = JSON.parse(await file.readFile("utf8"));
+      let value: any;
+      try {
+        value = JSON.parse(await file.readFile("utf8"));
+      } catch {
+        throw Error("browser_execution_journal_corrupt");
+      }
       if (
         value.protocol !== "browser-sandbox.execution/v1" ||
         value.installationId !== options.installationId ||
