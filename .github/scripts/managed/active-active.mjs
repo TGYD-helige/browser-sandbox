@@ -17,6 +17,8 @@ export async function activeActive({
   const deployment = "ha-browser";
   const prefix = "browser-sandbox.io/";
   const settings = JSON.parse(await readFile(values, "utf8"));
+  // The preceding single-controller matrix retains a journal owned by a different installation.
+  delete settings.controllerData?.existingClaim;
   settings.profileStore = { enabled: false };
   settings.controller = { replicas: 1 };
   settings.capacity = {

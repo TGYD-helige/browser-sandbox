@@ -1,6 +1,8 @@
 """Validate the operator-facing chart with Helm's actual renderer."""
+import json
 import pathlib
 import subprocess
+import tempfile
 import unittest
 
 import yaml
@@ -18,6 +20,27 @@ def render(*arguments, release="trial"):
 
 
 class ChartTest(unittest.TestCase):
+    def test_active_active_matrix_uses_an_independent_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            values = pathlib.Path(directory) / "values.json"
+            values.write_text(json.dumps({"controllerData": {"existingClaim": "trial-browser-data"}}))
+            # Stop at the first Helm call, before the helper acquires cluster resources.
+            subprocess.check_call([
+                "node", "--input-type=module", "-e", """
+                import { activeActive } from './.github/scripts/managed/active-active.mjs';
+                await activeActive({
+                    directory: process.argv[1], values: process.argv[2],
+                    run: async () => { process.exit(0); },
+                });
+                """, directory, str(values),
+            ], cwd=ROOT)
+            resources = render("-f", str(pathlib.Path(directory) / "active-active-values.json"), release="ha")
+            deployment = next(item for item in resources if item["kind"] == "Deployment")
+            volumes = deployment["spec"]["template"]["spec"]["volumes"]
+            journal = next(item for item in volumes if item["name"] == "controller-data")
+            self.assertEqual(journal["persistentVolumeClaim"]["claimName"], "ha-browser-data")
+            self.assertTrue(any(item["kind"] == "PersistentVolumeClaim" and item["metadata"]["name"] == "ha-browser-data" for item in resources))
+
     def test_invalid_release_names_fail_at_render_time(self):
         for release in ["1abc", "a.b", "a" * 49 + "--aa"]:
             with self.subTest(release=release):
