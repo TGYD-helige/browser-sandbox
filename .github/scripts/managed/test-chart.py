@@ -189,6 +189,9 @@ class ChartTest(unittest.TestCase):
         env = {item["name"]: item.get("value") for item in pod["containers"][0]["env"]}
         self.assertEqual(env["BROWSER_SHARED_STATE"], "true")
         self.assertEqual(env["BROWSER_CONTROLLER_REPLICAS"], "3")
+        readiness = pod["containers"][0]["readinessProbe"]
+        self.assertEqual(readiness["httpGet"], {"path": "/health", "port": "access"})
+        self.assertLessEqual(readiness["periodSeconds"] * readiness["failureThreshold"], 10)
         self.assertNotIn("BROWSER_CONTROLLER_STATE", env)
         self.assertTrue(any(item["kind"] == "PodDisruptionBudget" and item["metadata"]["name"].endswith("-controller") for item in resources))
         policy = next(item["spec"] for item in resources if item["kind"] == "NetworkPolicy" and item["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "controller")

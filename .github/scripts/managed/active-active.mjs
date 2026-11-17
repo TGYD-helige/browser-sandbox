@@ -87,12 +87,22 @@ export async function activeActive({
       (item) => item.metadata.labels[prefix + "execution"] === id,
     );
     const pod = (await list("controller")).find(
-      (item) => item.metadata.uid === lease?.spec.holderIdentity,
+      (item) =>
+        item.metadata.uid === lease?.spec.holderIdentity &&
+        !item.metadata.deletionTimestamp &&
+        item.status.conditions?.some(
+          (condition) => condition.type === "Ready" && condition.status === "True",
+        ),
     );
     return { lease, pod };
   };
   const peers = async (id) => {
-    const current = await owner(id);
+    const current = await wait(
+      "Execution owner did not become ready",
+      () => owner(id),
+      (value) => Boolean(value.pod),
+      45000,
+    );
     const others = (await list("controller")).filter(
       (pod) =>
         pod.metadata.uid !== current.pod?.metadata.uid &&

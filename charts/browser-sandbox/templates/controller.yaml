@@ -159,8 +159,17 @@ spec:
               containerPort: 8083
             {{- end }}
           readinessProbe:
+            {{- if gt $replicas 1 }}
+            httpGet:
+              path: /health
+              port: access
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 3
+            {{- else }}
             tcpSocket:
               port: access
+            {{- end }}
           livenessProbe:
             tcpSocket:
               port: access
