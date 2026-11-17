@@ -292,8 +292,19 @@ export async function activeActive({
     };
     stage = "three replicas";
     await helm(3);
-    assert.equal((await list("controller")).length, 3);
-    const replicas = await list("controller");
+    const replicas = await wait(
+      "Three ready controller Pods did not settle after scaling",
+      () => list("controller"),
+      (items) =>
+        items.length === 3 &&
+        items.every(
+          (pod) =>
+            !pod.metadata.deletionTimestamp &&
+            pod.status.conditions?.some(
+              (condition) => condition.type === "Ready" && condition.status === "True",
+            ),
+        ),
+    );
     stage = "concurrent registration";
     const same = randomUUID();
     const registrations = await Promise.all(

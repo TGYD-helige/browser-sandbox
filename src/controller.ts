@@ -1780,6 +1780,8 @@ export async function createController(options: ControllerOptions) {
           rememberFinished(id);
           return;
         }
+        if (Array.isArray(record.data.grants) && record.data.grants.length)
+          await ownership.indexLegacy(record);
         const discovered = await options.backend.list(AbortSignal.timeout(30000));
         try {
           await restoreRecord(

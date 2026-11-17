@@ -65,9 +65,6 @@ export async function importExecutionJournal(options: {
     }
   }
   for (const record of entries) {
-    const owner = await options.ownership.resolve(record.executionId, true);
-    if (!options.ownership.owns(record.executionId) || !owner)
-      throw Error("browser_controller_owner_moved");
     const previous = await options.ownership.journal.read(record.executionId);
     if (previous) {
       // A completed import may have subsequently advanced through ordinary lifecycle writes.
@@ -77,9 +74,14 @@ export async function importExecutionJournal(options: {
           !isDeepStrictEqual(previous.data, record.data))
       )
         throw Error("browser_execution_migration_conflict");
-      await options.ownership.indexLegacy(previous);
+      options.validate(previous.data);
+      if (options.ownership.owns(record.executionId))
+        await options.ownership.indexLegacy(previous);
       continue;
     }
+    const owner = await options.ownership.resolve(record.executionId, true);
+    if (!options.ownership.owns(record.executionId) || !owner)
+      throw Error("browser_controller_owner_moved");
     await options.ownership.importRecord(record);
     await options.ownership.indexLegacy(record);
     if (record.data.profileId && record.data.phase !== "finished")

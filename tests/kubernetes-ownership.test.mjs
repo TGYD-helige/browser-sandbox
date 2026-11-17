@@ -634,3 +634,31 @@ test("controller startup rejects a volume Profile store with multiple replicas b
   assert.equal(child.status, 1);
   assert.match(child.stderr, /browser_profile_store_replicas_unsupported/);
 });
+
+test("restarting migration accepts an imported record while its previous owner Lease expires", async (t) => {
+  const { a, b } = await fixture(t);
+  const directory = await mkdtemp(join(tmpdir(), "journal-restart-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await cp(
+    new URL("../.github/scripts/managed/fixtures/journal-v0.2.0/", import.meta.url),
+    directory,
+    { recursive: true },
+  );
+  await importExecutionJournal({
+    directory,
+    installationId: "fixture",
+    ownership: a,
+    validate: validateControllerRecord,
+  });
+  assert.equal(
+    await importExecutionJournal({
+      directory,
+      installationId: "fixture",
+      ownership: b,
+      validate: validateControllerRecord,
+    }),
+    1,
+  );
+  assert.equal(b.owns(id), false);
+  assert.equal((await b.journal.read(id)).revision, 1);
+});
