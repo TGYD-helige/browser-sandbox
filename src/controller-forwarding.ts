@@ -82,6 +82,7 @@ export function createHostForwarding() {
         peer.signal.addEventListener("abort", close, { once: true });
         socket.once("close", () => {
           sockets.delete(socket);
+          if (owners.get(origin)?.rpc === rpc) owners.delete(origin);
           peer.signal.removeEventListener("abort", close);
         });
         const rpc = connectPeer(socket, (input, callbackSignal) =>

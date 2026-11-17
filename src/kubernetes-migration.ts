@@ -72,9 +72,11 @@ export async function importExecutionJournal(options: {
           !isDeepStrictEqual(previous.data, record.data))
       )
         throw Error("browser_execution_migration_conflict");
+      await options.ownership.indexLegacy(previous);
       continue;
     }
     await options.ownership.importRecord(record);
+    await options.ownership.indexLegacy(record);
     if (record.data.profileId && record.data.phase !== "finished")
       await options.ownership.acquireProfile(
         record.executionId,

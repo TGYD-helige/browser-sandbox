@@ -1750,7 +1750,7 @@ export async function createController(options: ControllerOptions) {
   }
   const loading = new Map<string, Promise<void>>();
   function loadOwned(id: string): Promise<void> {
-    if (bindings.has(id) || finished.has(id)) return Promise.resolve();
+    if (bindings.has(id) || (finished.has(id) && !ownership)) return Promise.resolve();
     let pending = loading.get(id);
     if (!pending) {
       pending = (async () => {

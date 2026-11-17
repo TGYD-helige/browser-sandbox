@@ -130,7 +130,10 @@ try {
         ),
       );
       assert.equal((await sessionRequest(url.href)).generation, state.generation);
-      if (action === "functional") {
+      if (action === "live") {
+        await writeFile(`/tmp/ha-live-${executionId}.ready`, "ready");
+        await cdp.closed;
+      } else if (action === "functional") {
         const base = url.href.replace(/^ws/, "http");
         const filename = `ha-${randomUUID()}.txt`;
         const upload = await fetch(`${base}/files/${filename}`, {

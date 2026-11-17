@@ -186,7 +186,34 @@ export async function activeActive({
     await kubectl("delete", "pod", name, "--wait=true", "--timeout=30s");
   }
   const report = { architecture: process.arch };
+  const controllerProcess = async (pod) => {
+    const id = pod.status.containerStatuses[0].containerID.replace(
+      /^containerd:\/\//,
+      "",
+    );
+    const tasks = await run("docker", [
+      "exec",
+      pod.spec.nodeName,
+      "ctr",
+      "-n",
+      "k8s.io",
+      "tasks",
+      "ls",
+    ]);
+    const pid = tasks
+      .split("\n")
+      .find((line) => line.split(/\s+/)[0] === id)
+      ?.split(/\s+/)[1];
+    assert(
+      /^[1-9][0-9]*$/.test(pid),
+      "Controller process was not found in its node runtime",
+    );
+    return { node: pod.spec.nodeName, pid };
+  };
+  const signalProcess = (process, signal) =>
+    run("docker", ["exec", process.node, "kill", `-${signal}`, process.pid]);
   let paused;
+  let pausedProcess;
   let installed = false;
   try {
     installed = true;
@@ -338,12 +365,35 @@ export async function activeActive({
       const started = performance.now();
       await kubectl(
         "exec",
-        current.pod.metadata.name,
+        "client",
         "--",
         "node",
         "-e",
-        "process.kill(1,'SIGKILL')",
-      ).catch(() => {});
+        `require('node:fs').rmSync('/tmp/ha-live-${id}.ready',{force:true})`,
+      );
+      const live = client("live", id, current.pod, undefined, 60000);
+      live.catch(() => {});
+      await wait(
+        "Live CDP connection was not ready before owner kill",
+        async () => {
+          try {
+            await kubectl(
+              "exec",
+              "client",
+              "--",
+              "node",
+              "-e",
+              `require('node:fs').readFileSync('/tmp/ha-live-${id}.ready')`,
+            );
+            return true;
+          } catch {
+            return false;
+          }
+        },
+        Boolean,
+      );
+      await signalProcess(await controllerProcess(current.pod), "KILL");
+      await live;
       await wait(
         "Owner kill did not transfer ownership",
         () => owner(id),
@@ -404,7 +454,19 @@ export async function activeActive({
       },
       Boolean,
     );
-    await kubectl("exec", paused, "--", "node", "-e", "process.kill(1,'SIGSTOP')");
+    pausedProcess = await controllerProcess(current.pod);
+    await signalProcess(pausedProcess, "STOP");
+    await wait(
+      "Owner process did not report SIGSTOP",
+      () =>
+        run("docker", [
+          "exec",
+          pausedProcess.node,
+          "cat",
+          `/proc/${pausedProcess.pid}/status`,
+        ]),
+      (status) => /^State:\s+T/m.test(status),
+    );
     const next = await wait(
       "Paused owner was not fenced by takeover",
       () => owner(id),
@@ -413,7 +475,8 @@ export async function activeActive({
         Number(value.lease.metadata.annotations[prefix + "epoch"]) > oldEpoch,
       45000,
     );
-    // The resumed process must neither finalize nor remove this worker. Probe its old epoch directly.
+    await client("verify", id, next.pod);
+    // Recovery has announced the new worker epoch before the old control probe is sent.
     await kubectl(
       "exec",
       next.pod.metadata.name,
@@ -423,8 +486,9 @@ export async function activeActive({
       "-e",
       `import{createControllerRuntime}from'/opt/browser-sandbox/dist/network-control.js';const r=createControllerRuntime('http://${worker.status.podIP}:8081',{epoch:${oldEpoch}});try{await r.request({op:'finalize',executionId:'${id}'});process.exitCode=1}catch(e){if(e.message!=='browser_controller_fenced')throw e}finally{r.close()}`,
     );
-    await kubectl("exec", paused, "--", "node", "-e", "process.kill(1,'SIGCONT')");
+    await signalProcess(pausedProcess, "CONT");
     paused = undefined;
+    pausedProcess = undefined;
     await client("verify", id);
     await kubectl(
       "exec",
@@ -498,15 +562,7 @@ export async function activeActive({
     );
     return report;
   } finally {
-    if (paused)
-      await kubectl(
-        "exec",
-        paused,
-        "--",
-        "node",
-        "-e",
-        "process.kill(1,'SIGCONT')",
-      ).catch(() => {});
+    if (pausedProcess) await signalProcess(pausedProcess, "CONT").catch(() => {});
     if (installed)
       await run(
         "helm",

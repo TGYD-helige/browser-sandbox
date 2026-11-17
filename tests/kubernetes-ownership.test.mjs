@@ -37,8 +37,15 @@ async function fixture(t, extra = {}) {
         metadata: { resourceVersion: String(version) },
       });
     }
-    if (req.method === "GET") return reply(previous ? 200 : 404, previous);
+    if (req.method === "GET") {
+      await state.beforeGet?.(path);
+      return reply(previous ? 200 : 404, previous);
+    }
     if (req.method === "POST") {
+      if (path.endsWith("/secrets") && state.failSecretCreate) {
+        state.failSecretCreate = false;
+        return reply(503);
+      }
       const key = `${path}/${body.metadata.name}`;
       if (objects.has(key)) return reply(409);
       body.metadata.resourceVersion = String(++version);
@@ -56,6 +63,10 @@ async function fixture(t, extra = {}) {
       return reply(200, body);
     }
     if (req.method === "DELETE") {
+      if (path.includes("/leases/") && state.failLeaseDelete) {
+        state.failLeaseDelete = false;
+        return reply(503);
+      }
       if (body.preconditions.resourceVersion !== previous.metadata.resourceVersion)
         return reply(409);
       objects.delete(path);
@@ -241,6 +252,8 @@ test("host and HTTP requests forward once, and the same capability URL survives 
   const response = await fetch(`${controllers[peerIndex].origin}${path}/session`);
   assert.equal(response.status, 200);
   assert.equal((await response.json()).state, "unused");
+  await [a, b][ownerIndex].indexLegacy(await [a, b][ownerIndex].journal.read(id));
+  await [a, b][peerIndex].refresh();
   const legacyPath = `/execution/${path.split("/").at(-1)}/session`;
   assert.equal(
     (await fetch(`${controllers[peerIndex].origin}${legacyPath}`)).status,
@@ -264,6 +277,10 @@ test("host and HTTP requests forward once, and the same capability URL survives 
     action: "status",
   });
   assert.equal(forwarded.state, "unused");
+  await runtimes[peerIndex].request({ op: "finalize", executionId: id });
+  await runtimes[peerIndex].request({ op: "finalize", executionId: id });
+  assert.equal(a.owns(id), false);
+  assert.equal(b.owns(id), false);
 });
 
 test("an in-flight old-epoch Secret write loses its conditional update across takeover", async (t) => {
@@ -334,4 +351,65 @@ test("lease renewal passes share one bounded operation", async (t) => {
   resume.resolve();
   await Promise.all([first, second]);
   assert.equal(a.owns(id), true);
+});
+
+test("a failed Secret handoff retries before ownership becomes usable", async (t) => {
+  const { a, state } = await fixture(t);
+  state.failSecretCreate = true;
+  await assert.rejects(a.resolve(id, true));
+  assert.equal(a.owns(id), false);
+  await a.renew();
+  await a.resolve(id, true);
+  assert.equal(a.owns(id), true);
+  assert.equal((await a.journal.create(id, { phase: "registered" })).revision, 1);
+});
+
+test("a stale completion cannot use a watch-updated Lease version to release the new owner", async (t) => {
+  const { a, b, state, advance } = await fixture(t);
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "finished" });
+  await b.resolve(id);
+  const entered = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  state.beforeGet = async (path) => {
+    if (!path.includes("/secrets/")) return;
+    state.beforeGet = undefined;
+    entered.resolve();
+    await resume.promise;
+  };
+  const pending = a.complete(id);
+  const rejected = assert.rejects(
+    pending,
+    /browser_kubernetes_operation_failed|browser_controller_fenced/,
+  );
+  await entered.promise;
+  advance(15001);
+  await b.resolve(id);
+  await a.refresh();
+  resume.resolve();
+  await rejected;
+  assert.equal(b.owns(id), true);
+  assert.equal((await a.resolve(id)).epoch, 2);
+});
+
+test("interrupted finished-fence compaction resumes after its Secret was deleted", async (t) => {
+  const { a, b, state, advance, objects } = await fixture(t, { maxFinished: 1 });
+  for (const executionId of [id, other]) {
+    await a.resolve(executionId, true);
+    await a.journal.create(executionId, { phase: "finished" });
+    await a.complete(executionId);
+  }
+  state.failLeaseDelete = true;
+  await assert.rejects(a.refresh());
+  await b.refresh();
+  advance(15001);
+  await b.refresh();
+  assert.equal(await b.journal.read(id), undefined);
+  const remaining = [...objects.values()].filter(
+    (object) => object.metadata.labels["browser-sandbox.io/state"] === "execution",
+  );
+  assert.equal(remaining.length, 2);
+  await b.resolve(other);
+  await b.complete(other);
+  assert.equal(b.owns(other), false);
 });
