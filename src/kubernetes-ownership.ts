@@ -156,7 +156,7 @@ export function createKubernetesOwnership(
       throw error;
     }
   };
-  const assertOwned = async (id: string) => {
+  const readOwnedLease = async (id: string) => {
     const local = owned.get(id);
     if (!local || now() >= local.deadline) {
       forget(id);
@@ -165,15 +165,18 @@ export function createKubernetesOwnership(
     const lease = await get(`${leases}/${name(id)}`);
     if (
       !lease ||
-      observe(lease).replica !== options.replica ||
-      Number(lease.metadata.annotations[prefix + "epoch"]) !== local.epoch ||
+      lease.spec?.holderIdentity !== options.replica ||
+      Number(lease.metadata?.annotations?.[prefix + "epoch"]) !== local.epoch ||
+      owned.get(id) !== local ||
       now() >= local.deadline
     ) {
       forget(id);
       throw Error("browser_controller_fenced");
     }
-    return local.epoch;
+    observe(lease);
+    return { epoch: local.epoch, lease };
   };
+  const assertOwned = async (id: string) => (await readOwnedLease(id)).epoch;
   const decode = (secret: any, id: string) => {
     verify(secret, name(id));
     let body: any;
@@ -365,32 +368,38 @@ export function createKubernetesOwnership(
     if (!validProfileId(profileId)) throw Error("browser_profile_id_invalid");
     const epoch = await assertOwned(id);
     const recordSecret = await get(`${secrets}/${name(id)}`);
-    if (!recordSecret || decode(recordSecret, id).epoch !== epoch)
-      throw Error("browser_controller_fenced");
+    const body = recordSecret && decode(recordSecret, id);
+    if (!body || body.epoch !== epoch) throw Error("browser_controller_fenced");
+    if (!body.record || body.record.data.profileId !== profileId)
+      throw Error("browser_profile_binding_invalid");
+    if (
+      release
+        ? body.record.data.phase !== "finished"
+        : body.record.data.phase === "finished"
+    )
+      throw Error("browser_execution_revoked");
     const path = `${leases}/${profileName(profileId)}`;
     const previous = await get(path);
     if (previous) {
       verify(previous, profileName(profileId), "profile");
-      if (previous.spec?.holderIdentity !== id) {
+      const holder = previous.spec?.holderIdentity;
+      if (holder && holder !== id) {
         if (release) return;
         throw Error("browser_profile_busy");
       }
-      if (Number(previous.metadata.annotations?.[prefix + "epoch"]) > epoch)
+      if (
+        previous.metadata.annotations?.[prefix + "execution"] === id &&
+        Number(previous.metadata.annotations?.[prefix + "epoch"]) > epoch
+      )
         throw Error("browser_controller_fenced");
     }
-    if (release) {
-      const record = await read(id);
-      if (record?.data.phase !== "finished") throw Error("browser_profile_busy");
-      if (previous)
-        await api(
-          path,
-          "DELETE",
-          { preconditions: { resourceVersion: previous.metadata.resourceVersion } },
-          signal(),
-        );
-      return;
-    }
-    if (previous && Number(previous.metadata.annotations?.[prefix + "epoch"]) === epoch)
+    // Keep a free tombstone: deleting it would let an old absent-resource POST resurrect ownership.
+    if (
+      previous &&
+      previous.spec.holderIdentity === (release ? "" : id) &&
+      previous.metadata.annotations?.[prefix + "execution"] === id &&
+      Number(previous.metadata.annotations?.[prefix + "epoch"]) === epoch
+    )
       return;
     try {
       await api(
@@ -402,10 +411,13 @@ export function createKubernetesOwnership(
           metadata: {
             name: profileName(profileId),
             labels: { ...labels, [prefix + "state"]: "profile" },
-            annotations: { [prefix + "epoch"]: String(epoch) },
+            annotations: {
+              [prefix + "epoch"]: String(epoch),
+              [prefix + "execution"]: id,
+            },
             ...(previous ? { resourceVersion: previous.metadata.resourceVersion } : {}),
           },
-          spec: { holderIdentity: id },
+          spec: { holderIdentity: release ? "" : id },
         },
         signal(),
       );
@@ -414,20 +426,9 @@ export function createKubernetesOwnership(
       throw error;
     }
   };
-  const snapshotOwned = (id: string, epoch: number) => {
-    const lease = observed.get(id)?.lease;
-    if (
-      !lease ||
-      lease.spec.holderIdentity !== options.replica ||
-      Number(lease.metadata.annotations[prefix + "epoch"]) !== epoch
-    )
-      throw Error("browser_controller_fenced");
-    return lease;
-  };
   const indexLegacy = async (record: ExecutionRecord) => {
     const id = record.executionId;
-    const epoch = await assertOwned(id);
-    const lease = snapshotOwned(id, epoch);
+    const { epoch, lease } = await readOwnedLease(id);
     const grants = Array.isArray(record.data.grants) ? record.data.grants : [];
     const hashes = grants.map((grant: any) => {
       if (!/^[a-f0-9]{64}$/.test(grant.token))
@@ -452,8 +453,7 @@ export function createKubernetesOwnership(
     observe(updated);
   };
   const complete = async (id: string) => {
-    const epoch = await assertOwned(id);
-    const lease = snapshotOwned(id, epoch);
+    const { epoch, lease } = await readOwnedLease(id);
     const record = await read(id);
     if (record?.data.phase !== "finished")
       throw Error("browser_execution_record_changed");
@@ -494,8 +494,7 @@ export function createKubernetesOwnership(
     for (const [id] of finished.slice(0, Math.max(0, finished.length - maxFinished))) {
       await resolve(id);
       if (!owned.has(id)) continue;
-      const epoch = await assertOwned(id);
-      const lease = snapshotOwned(id, epoch);
+      const { epoch, lease } = await readOwnedLease(id);
       const secret = await get(`${secrets}/${name(id)}`);
       const body = secret && decode(secret, id);
       if (
@@ -537,9 +536,9 @@ export function createKubernetesOwnership(
         await Promise.all(
           entries.slice(start, start + 8).map(async ([id, local]) => {
             try {
-              await assertOwned(id);
+              if (!local.ready) return;
+              const { lease } = await readOwnedLease(id);
               const started = now();
-              const lease = observed.get(id).lease;
               const updated = await api(
                 `${leases}/${name(id)}`,
                 "PUT",
@@ -553,7 +552,6 @@ export function createKubernetesOwnership(
               if (owned.get(id) === local) local.deadline = started + leaseMs;
             } catch (error) {
               if (
-                conflict(error) ||
                 now() >= local.deadline ||
                 (error as Error).message === "browser_controller_fenced"
               )
@@ -673,8 +671,7 @@ export function createKubernetesOwnership(
     async release() {
       for (const id of [...owned.keys()]) {
         try {
-          const epoch = await assertOwned(id);
-          const lease = snapshotOwned(id, epoch);
+          const { lease } = await readOwnedLease(id);
           await api(
             `${leases}/${name(id)}`,
             "PUT",

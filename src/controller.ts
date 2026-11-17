@@ -35,6 +35,7 @@ export interface ExecutionBinding {
   incarnation: string;
   allowedDomains: string[];
   profileId?: string;
+  profileAcquired?: boolean;
   storageMode?: "host" | "volume";
   storage?: StorageAdapter;
   storagePeer?: ControlPeer;
@@ -245,6 +246,7 @@ export async function createController(options: ControllerOptions) {
     if (!journal) return Promise.resolve();
     const data = {
       profileId: binding.profileId,
+      profileAcquired: binding.profileAcquired,
       storageMode: binding.storageMode,
       infrastructureOnly: binding.infrastructureOnly,
       incarnation: binding.incarnation,
@@ -799,6 +801,7 @@ export async function createController(options: ControllerOptions) {
     if (ownership && !ownership.owns(binding.executionId))
       throw Error("browser_controller_fenced");
     if (binding.revoked || closing) throw Error("browser_execution_revoked");
+    if (binding.profileAcquired === false) throw Error("browser_profile_busy");
     if (binding.creation?.abort.signal.aborted) {
       await waitForControl(
         binding.starting.catch(() => {}),
@@ -1029,8 +1032,6 @@ export async function createController(options: ControllerOptions) {
         throw Error("browser_profile_binding_changed");
       if (!binding) {
         if (bindings.size >= 65536) throw Error("browser_execution_capacity_exceeded");
-        if (request.profileId && ownership)
-          await ownership.acquireProfile(id, request.profileId);
         if (request.profileId && profileLeases.has(request.profileId))
           throw Error("browser_profile_busy");
         binding = {
@@ -1038,6 +1039,7 @@ export async function createController(options: ControllerOptions) {
           incarnation: randomUUID(),
           allowedDomains: domains,
           profileId: request.profileId,
+          profileAcquired: ownership && request.profileId ? false : undefined,
           storageMode: hostStorage ? "host" : request.profileId ? "volume" : undefined,
           life: new AbortController(),
           revoked: false,
@@ -1048,8 +1050,15 @@ export async function createController(options: ControllerOptions) {
           revision: 0,
         };
         bindStorage(binding);
-        if (request.profileId) profileLeases.set(request.profileId, binding);
+        if (request.profileId && !ownership)
+          profileLeases.set(request.profileId, binding);
         bindings.set(id, binding);
+      }
+      if (ownership && binding.profileId && !binding.profileAcquired) {
+        await persist(binding);
+        await ownership.acquireProfile(id, binding.profileId);
+        binding.profileAcquired = true;
+        profileLeases.set(binding.profileId, binding);
       }
       if (
         hostStorage &&
@@ -1556,11 +1565,13 @@ export async function createController(options: ControllerOptions) {
         worker.profileId !== data.profileId)
     )
       throw Error("browser_worker_ownership_mismatch");
-    if (ownership && data.profileId) await ownership.acquireProfile(id, data.profileId);
+    if (ownership && data.profileId && data.profileAcquired !== false)
+      await ownership.acquireProfile(id, data.profileId);
     const binding: ExecutionBinding = {
       executionId: id,
       incarnation: data.incarnation,
       profileId: data.profileId,
+      profileAcquired: data.profileAcquired,
       storageMode: data.storageMode,
       infrastructureOnly: data.infrastructureOnly,
       allowedDomains: data.allowedDomains,
@@ -1594,7 +1605,11 @@ export async function createController(options: ControllerOptions) {
       binding.revoked = true;
     }
     bindings.set(id, binding);
-    if (binding.profileId && !binding.infrastructureOnly) {
+    if (
+      binding.profileId &&
+      !binding.infrastructureOnly &&
+      binding.profileAcquired !== false
+    ) {
       if (!validProfileId(binding.profileId) || profileLeases.has(binding.profileId))
         throw Error("browser_profile_lease_recovery_failed");
       profileLeases.set(binding.profileId, binding);
@@ -2350,7 +2365,12 @@ export function validateControllerRecord(data: any) {
     ].includes(data.phase)
   )
     invalid();
-  for (const key of ["stopConfirmed", "cleanupUnconfirmed", "infrastructureOnly"])
+  for (const key of [
+    "stopConfirmed",
+    "cleanupUnconfirmed",
+    "infrastructureOnly",
+    "profileAcquired",
+  ])
     if (data[key] !== undefined && typeof data[key] !== "boolean") invalid();
   if (
     data.stopConfirmed &&

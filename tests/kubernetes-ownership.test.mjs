@@ -133,9 +133,10 @@ test("conditional ownership selects one replica and fences old journal and Profi
   assert.equal(owners[0].replica, owners[1].replica);
   const owner = owners[0].replica === "a" ? a : b;
   const peer = owner === a ? b : a;
-  await owner.journal.create(id, { phase: "registered" });
+  await owner.journal.create(id, { phase: "registered", profileId: "profile-1" });
   await owner.acquireProfile(id, "profile-1");
   await peer.resolve(other, true);
+  await peer.journal.create(other, { phase: "registered", profileId: "profile-1" });
   await assert.rejects(peer.acquireProfile(other, "profile-1"), /browser_profile_busy/);
   await peer.resolve(id);
   advance(15001);
@@ -151,7 +152,10 @@ test("conditional ownership selects one replica and fences old journal and Profi
     owner.releaseProfile(id, "profile-1"),
     /browser_controller_fenced/,
   );
-  const record = await peer.journal.update(id, 1, { phase: "finished" });
+  const record = await peer.journal.update(id, 1, {
+    phase: "finished",
+    profileId: "profile-1",
+  });
   assert.equal(record.revision, 2);
   await peer.releaseProfile(id, "profile-1");
 });
@@ -317,8 +321,9 @@ test("finished recovery releases a stranded Profile lease and bounds shared fini
   await b.resolve(id);
   await b.complete(id);
   await b.resolve(other, true);
-  await b.journal.create(other, { phase: "finished", profileId: "stranded" });
+  await b.journal.create(other, { phase: "registered", profileId: "stranded" });
   await b.acquireProfile(other, "stranded");
+  await b.journal.update(other, 1, { phase: "finished", profileId: "stranded" });
   await b.complete(other);
   await b.refresh();
   assert.equal(await b.journal.read(id), undefined);
@@ -412,4 +417,88 @@ test("interrupted finished-fence compaction resumes after its Secret was deleted
   await b.resolve(other);
   await b.complete(other);
   assert.equal(b.owns(other), false);
+});
+
+test("an old absent-Profile POST cannot recreate ownership after takeover completes", async (t) => {
+  const { a, b, state, advance } = await fixture(t);
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "registered", profileId: "post-race" });
+  await b.resolve(id);
+  const entered = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  state.beforeGet = async (path) => {
+    if (!path.includes("-p-")) return;
+    state.beforeGet = undefined;
+    entered.resolve();
+    await resume.promise;
+  };
+  const old = a.acquireProfile(id, "post-race");
+  const rejected = assert.rejects(
+    old,
+    /browser_profile_busy|browser_controller_fenced/,
+  );
+  await entered.promise;
+  advance(15001);
+  await b.resolve(id);
+  await b.acquireProfile(id, "post-race");
+  await b.journal.update(id, 1, { phase: "finished", profileId: "post-race" });
+  await b.complete(id);
+  resume.resolve();
+  await rejected;
+  await b.resolve(other, true);
+  await b.journal.create(other, { phase: "registered", profileId: "post-race" });
+  await b.acquireProfile(other, "post-race");
+});
+
+test("a controller takeover can finalize durable intent interrupted before Profile acquisition", async (t) => {
+  const { a, b, ports, advance, cleanups } = await fixture(t);
+  const backend = {
+    list: async () => [],
+    create: async () => {
+      throw Error("unexpected");
+    },
+    remove: async () => {
+      throw Error("unexpected");
+    },
+  };
+  const first = await createController({
+    ownership: a,
+    backend,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+  });
+  const peer = { signal: new AbortController().signal, callback: async () => {} };
+  // Persist exactly the pending registration contract before any Profile mutation.
+  await a.resolve(id, true);
+  await a.journal.create(id, {
+    phase: "registered",
+    profileId: "pending-intent",
+    profileAcquired: false,
+    storageMode: "host",
+    incarnation: other,
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+    workerProtocol: "browser-sandbox.worker/v2",
+  });
+  await b.resolve(id);
+  advance(15001);
+  const second = await createController({
+    ownership: b,
+    backend,
+    peerPort: ports[1],
+    port: 0,
+    reconciliationMs: 60000,
+  });
+  cleanups.unshift(async () => {
+    await first.stop({ finalize: false });
+    await second.stop({ finalize: false });
+  });
+  await second.command({ op: "finalize", executionId: id }, peer);
+  assert.equal((await b.journal.read(id)).data.phase, "finished");
+  await b.resolve(other, true);
+  await b.journal.create(other, { phase: "registered", profileId: "pending-intent" });
+  await b.acquireProfile(other, "pending-intent");
 });
