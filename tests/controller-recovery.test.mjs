@@ -41,7 +41,7 @@ async function fixture(t) {
               };
             if (request.op === "worker_status")
               return {
-                protocol: "browser-sandbox.worker/v1",
+                protocol: "browser-sandbox.worker/v2",
                 session: {
                   state: "retained",
                   generation: "original",
@@ -305,7 +305,7 @@ test("incompatible worker protocol and lost generation reject renewal while reta
   const original = worker.runtime.request;
   worker.runtime.request = async (request) =>
     request.op === "worker_status"
-      ? { protocol: "browser-sandbox.worker/v2" }
+      ? { protocol: "browser-sandbox.worker/v3" }
       : original(request);
   await first.stop();
   const second = await f.start();
@@ -319,7 +319,7 @@ test("incompatible worker protocol and lost generation reject renewal while reta
   worker.runtime.request = async (request) =>
     request.op === "worker_status"
       ? {
-          protocol: "browser-sandbox.worker/v1",
+          protocol: "browser-sandbox.worker/v2",
           session: { state: "lost", generation: "original", connectedClients: 0 },
           takeover: "automation",
           pendingAuth: 0,
@@ -482,7 +482,7 @@ test("slow worker creation refreshes idle activity before the first CDP connecti
     worker.runtime.request = async (message) =>
       message.op === "worker_status"
         ? {
-            protocol: "browser-sandbox.worker/v1",
+            protocol: "browser-sandbox.worker/v2",
             session: { state: "unused", connectedClients: 0 },
             takeover: "automation",
             pendingAuth: 0,
@@ -750,7 +750,7 @@ test("late protocol mismatch preserves the original endpoint through compatible 
   worker.runtime.request = async (input) => {
     if (input.op !== "worker_status") return request(input);
     if (statusError) throw Error("browser_control_disconnected");
-    return { protocol: "browser-sandbox.worker/v2" };
+    return { protocol: "browser-sandbox.worker/v3" };
   };
   t.after(() => {
     worker.runtime.request = request;
@@ -1002,6 +1002,7 @@ test("concurrent Profile deletion and host reconnect do not deadlock recovered a
   });
   await journal.create(executionId, {
     phase: "finalizing",
+    workerProtocol: "browser-sandbox.worker/v2",
     incarnation,
     profileId: "absent-host",
     storageMode: "host",
@@ -1080,7 +1081,7 @@ test("an incompatible persisted worker protocol preserves a pending Profile save
     lastActivityAt: Date.now(),
     grants: [],
     workerId: worker.id,
-    workerProtocol: "browser-sandbox.worker/v2",
+    workerProtocol: "browser-sandbox.worker/v3",
   });
   const original = await readFile(join(f.directory, `${executionId}.json`), "utf8");
   const controller = await f.start({
@@ -1346,7 +1347,7 @@ test("a long CDP tunnel receives a fresh idle window when it disconnects", async
   worker.runtime.request = async (input) => {
     if (input.op === "worker_status")
       return {
-        protocol: "browser-sandbox.worker/v1",
+        protocol: "browser-sandbox.worker/v2",
         session: {
           state: "live",
           generation: "original",
@@ -1616,7 +1617,7 @@ test("temporary protocol skew does not fence capacity after authoritative absenc
   let operations = 0;
   worker.runtime.request = async (input) => {
     operations++;
-    if (input.op === "worker_status") return { protocol: "browser-sandbox.worker/v2" };
+    if (input.op === "worker_status") return { protocol: "browser-sandbox.worker/v3" };
     throw Error("An incompatible worker must not receive commands");
   };
   const second = await f.start({ reconciliationMs: 60000 });

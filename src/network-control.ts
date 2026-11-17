@@ -15,7 +15,7 @@ export interface ControlPeer {
 }
 
 /** Bidirectional bounded RPC. Disconnect rejects work in both directions; nothing is replayed. */
-function connectPeer(
+export function connectPeer(
   socket: WebSocket,
   dispatch: (request: any, signal: AbortSignal) => Promise<any>,
 ) {
@@ -192,14 +192,19 @@ export interface ControllerRuntime extends BrowserRuntime {
   identity: "managed";
   close(): void;
   setAutomation(automation: AutomationCoordinator): void;
+  setEpoch(epoch: number): void;
 }
 
 /** Internal trusted networks only; host authentication is reserved at /host. */
 export function createControllerRuntime(
   origin: string,
-  { automation: initialAutomation }: { automation?: AutomationCoordinator } = {},
+  {
+    automation: initialAutomation,
+    epoch: initialEpoch,
+  }: { automation?: AutomationCoordinator; epoch?: number } = {},
 ): ControllerRuntime {
   let automation = initialAutomation;
+  let epoch = initialEpoch;
   const storage = new Map<string, StorageAdapter>();
   const url = new URL("/host", origin);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
@@ -236,10 +241,16 @@ export function createControllerRuntime(
       AbortSignal.timeout(options?.timeoutMs ?? CONTROL_TIMEOUT_MS),
     ]);
     await waitForControl(ready, signal);
-    return rpc.call<T>({ ...input, automation: !!automation }, { ...options, signal });
+    return rpc.call<T>(
+      { ...input, ...(epoch === undefined ? {} : { epoch }), automation: !!automation },
+      { ...options, signal },
+    );
   };
   return {
     identity: "managed",
+    setEpoch(value) {
+      epoch = value;
+    },
     setAutomation(value) {
       automation = value;
     },

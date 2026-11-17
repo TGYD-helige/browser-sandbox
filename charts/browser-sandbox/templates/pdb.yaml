@@ -10,3 +10,17 @@ spec:
       {{- include "browser-sandbox.labels" . | nindent 6 }}
       app.kubernetes.io/component: worker
 {{- end }}
+
+{{- if gt (int .Values.controller.replicas) 1 }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-controller
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      {{- include "browser-sandbox.labels" . | nindent 6 }}
+      app.kubernetes.io/component: controller
+{{- end }}

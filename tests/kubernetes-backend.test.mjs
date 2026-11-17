@@ -105,7 +105,7 @@ test("Kubernetes creates an owned single-execution Pod and fences deletion by UI
 
 async function fixture(
   t,
-  { pending = false, deleteRace = false, createStatus, waitingReason } = {},
+  { pending = false, deleteRace = false, createStatus, waitingReason, ownership } = {},
 ) {
   const state = {
     pod: undefined,
@@ -167,9 +167,27 @@ async function fixture(
         );
         return;
       }
-      state.pod = { ...body, metadata: { ...body.metadata, uid: "original" } };
+      state.pod = {
+        ...body,
+        metadata: { ...body.metadata, uid: "original", resourceVersion: "1" },
+      };
+      response.end(JSON.stringify(state.pod));
+    } else if (request.method === "PATCH") {
+      assert.equal(body.metadata.resourceVersion, state.pod.metadata.resourceVersion);
+      state.pod.metadata.annotations = {
+        ...state.pod.metadata.annotations,
+        ...body.metadata.annotations,
+      };
+      state.pod.metadata.resourceVersion = "2";
       response.end(JSON.stringify(state.pod));
     } else if (request.method === "DELETE") {
+      if (
+        ownership &&
+        body.preconditions.resourceVersion !== state.pod.metadata.resourceVersion
+      ) {
+        response.writeHead(409).end("{}");
+        return;
+      }
       state.deleted = true;
       if (deleteRace) response.writeHead(404);
       response.end("{}");
@@ -211,6 +229,7 @@ async function fixture(
   server.listen(0, "127.0.0.1");
   await once(server, "listening");
   const backend = createKubernetesBackend({
+    ownership,
     apiServer: `http://127.0.0.1:${server.address().port}`,
     namespace: "test",
     installation: "trial",
@@ -466,4 +485,33 @@ test("Kubernetes quota rejection reports the cause without allocating a Pod", as
   );
   assert.equal(state.pod, undefined);
   assert.equal(state.deleted, false);
+});
+
+test("Kubernetes epoch fencing prevents stale deletion and permits confirmed stopped cleanup", async (t) => {
+  let epoch = 1;
+  const ownership = { assertOwned: async () => epoch };
+  const { backend, state } = await fixture(t, { ownership });
+  const worker = await backend.create(
+    { executionId, incarnation },
+    AbortSignal.timeout(5000),
+  );
+  t.after(() => worker.runtime.close());
+  assert.equal(state.pod.metadata.annotations["browser-sandbox.io/epoch"], "1");
+  epoch = 2;
+  await assert.rejects(
+    backend.remove(worker, AbortSignal.timeout(5000)),
+    /browser_controller_fenced/,
+  );
+  assert.equal(state.deleted, false);
+  await backend.fence(worker, epoch, AbortSignal.timeout(5000), true);
+  assert.equal(state.pod.metadata.annotations["browser-sandbox.io/epoch"], "2");
+  epoch = 1;
+  await assert.rejects(
+    backend.remove(worker, AbortSignal.timeout(5000)),
+    /browser_controller_fenced/,
+  );
+  assert.equal(state.deleted, false);
+  epoch = 2;
+  await backend.remove(worker, AbortSignal.timeout(5000));
+  assert.equal(state.deleted, true);
 });

@@ -6,6 +6,7 @@ import {
   type KubernetesAccess,
   KubernetesError,
 } from "./kubernetes-api.js";
+import type { KubernetesOwnership } from "./kubernetes-ownership.js";
 import { WorkerCleanupFailure } from "./lifecycle-errors.js";
 import { validProfileId } from "./local-profiles.js";
 import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
@@ -39,6 +40,7 @@ export interface KubernetesBackendOptions extends KubernetesAccess {
   template: KubernetesWorkerTemplate;
   creationTimeoutMs?: number;
   maxExecutionMs?: number;
+  ownership?: KubernetesOwnership;
 }
 
 const identity = (value: string) => /^[a-f0-9-]{36}$/.test(value);
@@ -151,13 +153,24 @@ export function createKubernetesBackend(
       return;
     }
     owned(pod, expected, await readOwner(signal), uid);
+    if (options.ownership) {
+      const executionId = expected[prefix + "execution"];
+      const epoch = await options.ownership.assertOwned(executionId);
+      if (Number(pod.metadata.annotations?.[prefix + "epoch"]) !== epoch)
+        throw Error("browser_controller_fenced");
+    }
     await api(
       `${base}/pods/${name}`,
       "DELETE",
       {
         apiVersion: "v1",
         kind: "DeleteOptions",
-        preconditions: { uid: pod.metadata.uid },
+        preconditions: {
+          uid: pod.metadata.uid,
+          ...(options.ownership
+            ? { resourceVersion: pod.metadata.resourceVersion }
+            : {}),
+        },
         propagationPolicy: "Background",
       },
       signal,
@@ -175,6 +188,9 @@ export function createKubernetesBackend(
     async create(placement, callerSignal) {
       if (!identity(placement.executionId) || !identity(placement.incarnation))
         throw Error("browser_identity_invalid");
+      const epoch = options.ownership
+        ? await options.ownership.assertOwned(placement.executionId)
+        : undefined;
       const signal = AbortSignal.any([
         callerSignal,
         AbortSignal.timeout(creationTimeoutMs),
@@ -214,7 +230,10 @@ export function createKubernetesBackend(
             metadata: {
               name,
               labels: expected,
-              annotations: { [prefix + "profile-id"]: placement.profileId ?? "" },
+              annotations: {
+                [prefix + "profile-id"]: placement.profileId ?? "",
+                ...(epoch ? { [prefix + "epoch"]: String(epoch) } : {}),
+              },
               ownerReferences: [
                 {
                   apiVersion: "v1",
@@ -369,6 +388,7 @@ export function createKubernetesBackend(
               profileId: placement.profileId,
               runtime: createControllerRuntime(origin, {
                 automation: placement.automation,
+                epoch,
               }),
             };
           }
@@ -471,6 +491,40 @@ export function createKubernetesBackend(
         cursors.add(cursor);
       } while (cursor);
       return workers;
+    },
+    async fence(worker, epoch, signal, stopped = false) {
+      if (!options.ownership) return;
+      await options.ownership.assertOwned(worker.executionId);
+      const [name, uid] = worker.id.split("/");
+      const pod = await getPod(name, signal);
+      if (!pod) return;
+      owned(
+        pod,
+        labels(worker.executionId, worker.incarnation, worker.profileId),
+        await readOwner(signal),
+        uid,
+      );
+      const previous = Number(pod.metadata.annotations?.[prefix + "epoch"] ?? 0);
+      if (!Number.isSafeInteger(previous) || previous > epoch)
+        throw Error("browser_controller_fenced");
+      if (previous < epoch)
+        await api(
+          `${base}/pods/${name}`,
+          "PATCH",
+          {
+            metadata: {
+              resourceVersion: pod.metadata.resourceVersion,
+              annotations: { [prefix + "epoch"]: String(epoch) },
+            },
+          },
+          signal,
+        );
+      worker.runtime.setEpoch?.(epoch);
+      if (stopped) return;
+      await worker.runtime.request(
+        { op: "worker_status", executionId: worker.executionId },
+        { signal, timeoutMs: 10000 },
+      );
     },
     async remove(worker: ManagedWorker, callerSignal) {
       const [name, uid, extra] = worker.id.split("/");

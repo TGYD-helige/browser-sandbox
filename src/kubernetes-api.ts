@@ -52,6 +52,7 @@ export function createKubernetesClient(options: KubernetesAccess) {
     method: string,
     body: unknown,
     callerSignal: AbortSignal,
+    onEvent?: (event: any) => void,
   ): Promise<any> => {
     const signal = AbortSignal.any([callerSignal, AbortSignal.timeout(15000)]);
     signal.throwIfAborted();
@@ -79,6 +80,36 @@ export function createKubernetesClient(options: KubernetesAccess) {
           },
         },
         (response) => {
+          if (onEvent && response.statusCode === 200) {
+            let input = "";
+            response.setEncoding("utf8");
+            response.on("data", (chunk) => {
+              input += chunk;
+              if (Buffer.byteLength(input) > 1048576) {
+                request.destroy(Error("browser_kubernetes_response_too_large"));
+                return;
+              }
+              let end: number;
+              while ((end = input.indexOf("\n")) >= 0) {
+                const line = input.slice(0, end);
+                input = input.slice(end + 1);
+                if (!line.trim()) continue;
+                try {
+                  onEvent(JSON.parse(line));
+                } catch {
+                  request.destroy(Error("browser_kubernetes_response_invalid"));
+                  return;
+                }
+              }
+            });
+            response.on("error", () => reject(Error("browser_kubernetes_unavailable")));
+            response.on("end", () =>
+              input.trim()
+                ? reject(Error("browser_kubernetes_response_invalid"))
+                : resolve({}),
+            );
+            return;
+          }
           const chunks: Buffer[] = [];
           let size = 0;
           response.on("data", (chunk) => {

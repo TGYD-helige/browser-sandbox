@@ -344,7 +344,7 @@ export class BrowserViewer extends HTMLElement {
     if (this.hasAttribute("data-standalone")) {
       const token = location.hash.slice(1);
       history.replaceState(null, "", location.pathname);
-      if (/^[a-f0-9]{64}$/.test(token))
+      if (/^(?:[a-f0-9-]{36}\.)?[a-f0-9]{64}$/.test(token))
         this.connect({
           endpoint: `${location.origin.replace(/^http/, "ws")}/view/socket`,
           token,
@@ -366,11 +366,16 @@ export class BrowserViewer extends HTMLElement {
     const url = new URL(endpoint);
     if (
       !["ws:", "wss:"].includes(url.protocol) ||
-      !/^[a-f0-9]{64}$/.test(token) ||
+      !/^(?:[a-f0-9-]{36}\.)?[a-f0-9]{64}$/.test(token) ||
       url.username ||
       url.password
     )
       throw Error("Invalid viewer connection");
+    if (token.includes(".")) {
+      const [executionId, capability] = token.split(".");
+      url.pathname = `/execution/${executionId}/view/socket`;
+      token = capability;
+    }
     this.setViewport(viewport);
     const socket = (this.#socket = new WebSocket(url));
     this.#elements.status.textContent = "Connecting…";

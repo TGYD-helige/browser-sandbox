@@ -22,6 +22,7 @@ export interface ManagedWorker {
   infrastructureOnly?: boolean;
   runtime: BrowserRuntime & {
     close?(): void;
+    setEpoch?(epoch: number): void;
     setAutomation?(automation: AutomationCoordinator): void;
   };
 }
@@ -40,5 +41,11 @@ export interface ManagedBackend {
   ): Promise<ManagedWorker>;
   /** A failed discovery is unknown ownership; include stopped resources awaiting cleanup. */
   list?(signal: AbortSignal): Promise<ManagedWorker[]>;
+  fence?(
+    worker: ManagedWorker,
+    epoch: number,
+    signal: AbortSignal,
+    stopped?: boolean,
+  ): Promise<void>;
   remove(worker: ManagedWorker, signal: AbortSignal): Promise<void>;
 }

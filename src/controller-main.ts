@@ -1,8 +1,13 @@
 import { createServer } from "node:http";
-import { createController } from "./controller.js";
+import { createController, validateControllerRecord } from "./controller.js";
 import { createProfileStore } from "./profile-store.js";
 
 const root = process.env.BROWSER_PROFILE_STORE_ROOT;
+const replicas = Number(process.env.BROWSER_CONTROLLER_REPLICAS ?? 1);
+if (!Number.isSafeInteger(replicas) || replicas < 1 || replicas > 100)
+  throw Error("browser_controller_configuration_invalid");
+if (replicas > 1 && root) throw Error("browser_profile_store_replicas_unsupported");
+let ownership: import("./kubernetes-ownership.js").KubernetesOwnership;
 if (root)
   process.env.BROWSER_PROFILE_STORE_ORIGIN ??= `http://${process.env.BROWSER_CONTROLLER_CONTAINER ?? process.env.HOSTNAME}:8083`;
 else delete process.env.BROWSER_PROFILE_STORE_ORIGIN;
@@ -13,9 +18,30 @@ if (backendName === "kubernetes") {
   const { readFile } = await import("node:fs/promises");
   const { createKubernetesBackend } = await import("./kubernetes-backend.js");
   const { readKubernetesAccess } = await import("./kubernetes-api.js");
+  const access = await readKubernetesAccess();
+  if (replicas > 1 || process.env.BROWSER_SHARED_STATE === "true") {
+    const { createKubernetesOwnership } = await import("./kubernetes-ownership.js");
+    ownership = createKubernetesOwnership({
+      ...access,
+      installation: process.env.BROWSER_INSTALLATION ?? "default",
+      replica: process.env.BROWSER_CONTROLLER_ID,
+      peerOrigin: process.env.BROWSER_PEER_ORIGIN,
+    });
+    if (replicas === 1) {
+      const { importExecutionJournal } = await import("./kubernetes-migration.js");
+      await importExecutionJournal({
+        directory:
+          process.env.BROWSER_CONTROLLER_STATE ?? "/controller-data/executions",
+        installationId: process.env.BROWSER_INSTALLATION ?? "default",
+        ownership,
+        validate: validateControllerRecord,
+      });
+    }
+  }
   backend = createKubernetesBackend({
+    ownership,
     installation: process.env.BROWSER_INSTALLATION ?? "default",
-    ...(await readKubernetesAccess()),
+    ...access,
     ownerName: process.env.BROWSER_KUBERNETES_OWNER,
     image: process.env.BROWSER_IMAGE,
     template: JSON.parse(
@@ -79,6 +105,9 @@ if (storageServer)
   });
 const controller = await createController({
   profileStore: store,
+  ownership,
+  replicas,
+  peerPort: Number(process.env.BROWSER_PEER_PORT ?? 8084),
   onWorkerEvent: (event) => console.log(JSON.stringify(event)),
   backend,
   installationId: process.env.BROWSER_INSTALLATION ?? "default",

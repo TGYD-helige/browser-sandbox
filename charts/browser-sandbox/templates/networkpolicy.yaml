@@ -76,3 +76,14 @@ spec:
         - protocol: TCP
           port: {{ .Values.hostControl.port }}
     {{- end }}
+
+    {{- if or (gt (int .Values.controller.replicas) 1) .Values.controller.sharedState }}
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "browser-sandbox.labels" . | nindent 14 }}
+              app.kubernetes.io/component: controller
+      ports:
+        - protocol: TCP
+          port: 8084
+    {{- end }}

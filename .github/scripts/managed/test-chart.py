@@ -177,6 +177,37 @@ class ChartTest(unittest.TestCase):
         self.assertNotIn("from", access)
         self.assertEqual(host["from"], [{"podSelector": {"matchLabels": {"browser-sandbox.io/host-control": "true"}}}])
 
+    def test_active_active_has_shared_state_peer_isolation_and_no_rwo_mount(self):
+        resources = render("--set", "controller.replicas=3")
+        deployment = next(item for item in resources if item["kind"] == "Deployment")
+        self.assertEqual(deployment["spec"]["replicas"], 3)
+        self.assertEqual(deployment["spec"]["strategy"]["type"], "RollingUpdate")
+        pod = deployment["spec"]["template"]["spec"]
+        self.assertIn("podAntiAffinity", pod["affinity"])
+        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in resources))
+        self.assertFalse(any(volume.get("persistentVolumeClaim") for volume in pod["volumes"]))
+        env = {item["name"]: item.get("value") for item in pod["containers"][0]["env"]}
+        self.assertEqual(env["BROWSER_SHARED_STATE"], "true")
+        self.assertEqual(env["BROWSER_CONTROLLER_REPLICAS"], "3")
+        self.assertNotIn("BROWSER_CONTROLLER_STATE", env)
+        self.assertTrue(any(item["kind"] == "PodDisruptionBudget" and item["metadata"]["name"].endswith("-controller") for item in resources))
+        policy = next(item["spec"] for item in resources if item["kind"] == "NetworkPolicy" and item["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "controller")
+        peer = next(rule for rule in policy["ingress"] if rule["ports"][0]["port"] == 8084)
+        self.assertEqual(peer["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"], "controller")
+        self.assertFalse(any(8084 in [port["port"] for port in item["spec"]["ports"]] for item in resources if item["kind"] == "Service"))
+        rules = next(item["rules"] for item in resources if item["kind"] == "Role" and not item["metadata"]["name"].endswith("-drain"))
+        self.assertEqual(set(next(rule["verbs"] for rule in rules if "leases" in rule["resources"])), {"get", "list", "watch", "create", "update", "delete"})
+        self.assertEqual(set(next(rule["verbs"] for rule in rules if "secrets" in rule["resources"])), {"get", "create", "update", "delete"})
+        with self.assertRaises(subprocess.CalledProcessError):
+            render("--set", "controller.replicas=3", "--set", "profileStore.enabled=true")
+
+    def test_single_replica_migration_keeps_source_read_only(self):
+        resources = render("--set", "controller.sharedState=true")
+        deployment = next(item for item in resources if item["kind"] == "Deployment")
+        self.assertEqual(deployment["spec"]["strategy"]["type"], "Recreate")
+        mounts = deployment["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+        self.assertTrue(next(mount for mount in mounts if mount["name"] == "controller-data")["readOnly"])
+
 
 if __name__ == "__main__":
     unittest.main()

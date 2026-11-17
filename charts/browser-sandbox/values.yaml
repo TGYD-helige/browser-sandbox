@@ -5,6 +5,9 @@ image:
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 controller:
+  replicas: 1
+  # Enable once at one replica to import the retained v1 journal before scaling.
+  sharedState: false
   publicOrigin: ""
   resources:
     requests:

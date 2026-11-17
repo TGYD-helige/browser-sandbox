@@ -12,6 +12,7 @@ import {
 } from "./network-policy.js";
 import { BROWSER_PRIVACY_ARGS } from "./privacy.js";
 import { verifyTarget } from "./probe.js";
+import { createWorkerFence } from "./worker-protocol.js";
 import { createWorkerStorage } from "./worker-storage.js";
 
 if (process.env.PORT !== "3001") throw Error("browser_internal_port_invalid");
@@ -133,7 +134,7 @@ const workerStorage = createWorkerStorage(
 const networkControl = workerExecutionId
   ? createNetworkHostControl({
       server: gateway.workerServer,
-      dispatch: async (request, peer, signal) => {
+      dispatch: createWorkerFence(async (request, peer, signal) => {
         if (request.executionId !== workerExecutionId)
           throw Error("browser_identity_mismatch");
         if (!controllerPeer || controllerPeer.signal.aborted || request.automation)
@@ -143,7 +144,7 @@ const networkControl = workerExecutionId
         const storageResult = await workerStorage(request, peer, signal);
         if (storageResult) return storageResult;
         return gateway.workerCommand(request, signal);
-      },
+      }),
     })
   : undefined;
 for (const signal of ["SIGINT", "SIGTERM"])

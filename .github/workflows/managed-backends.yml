@@ -49,7 +49,7 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -73,7 +73,8 @@ jobs:
       - run: docker build -t browser-sandbox:managed .
       - run: docker build -f .github/scripts/managed/Dockerfile.client -t browser-sandbox-client:managed .
       - run: bash .github/scripts/verify-image.sh browser-sandbox:managed
-      - run: node .github/scripts/managed/kubernetes.mjs
+      - name: Single controller and three-replica active-active matrix
+        run: node .github/scripts/managed/kubernetes.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:
