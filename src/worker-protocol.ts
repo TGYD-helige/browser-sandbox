@@ -54,11 +54,13 @@ export function workerIdle(value: unknown, now = Date.now()): boolean {
 /** Epoch zero preserves single-controller clients; seeing a fenced owner permanently disables it. */
 export function createWorkerFence(
   dispatch: (request: any, peer: ControlPeer, signal: AbortSignal) => Promise<any>,
+  executionId: string,
 ) {
   let highest = 0;
   let ownership = new AbortController();
   let peers = new WeakMap<ControlPeer, ControlPeer>();
   return async (request: any, peer: ControlPeer, signal: AbortSignal) => {
+    if (request?.executionId !== executionId) throw Error("browser_identity_mismatch");
     const epoch = request.epoch ?? 0;
     if (!Number.isSafeInteger(epoch) || epoch < 0)
       throw Error("browser_controller_epoch_invalid");

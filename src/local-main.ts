@@ -135,8 +135,6 @@ const networkControl = workerExecutionId
   ? createNetworkHostControl({
       server: gateway.workerServer,
       dispatch: createWorkerFence(async (request, peer, signal) => {
-        if (request.executionId !== workerExecutionId)
-          throw Error("browser_identity_mismatch");
         if (!controllerPeer || controllerPeer.signal.aborted || request.automation)
           controllerPeer = peer;
         if (request.op === "register")
@@ -144,7 +142,7 @@ const networkControl = workerExecutionId
         const storageResult = await workerStorage(request, peer, signal);
         if (storageResult) return storageResult;
         return gateway.workerCommand(request, signal);
-      }),
+      }, workerExecutionId),
     })
   : undefined;
 for (const signal of ["SIGINT", "SIGTERM"])

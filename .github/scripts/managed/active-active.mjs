@@ -401,6 +401,18 @@ export async function activeActive({
     const worker = (await list("worker")).find(
       (pod) => pod.metadata.labels[prefix + "execution"] === id,
     );
+    stage = "worker execution identity";
+    await kubectl(
+      "exec",
+      current.pod.metadata.name,
+      "--",
+      "node",
+      "--input-type=module",
+      "-e",
+      `import{createControllerRuntime}from'/opt/browser-sandbox/dist/network-control.js';const r=createControllerRuntime('http://${worker.status.podIP}:8081',{epoch:${Number(current.lease.metadata.annotations[prefix + "epoch"]) + 1000}});try{await r.request({op:'worker_status',executionId:'${randomUUID()}'});throw Error('misroute_accepted')}catch(e){if(e.message!=='browser_identity_mismatch')throw e}finally{r.close()}`,
+    );
+    await client("verify", id, current.other);
+    report.misroutedEpochDoesNotFenceAnotherExecution = true;
     stage = "persistent Profile failover";
     const persistentId = randomUUID();
     await client("prepare", persistentId, undefined, "ha-persistent");
