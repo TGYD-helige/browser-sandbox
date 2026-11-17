@@ -6,7 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import WebSocket from "ws";
+import { waitForControl } from "../dist/automation-control.js";
 import { createController, validateControllerRecord } from "../dist/controller.js";
+import { createKubernetesBackend } from "../dist/kubernetes-backend.js";
 import { importExecutionJournal } from "../dist/kubernetes-migration.js";
 import { createKubernetesOwnership } from "../dist/kubernetes-ownership.js";
 import { createControllerRuntime } from "../dist/network-control.js";
@@ -36,24 +38,42 @@ async function fixture(t, extra = {}) {
         .writeHead(status, { "content-type": "application/json" })
         .end(JSON.stringify(value));
     if (req.method === "GET" && path.endsWith("/leases")) {
-      if (req.url.includes("watch=true")) return reply(200);
+      if (req.url.includes("watch=true")) {
+        if (!state.watchEvents) return reply(200);
+        const events = state.watchEvents;
+        state.watchEvents = undefined;
+        return res
+          .writeHead(200)
+          .end(events.map((event) => JSON.stringify(event)).join("\n") + "\n");
+      }
+      const items = [...objects.entries()]
+        .filter(
+          ([key, value]) =>
+            key.startsWith(path + "/") &&
+            value.metadata.labels["browser-sandbox.io/state"] === "execution",
+        )
+        .map(([, value]) => value);
+      const snapshot = await state.beforeList?.(items);
       return reply(200, {
-        items: [...objects.entries()]
-          .filter(
-            ([key, value]) =>
-              key.startsWith(path + "/") &&
-              value.metadata.labels["browser-sandbox.io/state"] === "execution",
-          )
-          .map(([, value]) => value),
+        items: snapshot ?? items,
         metadata: { resourceVersion: String(version) },
       });
     }
+
+    if (req.method === "GET" && path.endsWith("/pods"))
+      return reply(200, {
+        items: [...objects.entries()]
+          .filter(([key]) => key.startsWith(path + "/"))
+          .map(([, value]) => value),
+        metadata: {},
+      });
     if (req.method === "GET") {
       await state.beforeGet?.(path);
       if (state.readAfterGet) previous = objects.get(path);
       return reply(previous ? 200 : 404, previous);
     }
     if (req.method === "POST") {
+      await state.beforePost?.(path, body);
       if (path.endsWith("/secrets") && state.failSecretCreate) {
         state.failSecretCreate = false;
         return reply(503);
@@ -61,11 +81,26 @@ async function fixture(t, extra = {}) {
       const key = `${path}/${body.metadata.name}`;
       if (objects.has(key)) return reply(409);
       body.metadata.resourceVersion = String(++version);
+      if (path.endsWith("/pods")) {
+        body.metadata.uid = `pod-${version}`;
+        body.status = {
+          phase: "Running",
+          podIP: "127.0.0.1",
+          conditions: [{ type: "Ready", status: "True" }],
+        };
+      }
       objects.set(key, body);
       return reply(201, body);
     }
     if (!previous) return reply(404);
     if (req.method === "PUT") {
+      if (
+        body.metadata.labels["browser-sandbox.io/state"] === "epoch" &&
+        state.failLeaseRetire
+      ) {
+        state.failLeaseRetire = false;
+        return reply(503);
+      }
       await state.beforeWrite?.(path, body);
       previous = objects.get(path);
       if (body.metadata.resourceVersion !== previous.metadata.resourceVersion)
@@ -74,12 +109,29 @@ async function fixture(t, extra = {}) {
       objects.set(path, body);
       return reply(200, body);
     }
+    if (req.method === "PATCH") {
+      if (body.metadata.resourceVersion !== previous.metadata.resourceVersion)
+        return reply(409);
+      const updated = {
+        ...previous,
+        metadata: {
+          ...previous.metadata,
+          resourceVersion: String(++version),
+          annotations: {
+            ...previous.metadata.annotations,
+            ...body.metadata.annotations,
+          },
+        },
+      };
+      objects.set(path, updated);
+      return reply(200, updated);
+    }
     if (req.method === "DELETE") {
-      if (path.includes("/leases/") && state.failLeaseDelete) {
-        state.failLeaseDelete = false;
-        return reply(503);
-      }
-      if (body.preconditions.resourceVersion !== previous.metadata.resourceVersion)
+      if (
+        body.preconditions.resourceVersion
+          ? body.preconditions.resourceVersion !== previous.metadata.resourceVersion
+          : body.preconditions.uid !== previous.metadata.uid
+      )
         return reply(409);
       objects.delete(path);
       return reply(200);
@@ -131,6 +183,7 @@ async function fixture(t, extra = {}) {
     state,
     ports,
     cleanups,
+    apiServer: options.apiServer,
     advance: (ms) => {
       now += ms;
     },
@@ -420,7 +473,7 @@ test("interrupted finished-fence compaction resumes after its Secret was deleted
     await a.journal.create(executionId, { phase: "finished" });
     await a.complete(executionId);
   }
-  state.failLeaseDelete = true;
+  state.failLeaseRetire = true;
   await assert.rejects(a.refresh());
   await b.refresh();
   advance(15001);
@@ -829,12 +882,7 @@ test("startup renews ownership during delayed discovery and lists workers once p
   await entered.promise;
   advance(5000);
   t.mock.timers.tick(5000);
-  await Promise.race([
-    renewed.promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(Error("startup did not renew before listening")), 300),
-    ),
-  ]);
+  await waitForControl(renewed.promise, AbortSignal.timeout(5000));
   resume.resolve();
   await starting;
   assert.equal(
@@ -925,12 +973,7 @@ test("slow graceful shutdown keeps renewing until it conditionally releases owne
   advance(5000);
   t.mock.timers.tick(5000);
   try {
-    await Promise.race([
-      renewed.promise,
-      new Promise((_, reject) =>
-        setTimeout(() => reject(Error("shutdown stopped renewal before cleanup")), 300),
-      ),
-    ]);
+    await waitForControl(renewed.promise, AbortSignal.timeout(5000));
   } finally {
     resume.resolve();
     await stopping;
@@ -1299,4 +1342,362 @@ test("non-owner forwarding cannot normalize an execution path into private host 
       "execution routing must not reach the trusted peer /host route",
     );
   }
+});
+
+test("owned executions awaiting binding recovery return retryable 503 without cluster reads", async (t) => {
+  const { a, ports, state, cleanups } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => [],
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {},
+    },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  await a.resolve(id, true);
+  const record = await a.journal.create(id, {
+    phase: "registered",
+    grants: [{ token: "d".repeat(64) }],
+  });
+  await a.indexLegacy(record);
+  const before = state.requests;
+  const response = await fetch(
+    `${controller.origin}/execution/${id}/${"d".repeat(64)}/session`,
+  );
+  assert.equal(response.status, 503);
+  assert.equal((await response.json()).error, "browser_controller_owner_moved");
+  const socket = new WebSocket(
+    `${controller.origin.replace(/^http/, "ws")}/view/socket`,
+  );
+  socket.once("open", () =>
+    socket.send(JSON.stringify({ type: "authenticate", token: "d".repeat(64) })),
+  );
+  socket.on("error", () => {});
+  const closed = await new Promise((resolve) =>
+    socket.once("close", (code, reason) => resolve({ code, reason: String(reason) })),
+  );
+  assert.deepEqual(closed, { code: 1013, reason: "browser_controller_owner_moved" });
+  assert.equal(state.requests, before);
+});
+
+test("a missing migration mount does not mark the journal imported forever", async (t) => {
+  const { a } = await fixture(t);
+  const root = await mkdtemp(join(tmpdir(), "missing-journal-mount-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const directory = join(root, "executions");
+  const options = {
+    directory,
+    installationId: "fixture",
+    ownership: a,
+    validate: validateControllerRecord,
+  };
+  assert.equal(await importExecutionJournal(options), 0);
+  assert.equal(await a.migrationComplete(), false);
+  await cp(
+    new URL("../.github/scripts/managed/fixtures/journal-v0.2.0/", import.meta.url),
+    directory,
+    { recursive: true },
+  );
+  assert.equal(await importExecutionJournal(options), 1);
+});
+
+test("authoritative lease refresh removes missed deletions and their capability routes", async (t) => {
+  const { a, objects } = await fixture(t);
+  await a.resolve(id, true);
+  const record = await a.journal.create(id, {
+    phase: "registered",
+    grants: [{ token: "e".repeat(64) }],
+  });
+  await a.indexLegacy(record);
+  const key = [...objects.keys()].find(
+    (path) =>
+      path.includes("/leases/") &&
+      objects.get(path).metadata.labels["browser-sandbox.io/execution"] === id,
+  );
+  objects.delete(key);
+  await a.refresh();
+  assert.equal(a.lookup(id), undefined);
+  assert.equal(a.findCapability("e".repeat(64)), undefined);
+  assert.equal(a.owns(id), false);
+});
+
+test("an older LIST snapshot does not erase or replace a newer local observation", async (t) => {
+  const { a, state } = await fixture(t);
+  await a.resolve(id, true);
+  const record = await a.journal.create(id, {
+    phase: "registered",
+    grants: [{ token: "e".repeat(64) }],
+  });
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  // Synthetic stale LIST: a newer Lease update arrives while the empty snapshot is in flight.
+  state.beforeList = async () => {
+    entered.resolve();
+    await resume.promise;
+    return [];
+  };
+  const refreshing = a.refresh();
+  await entered.promise;
+  await a.indexLegacy(record);
+  resume.resolve();
+  await refreshing;
+  assert.equal(a.lookup(id)?.replica, "a");
+  assert.equal(a.findCapability("e".repeat(64)), id);
+  assert.equal(a.owns(id), true);
+});
+
+test("compaction skips an execution fenced during its record read and continues", async (t) => {
+  const { a, b, state, advance } = await fixture(t, { maxFinished: 1 });
+  const third = "33333333-3333-4333-8333-333333333333";
+  for (const executionId of [id, other, third]) {
+    await a.resolve(executionId, true);
+    await a.journal.create(executionId, { phase: "finished" });
+    await a.complete(executionId);
+  }
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  state.readAfterGet = true;
+  let reads = 0;
+  state.beforeGet = async (path) => {
+    if (!path.includes("/secrets/") || !path.endsWith(id) || ++reads < 2) return;
+    state.beforeGet = undefined;
+    entered.resolve();
+    await resume.promise;
+  };
+  const refreshing = a.refresh();
+  t.after(() => resume.resolve());
+  const outcome = refreshing.then(
+    () => null,
+    (error) => error,
+  );
+  await waitForControl(entered.promise, AbortSignal.timeout(5000));
+  await b.resolve(id);
+  advance(15001);
+  await b.resolve(id);
+  resume.resolve();
+  assert.equal(await outcome, null);
+  assert.equal(b.owns(id), true);
+  assert.equal(await a.journal.read(other), undefined);
+  assert.equal((await a.journal.read(third)).data.phase, "finished");
+});
+
+test("compaction retains the epoch floor for the same execution and Profile", async (t) => {
+  const { a, b, objects, advance } = await fixture(t, { maxFinished: 1 });
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "registered", profileId: "epoch-floor" });
+  await a.acquireProfile(id, "epoch-floor");
+  await b.resolve(id);
+  advance(15001);
+  const old = await b.resolve(id);
+  await b.journal.update(id, 1, { phase: "finished", profileId: "epoch-floor" });
+  await b.complete(id);
+  await b.resolve(other, true);
+  await b.journal.create(other, { phase: "finished" });
+  await b.complete(other);
+  await b.refresh();
+  assert.equal(await b.journal.read(id), undefined);
+  assert.equal(
+    await b.resolve(id),
+    undefined,
+    "read-only lookup must not revive a tombstone",
+  );
+  const tombstone = [...objects.values()].find(
+    (value) => value.metadata.labels["browser-sandbox.io/state"] === "epoch",
+  );
+  assert.ok(tombstone);
+  assert.deepEqual(Object.keys(tombstone.metadata.annotations), [
+    "browser-sandbox.io/epoch",
+  ]);
+  const next = await b.resolve(id, true);
+  assert.ok(next.epoch > old.epoch);
+  await b.journal.create(id, { phase: "registered", profileId: "epoch-floor" });
+  await b.acquireProfile(id, "epoch-floor");
+});
+
+test("a Pod POST landing after compaction is fenced and removed by the next execution epoch", async (t) => {
+  const { a, b, objects, state, advance, apiServer } = await fixture(t, {
+    maxFinished: 1,
+  });
+  objects.set("/api/v1/namespaces/test/configmaps/workers", {
+    metadata: {
+      uid: "release",
+      labels: {
+        "app.kubernetes.io/name": "browser-sandbox",
+        "app.kubernetes.io/instance": "test",
+      },
+    },
+  });
+  const backend = (ownership) =>
+    createKubernetesBackend({
+      namespace: "test",
+      installation: "test",
+      apiServer,
+      ownerName: "workers",
+      image: `browser-sandbox@sha256:${"a".repeat(64)}`,
+      ownership,
+      template: {
+        securityContext: {
+          seccompProfile: {
+            type: "Localhost",
+            localhostProfile: "browser-sandbox.json",
+          },
+        },
+      },
+    });
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "registered" });
+  await b.resolve(id);
+  advance(15001);
+  const old = await b.resolve(id);
+  assert.equal(old.epoch, 2);
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  state.beforePost = async (path) => {
+    if (!path.endsWith("/pods")) return;
+    state.beforePost = undefined;
+    entered.resolve();
+    await resume.promise;
+  };
+  const pending = backend(b).create(
+    { executionId: id, incarnation: other },
+    AbortSignal.timeout(10000),
+  );
+  const rejected = assert.rejects(pending, /browser_controller_fenced/);
+  t.after(() => resume.resolve());
+  await waitForControl(entered.promise, AbortSignal.timeout(5000));
+  await a.resolve(id);
+  advance(15001);
+  await a.resolve(id);
+  await a.journal.update(id, 1, { phase: "finished" });
+  await a.complete(id);
+  await a.resolve(other, true);
+  await a.journal.create(other, { phase: "finished" });
+  await a.complete(other);
+  await a.refresh();
+  assert.equal(
+    await a.journal.read(id),
+    undefined,
+    "compaction completes before the old POST lands",
+  );
+  assert.equal(
+    [...objects.keys()].some((path) => path.includes("/pods/")),
+    false,
+  );
+  resume.resolve();
+  await rejected;
+  const current = await a.resolve(id, true);
+  const next = backend(a);
+  const workers = await next.list(AbortSignal.timeout(5000));
+  assert.equal(
+    workers.length,
+    1,
+    "fenced creator must leave the late Pod for its successor",
+  );
+  t.after(() => workers[0].runtime.close());
+  assert.equal(workers[0].epoch, old.epoch);
+  assert.ok(current.epoch > old.epoch);
+  await next.fence(workers[0], current.epoch, AbortSignal.timeout(5000), true);
+  await next.remove(workers[0], AbortSignal.timeout(5000));
+  assert.equal((await next.list(AbortSignal.timeout(5000))).length, 0);
+});
+
+function watchSentinel(objects, executionId) {
+  const lease = structuredClone(
+    [...objects.values()].find(
+      (value) =>
+        value.kind === "Lease" &&
+        value.metadata.labels["browser-sandbox.io/execution"] === executionId,
+    ),
+  );
+  lease.metadata.annotations["browser-sandbox.io/epoch"] = String(
+    Number(lease.metadata.annotations["browser-sandbox.io/epoch"]) + 1,
+  );
+  lease.metadata.resourceVersion += "-sentinel";
+  lease.spec.holderIdentity = "b";
+  return { type: "MODIFIED", object: lease };
+}
+
+test("a stale LIST cannot restore a route added and deleted by watch while it was in flight", async (t) => {
+  const { a, b, objects, state } = await fixture(t);
+  await a.resolve(other, true);
+  await b.resolve(id, true);
+  const token = "f".repeat(64);
+  const record = await b.journal.create(id, {
+    phase: "registered",
+    grants: [{ token }],
+  });
+  await b.indexLegacy(record);
+  const lease = structuredClone(
+    [...objects.values()].find(
+      (value) =>
+        value.kind === "Lease" &&
+        value.metadata.labels["browser-sandbox.io/execution"] === id,
+    ),
+  );
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  state.beforeList = async (items) => {
+    state.beforeList = undefined;
+    entered.resolve();
+    await resume.promise;
+    return items;
+  };
+  const refreshing = a.refresh();
+  t.after(() => resume.resolve());
+  await waitForControl(entered.promise, AbortSignal.timeout(5000));
+  objects.delete(
+    `/apis/coordination.k8s.io/v1/namespaces/test/leases/${lease.metadata.name}`,
+  );
+  const processed = Promise.withResolvers();
+  a.onLost((executionId) => {
+    if (executionId === other) processed.resolve();
+  });
+  // Controlled watch ordering: observe both changes before releasing the old LIST snapshot.
+  state.watchEvents = [
+    { type: "ADDED", object: lease },
+    { type: "DELETED", object: lease },
+    watchSentinel(objects, other),
+  ];
+  void a.watch();
+  await waitForControl(processed.promise, AbortSignal.timeout(5000));
+  assert.equal(a.lookup(id), undefined);
+  assert.equal(a.findCapability(token), undefined);
+  resume.resolve();
+  await refreshing;
+  assert.equal(a.lookup(id), undefined);
+  assert.equal(a.findCapability(token), undefined);
+});
+
+test("a delayed tombstone watch deletion preserves a revived higher execution epoch", async (t) => {
+  const { a, objects, state } = await fixture(t, { maxFinished: 1 });
+  for (const executionId of [id, other]) {
+    await a.resolve(executionId, true);
+    await a.journal.create(executionId, { phase: "finished" });
+    await a.complete(executionId);
+  }
+  await a.compact();
+  const retired = structuredClone(
+    [...objects.values()].find(
+      (value) => value.metadata.labels["browser-sandbox.io/state"] === "epoch",
+    ),
+  );
+  await a.resolve(id, true);
+  await a.resolve(other, true);
+  const processed = Promise.withResolvers();
+  a.onLost((executionId) => {
+    if (executionId === other) processed.resolve();
+  });
+  state.watchEvents = [
+    { type: "DELETED", object: retired },
+    watchSentinel(objects, other),
+  ];
+  void a.watch();
+  await waitForControl(processed.promise, AbortSignal.timeout(5000));
+  assert.equal(a.owns(id), true);
 });

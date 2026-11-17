@@ -617,7 +617,7 @@ export async function activeActive({
     );
     assert.equal(resumed.metadata.uid, current.pod.metadata.uid);
     assert.equal(resumed.status.containerStatuses[0].restartCount, pausedRestartCount);
-    // The old process must run after SIGCONT, report its own fencing and avoid destructive work.
+    // The old process must run after SIGCONT, report its own fencing and report no worker removal.
     assertFencedOwner((await readEvents(current.pod)).slice(beforePauseEvents), id);
     await kubectl(
       "exec",
@@ -628,7 +628,7 @@ export async function activeActive({
       "-e",
       `import{createControllerRuntime}from'/opt/browser-sandbox/dist/network-control.js';const old=createControllerRuntime('http://${worker.status.podIP}:8081',{epoch:${oldEpoch}});const next=createControllerRuntime('http://${worker.status.podIP}:8081',{epoch:${Number(next.lease.metadata.annotations[prefix + "epoch"])}});try{try{await old.request({op:'finalize',executionId:'${id}'});throw Error('old_epoch_accepted')}catch(e){if(e.message!=='browser_controller_fenced')throw e}const status=await next.request({op:'worker_status',executionId:'${id}'});if(status.protocol!=='browser-sandbox.worker/v2')throw Error('worker_epoch_regressed')}finally{old.close();next.close()}`,
     );
-    report.resumedOldControllerReportedFencingWithoutDestructiveEvents = true;
+    report.resumedOldControllerReportedFencingWithoutRemoval = true;
     report.workerEpochDidNotRegressAfterResume = true;
     assertFencedOwner((await readEvents(current.pod)).slice(beforePauseEvents), id);
     assert.equal(

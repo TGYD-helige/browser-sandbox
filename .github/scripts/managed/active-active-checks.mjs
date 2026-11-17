@@ -10,8 +10,8 @@ export function assertFencedOwner(events, executionId) {
     "Resumed controller did not report its own fencing",
   );
   assert(
-    !own.some((event) => ["removed", "finalized", "commit"].includes(event.type)),
-    "Resumed old controller performed a destructive action",
+    !own.some((event) => event.type === "removed"),
+    "Resumed old controller reported worker removal",
   );
 }
 

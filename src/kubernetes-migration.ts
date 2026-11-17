@@ -20,10 +20,7 @@ export async function importExecutionJournal(options: {
   try {
     directory = await opendir(options.directory);
   } catch (error) {
-    if (error.code === "ENOENT") {
-      await options.ownership.finishMigration();
-      return 0;
-    }
+    if (error.code === "ENOENT") return 0;
     throw error;
   }
   for await (const entry of directory) {

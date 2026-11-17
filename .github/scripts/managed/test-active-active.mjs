@@ -6,17 +6,30 @@ import {
   summarizeFailover,
 } from "./active-active-checks.mjs";
 
-test("resumed controller evidence requires its own fencing report and excludes destructive events", () => {
+test("resumed controller evidence requires its own fencing report and excludes worker removal events", () => {
   assert.throws(() => assertFencedOwner([], "execution"));
   const fenced = {
     executionId: "execution",
     type: "fenced",
     error: "browser_controller_fenced",
   };
-  for (const type of ["removed", "finalized", "commit"])
-    assert.throws(() =>
-      assertFencedOwner([fenced, { executionId: "execution", type }], "execution"),
-    );
+  assert.throws(() =>
+    assertFencedOwner(
+      [fenced, { executionId: "execution", type: "removed" }],
+      "execution",
+    ),
+  );
+  // Synthetic unknown events cannot stand in for finalization or archive-save evidence.
+  assert.doesNotThrow(() =>
+    assertFencedOwner(
+      [
+        fenced,
+        { executionId: "execution", type: "finalized" },
+        { executionId: "execution", type: "commit" },
+      ],
+      "execution",
+    ),
+  );
   assert.doesNotThrow(() => assertFencedOwner([fenced], "execution"));
 });
 

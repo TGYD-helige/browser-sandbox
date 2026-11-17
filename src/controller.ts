@@ -139,10 +139,7 @@ export async function createController(options: ControllerOptions) {
     finished.add(id);
     if (finished.size > 65536) finished.delete(finished.values().next().value);
   };
-  let journal:
-    | Awaited<ReturnType<typeof createExecutionJournal>>
-    | ExecutionOwnership["journal"]
-    | undefined;
+  let journal: ExecutionOwnership["journal"] | undefined;
   const ownership = options.ownership;
   const scopedCapability = (id: string, token: string, separator: "/" | ".") =>
     ownership ? `${id}${separator}${token}` : token;
@@ -951,7 +948,7 @@ export async function createController(options: ControllerOptions) {
         throw Error("browser_request_invalid");
       const binding = bindings.get(id);
       const record =
-        !binding && journal?.has(id) && finished.has(id)
+        !binding && journal && finished.has(id)
           ? await journal.read(id).catch((error) => {
               if (error.code !== "ENOENT") throw error;
               return undefined;
@@ -1473,6 +1470,8 @@ export async function createController(options: ControllerOptions) {
                     forwardControllerViewer(client, owner.origin, id, auth.token);
                     return;
                   }
+                  if (ownership.owns(id) && !bindings.has(id) && !finished.has(id))
+                    throw Error("browser_controller_owner_moved");
                   req.executionId = id;
                 }
               }
@@ -1893,6 +1892,8 @@ export async function createController(options: ControllerOptions) {
       forwardControllerRequest(req, destination, owner.origin, head);
       return true;
     }
+    if (!bindings.has(id) && !finished.has(id))
+      throw Error("browser_controller_owner_moved");
     req.executionId = id;
     if (match)
       req.url = match[2] === "view/socket" ? "/view/socket" : `/execution/${match[2]}`;
@@ -1947,17 +1948,18 @@ export async function createController(options: ControllerOptions) {
       discoveredWorkers = discovered;
       const owned = new Map(discovered.map((worker) => [worker.id, worker]));
       const finishedRevisions = new Map<string, number>();
-      journal = await createExecutionJournal({
+      const localJournal = await createExecutionJournal({
         directory: options.stateDirectory,
         installationId: options.installationId,
         onRecord: (record) =>
           restoreRecord(record, discovered, owned, finishedRevisions),
       });
-      for (const id of journal.finishedIds()) rememberFinished(id);
+      journal = localJournal;
+      for (const id of localJournal.finishedIds()) rememberFinished(id);
       for (const worker of owned.values())
         await restoreOrphan(
           worker,
-          journal.has(worker.executionId)
+          localJournal.has(worker.executionId)
             ? (finishedRevisions.get(worker.executionId) ?? 0)
             : 0,
         );

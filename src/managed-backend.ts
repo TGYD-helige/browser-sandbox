@@ -79,9 +79,6 @@ export interface ExecutionOwnership {
   close(): Promise<void>;
   journal: {
     read(id: string): Promise<ExecutionRecord | undefined>;
-    has(id: string): boolean;
-    ids(): string[];
-    finishedIds(): string[];
     create(id: string, data: Record<string, unknown>): Promise<ExecutionRecord>;
     update(
       id: string,
