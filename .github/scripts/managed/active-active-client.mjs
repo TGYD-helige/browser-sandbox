@@ -14,16 +14,50 @@ const action = process.env.TEST_ACTION;
 const executionId = process.env.TEST_EXECUTION_ID ?? randomUUID();
 const stateFile = `/tmp/ha-${executionId}.json`;
 const runtime = createControllerRuntime(process.env.TEST_CONTROL_ORIGIN);
+const profileId = process.env.TEST_PROFILE;
+const profileFile = profileId ? `/tmp/ha-profile-${profileId}.json` : undefined;
 const adapter = {
-  load: async () => ({ seed: null }),
-  save: async () => ({
-    target: {
-      key: randomBytes(32).toString("hex"),
-      objectKey: "archive",
-      url: process.env.BROWSER_HOST_ARCHIVE_URL,
-    },
-  }),
-  commit: async (result) => ({ confirmedSha: result.archive.sha256 }),
+  async load() {
+    if (!profileFile) return { seed: null };
+    let latest;
+    try {
+      latest = JSON.parse(await readFile(profileFile, "utf8"));
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    return {
+      seed: latest
+        ? {
+            ...latest.archive,
+            key: latest.key,
+            url: process.env.BROWSER_HOST_ARCHIVE_URL,
+          }
+        : null,
+    };
+  },
+  save: async () => {
+    const key = randomBytes(32).toString("hex");
+    return {
+      target: {
+        key,
+        keyMaterial: { key },
+        objectKey: "archive",
+        url: process.env.BROWSER_HOST_ARCHIVE_URL,
+      },
+    };
+  },
+  async commit(result) {
+    if (profileFile)
+      await writeFile(
+        profileFile,
+        JSON.stringify({
+          archive: result.archive,
+          key: result.archive.keyMaterial.key,
+        }),
+        { mode: 0o600 },
+      );
+    return { confirmedSha: result.archive.sha256 };
+  },
 };
 let cdp;
 let storage;
@@ -62,8 +96,7 @@ try {
     );
   } else {
     let state;
-    if (action === "prepare") {
-      const profileId = process.env.TEST_PROFILE;
+    if (action === "prepare" || action === "restore") {
       if (profileId)
         storage = await runtime.attachStorage({ executionId, profileId }, adapter);
       const { wsEndpoint } = await runtime.request({
@@ -80,7 +113,16 @@ try {
     url.protocol = destination.protocol === "https:" ? "wss:" : "ws:";
     cdp = await connectCdp(url.href);
     await cdp.call("Browser.getVersion");
-    if (action === "prepare") {
+    if (action === "prepare" || action === "restore") {
+      if (action === "restore") {
+        const cookies = await cdp.call("Storage.getCookies");
+        assert(
+          cookies.cookies.some(
+            (cookie) => cookie.name === "ha-profile" && cookie.value === "preserved",
+          ),
+          "Cold Profile restore lost the saved Cookie",
+        );
+      }
       const { targetId } = await cdp.call("Target.createTarget", {
         url: "about:blank",
       });

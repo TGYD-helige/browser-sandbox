@@ -380,6 +380,43 @@ export async function activeActive({
     const worker = (await list("worker")).find(
       (pod) => pod.metadata.labels[prefix + "execution"] === id,
     );
+    stage = "persistent Profile failover";
+    const persistentId = randomUUID();
+    await client("prepare", persistentId, undefined, "ha-persistent");
+    const persistentOwner = await peers(persistentId);
+    const persistentEpoch = Number(
+      persistentOwner.lease.metadata.annotations[prefix + "epoch"],
+    );
+    const persistentWorker = (await list("worker")).find(
+      (pod) => pod.metadata.labels[prefix + "execution"] === persistentId,
+    );
+    await signalProcess(await controllerProcess(persistentOwner.pod), "KILL");
+    await wait(
+      "Persistent execution ownership did not move",
+      () => owner(persistentId),
+      (value) =>
+        value.pod &&
+        Number(value.lease.metadata.annotations[prefix + "epoch"]) > persistentEpoch,
+      45000,
+    );
+    await client("verify", persistentId);
+    assert.equal(
+      (await list("worker")).find(
+        (pod) => pod.metadata.labels[prefix + "execution"] === persistentId,
+      ).metadata.uid,
+      persistentWorker.metadata.uid,
+    );
+    await client("finish", persistentId).catch(() => {});
+    await wait(
+      "Disconnected host save did not retain recovery-blocked state",
+      () => client("status", persistentId),
+      (status) => status.execution.phase === "recovery-blocked",
+    );
+    await client("finish", persistentId, undefined, "ha-persistent");
+    const restoredId = randomUUID();
+    await client("restore", restoredId, undefined, "ha-persistent");
+    await client("finish", restoredId, undefined, "ha-persistent");
+    report.persistentProfileFailoverBlockedSaveReconnectAndColdRestore = true;
     stage = "owner kills";
     const failover = [];
     for (let sample = 0; sample < 5; sample++) {
