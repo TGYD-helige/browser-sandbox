@@ -39,6 +39,7 @@ async function fixture(t, extra = {}) {
     }
     if (req.method === "GET") {
       await state.beforeGet?.(path);
+      if (state.readAfterGet) previous = objects.get(path);
       return reply(previous ? 200 : 404, previous);
     }
     if (req.method === "POST") {
@@ -501,4 +502,35 @@ test("a controller takeover can finalize durable intent interrupted before Profi
   await b.resolve(other, true);
   await b.journal.create(other, { phase: "registered", profileId: "pending-intent" });
   await b.acquireProfile(other, "pending-intent");
+});
+
+test("a stale owner cannot acquire a free Profile reused by another completed execution", async (t) => {
+  const { a, b, state, advance } = await fixture(t);
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "registered", profileId: "reused" });
+  await b.resolve(id);
+  const entered = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  state.readAfterGet = true;
+  state.beforeGet = async (path) => {
+    if (!path.includes("-p-")) return;
+    state.beforeGet = undefined;
+    entered.resolve();
+    await resume.promise;
+  };
+  const old = a.acquireProfile(id, "reused");
+  const rejected = assert.rejects(old, /browser_controller_fenced/);
+  await entered.promise;
+  advance(15001);
+  await b.resolve(id);
+  await b.acquireProfile(id, "reused");
+  await b.journal.update(id, 1, { phase: "finished", profileId: "reused" });
+  await b.complete(id);
+  await b.resolve(other, true);
+  await b.journal.create(other, { phase: "registered", profileId: "reused" });
+  await b.acquireProfile(other, "reused");
+  await b.journal.update(other, 1, { phase: "finished", profileId: "reused" });
+  await b.complete(other);
+  resume.resolve();
+  await rejected;
 });

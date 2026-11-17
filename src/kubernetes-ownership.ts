@@ -366,6 +366,8 @@ export function createKubernetesOwnership(
   };
   const profile = async (id: string, profileId: string, release: boolean) => {
     if (!validProfileId(profileId)) throw Error("browser_profile_id_invalid");
+    const path = `${leases}/${profileName(profileId)}`;
+    const previous = await get(path);
     const epoch = await assertOwned(id);
     const recordSecret = await get(`${secrets}/${name(id)}`);
     const body = recordSecret && decode(recordSecret, id);
@@ -378,8 +380,6 @@ export function createKubernetesOwnership(
         : body.record.data.phase === "finished"
     )
       throw Error("browser_execution_revoked");
-    const path = `${leases}/${profileName(profileId)}`;
-    const previous = await get(path);
     if (previous) {
       verify(previous, profileName(profileId), "profile");
       const holder = previous.spec?.holderIdentity;
