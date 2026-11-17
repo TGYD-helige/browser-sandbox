@@ -11,7 +11,7 @@ import WebSocket, { WebSocketServer } from "ws";
 import { createController } from "../dist/controller.js";
 import { createExecutionJournal } from "../dist/execution-journal.js";
 
-async function fixture(t) {
+async function fixture(t, protocol = "browser-sandbox.worker/v2") {
   const directory = await mkdtemp(join(tmpdir(), "controller-recovery-"));
   const resources = new Map();
   const controllers = new Set();
@@ -41,7 +41,7 @@ async function fixture(t) {
               };
             if (request.op === "worker_status")
               return {
-                protocol: "browser-sandbox.worker/v2",
+                protocol,
                 session: {
                   state: "retained",
                   generation: "original",
@@ -1993,4 +1993,29 @@ test("a journal failure prevents acknowledging a confirmed storage commit to the
     mock.mock.restore();
     worker.runtime.request = request;
   }
+});
+
+test("default single-controller recovery retains protocol-v1 workers from the previous release", async (t) => {
+  const f = await fixture(t, "browser-sandbox.worker/v1");
+  const executionId = randomUUID();
+  const first = await f.start();
+  const endpoint = await first.command({ op: "register", executionId });
+  assert.equal((await fetch(fileUrl(first, endpoint))).status, 200);
+  await first.stop({ finalize: false });
+  const journal = await createExecutionJournal({
+    directory: f.directory,
+    installationId: "test",
+  });
+  const record = await journal.read(executionId);
+  await journal.update(executionId, record.revision, {
+    ...record.data,
+    workerProtocol: "browser-sandbox.worker/v1",
+  });
+  const second = await f.start();
+  assert.equal((await fetch(fileUrl(second, endpoint))).status, 200);
+  assert.equal(
+    (await second.command({ op: "session", executionId, action: "status" })).generation,
+    "original",
+  );
+  assert.equal(f.created, 1);
 });

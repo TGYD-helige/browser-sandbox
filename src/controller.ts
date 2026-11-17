@@ -137,6 +137,9 @@ export async function createController(options: ControllerOptions) {
     | KubernetesOwnership["journal"]
     | undefined;
   const ownership = options.ownership;
+  const supportedProtocol = (protocol: unknown) =>
+    protocol === WORKER_PROTOCOL ||
+    (!ownership && protocol === "browser-sandbox.worker/v1");
   const forwarding = createHostForwarding();
   if ((options.replicas ?? 1) > 1 && options.profileStore)
     throw Error("browser_profile_store_replicas_unsupported");
@@ -757,7 +760,7 @@ export async function createController(options: ControllerOptions) {
       { op: "worker_status", executionId: binding.executionId },
       { signal, timeoutMs: 10000 },
     );
-    if (status?.protocol !== WORKER_PROTOCOL)
+    if (!supportedProtocol(status?.protocol))
       throw Error("browser_worker_protocol_unsupported");
     if (!status.session || typeof status.session.state !== "string")
       throw Error("browser_worker_status_invalid");
@@ -1620,7 +1623,7 @@ export async function createController(options: ControllerOptions) {
       binding.starting = Promise.resolve(worker);
       binding.slot = admission.restore();
       try {
-        if (!binding.stopConfirmed && binding.workerProtocol !== WORKER_PROTOCOL)
+        if (!binding.stopConfirmed && !supportedProtocol(binding.workerProtocol))
           throw Error("browser_worker_protocol_unsupported");
         if (ownership)
           await options.backend.fence?.(
@@ -1640,7 +1643,7 @@ export async function createController(options: ControllerOptions) {
                 { op: "worker_status", executionId: id },
                 { timeoutMs: 10000 },
               );
-        if (status.protocol !== WORKER_PROTOCOL)
+        if (!supportedProtocol(status.protocol))
           throw Error("browser_worker_protocol_unsupported");
         if (
           !binding.stopConfirmed &&
@@ -1743,7 +1746,7 @@ export async function createController(options: ControllerOptions) {
         { timeoutMs: 10000 },
       );
       if (typeof status.protocol === "string") binding.workerProtocol = status.protocol;
-      if (status.protocol !== WORKER_PROTOCOL)
+      if (!supportedProtocol(status.protocol))
         throw Error("browser_worker_protocol_unsupported");
       binding.phase = "finalizing";
     } catch (error) {
@@ -1993,7 +1996,7 @@ export async function createController(options: ControllerOptions) {
                           { op: "worker_status", executionId: binding.executionId },
                           { timeoutMs: 10000 },
                         );
-                        if (status.protocol !== WORKER_PROTOCOL)
+                        if (!supportedProtocol(status.protocol))
                           throw Error("browser_worker_protocol_unsupported");
                       }
                       if (!binding.storageConnection)
@@ -2064,7 +2067,7 @@ export async function createController(options: ControllerOptions) {
               );
               binding.checkedAt = Date.now();
               binding.statusError = undefined;
-              binding.idleProtection = workerIdleProtection(status, now);
+              binding.idleProtection = workerIdleProtection(status, now, !ownership);
               if (binding.idleProtection) return;
               binding.reclaimReason = "idle";
               await dispatch({

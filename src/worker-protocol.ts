@@ -16,9 +16,15 @@ export type IdleProtection = "unknown" | "auth" | "takeover" | "clients" | "rete
 export function workerIdleProtection(
   value: unknown,
   now = Date.now(),
+  allowLegacy = false,
 ): IdleProtection | undefined {
   const status = value as WorkerStatus;
-  if (!status || status.protocol !== WORKER_PROTOCOL) return "unknown";
+  if (
+    !status ||
+    (status.protocol !== WORKER_PROTOCOL &&
+      !(allowLegacy && (status.protocol as string) === "browser-sandbox.worker/v1"))
+  )
+    return "unknown";
   const session = status.session;
   if (
     !session ||
