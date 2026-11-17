@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import { test } from "node:test";
+import { sessionRequest } from "../../../dist/session.js";
 import {
   assertFencedOwner,
   observeSingleRemoval,
+  readStatusDuringTakeover,
   summarizeFailover,
 } from "./active-active-checks.mjs";
 
@@ -61,4 +64,78 @@ test("five failover observations report a maximum rather than a population P95",
     maxMs: 5,
     samples: 5,
   });
+});
+
+test("takeover status reconnects after a controlled HTTP connection loss without replaying CDP", async (t) => {
+  let requests = 0;
+  const server = createServer(async (req, res) => {
+    let input = "";
+    for await (const chunk of req) input += chunk;
+    assert.deepEqual(JSON.parse(input), { action: "status" });
+    if (++requests === 1) return req.socket.destroy();
+    res.setHeader("content-type", "application/json");
+    res.end(JSON.stringify({ generation: "original" }));
+  });
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  // Synthetic rollout window: the selected replica closes after receiving the status request.
+  const endpoint = `ws://127.0.0.1:${server.address().port}/execution/${"a".repeat(64)}`;
+  const result = await readStatusDuringTakeover(
+    (signal) => sessionRequest(endpoint, "status", undefined, signal),
+    AbortSignal.timeout(5000),
+  );
+  assert.equal(result.generation, "original");
+  assert.equal(requests, 2);
+});
+
+test("takeover status retries only owner movement and connection loss within one deadline", async () => {
+  let reads = 0;
+  const status = await readStatusDuringTakeover(async () => {
+    if (++reads === 1) throw Error("browser_controller_owner_moved");
+    return { generation: "original" };
+  }, AbortSignal.timeout(5000));
+  assert.equal(status.generation, "original");
+  assert.equal(reads, 2);
+  for (const error of [
+    Error("browser_access_denied"),
+    Error("browser_session_failed"),
+    new TypeError("invalid response"),
+  ]) {
+    reads = 0;
+    await assert.rejects(
+      readStatusDuringTakeover(async () => {
+        reads++;
+        throw error;
+      }, AbortSignal.timeout(5000)),
+      (value) => value === error,
+    );
+    assert.equal(reads, 1);
+  }
+  reads = 0;
+  await assert.rejects(
+    async () => {
+      const result = await readStatusDuringTakeover(async () => {
+        reads++;
+        return { generation: "changed" };
+      }, AbortSignal.timeout(5000));
+      assert.equal(result.generation, "original");
+    },
+    { code: "ERR_ASSERTION" },
+  );
+  assert.equal(reads, 1, "generation mismatch remains an immediate failure");
+  reads = 0;
+  const deadline = new AbortController();
+  await assert.rejects(
+    readStatusDuringTakeover(async (signal) => {
+      assert.equal(signal, deadline.signal);
+      reads++;
+      deadline.abort(Error("test deadline"));
+      throw Error("browser_controller_owner_moved");
+    }, deadline.signal),
+    /test deadline/,
+  );
+  assert.equal(reads, 1, "an expired shared deadline cannot start another request");
 });

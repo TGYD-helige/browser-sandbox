@@ -9,6 +9,9 @@ const { createControllerRuntime, sessionRequest } = await import(
   `${root}/dist/index.js`
 );
 const { connectCdp } = await import(`${root}/dist/cdp.js`);
+const { readStatusDuringTakeover } = await import(
+  `${root}/.github/scripts/managed/active-active-checks.mjs`
+);
 const require = createRequire(`${root}/package.json`);
 const WebSocket = require("ws");
 const action = process.env.TEST_ACTION;
@@ -172,7 +175,14 @@ try {
           (cookie) => cookie.name === "ha-profile" && cookie.value === "preserved",
         ),
       );
-      assert.equal((await sessionRequest(url.href)).generation, state.generation);
+      const status =
+        action === "verify"
+          ? await readStatusDuringTakeover(
+              (signal) => sessionRequest(url.href, "status", undefined, signal),
+              AbortSignal.timeout(30000),
+            )
+          : await sessionRequest(url.href);
+      assert.equal(status.generation, state.generation);
       if (action === "live") {
         await writeFile(`/tmp/ha-live-${executionId}.ready`, "ready");
         let closed = false;

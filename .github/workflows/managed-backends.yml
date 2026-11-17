@@ -38,7 +38,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: managed-docker-${{ matrix.runner }}
+          name: managed-docker-${{ matrix.runner }}-attempt-${{ github.run_attempt }}
           path: managed-results/
           if-no-files-found: ignore
 
@@ -78,6 +78,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: managed-kubernetes-${{ matrix.runner }}
+          name: managed-kubernetes-${{ matrix.runner }}-attempt-${{ github.run_attempt }}
           path: managed-results/
           if-no-files-found: ignore
