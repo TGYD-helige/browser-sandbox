@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
 import test from "node:test";
 import {
   createKubernetesClient,
@@ -76,4 +77,29 @@ test("worker owner checks read a supplied Lease cache without listing Leases", a
     await check(pod("lease-uid", "22222222-2222-4222-8222-222222222222")),
     false,
   );
+});
+
+test("a watch event the caller rejects fails the request instead of resolving or escaping", async (t) => {
+  // The complete stream arrives before the handler throws, as with a final ERROR event.
+  const server = createServer((_req, res) =>
+    res.writeHead(200).end('{"type":"ERROR"}\n'),
+  );
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const api = createKubernetesClient({
+    namespace: "test",
+    apiServer: `http://127.0.0.1:${server.address().port}`,
+  });
+  const escaped = [];
+  const capture = (error) => escaped.push(error);
+  process.on("uncaughtException", capture);
+  t.after(() => process.off("uncaughtException", capture));
+  await assert.rejects(
+    api("/watch?watch=true", "GET", undefined, AbortSignal.timeout(5000), () => {
+      throw Error("rejected");
+    }),
+    /browser_kubernetes_response_invalid/,
+  );
+  await new Promise(setImmediate);
+  assert.deepEqual(escaped, []);
 });

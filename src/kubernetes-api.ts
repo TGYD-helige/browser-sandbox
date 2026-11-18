@@ -83,12 +83,15 @@ export function createKubernetesClient(options: KubernetesAccess) {
           if (onEvent && response.statusCode === 200) {
             let input = "";
             response.setEncoding("utf8");
+            // Settle before destroying: an error passed to destroy() after the response ended is uncaught.
+            const fail = (code: string) => {
+              reject(Error(code));
+              request.destroy();
+            };
             response.on("data", (chunk) => {
               input += chunk;
-              if (Buffer.byteLength(input) > 1048576) {
-                request.destroy(Error("browser_kubernetes_response_too_large"));
-                return;
-              }
+              if (Buffer.byteLength(input) > 1048576)
+                return fail("browser_kubernetes_response_too_large");
               let end: number;
               while ((end = input.indexOf("\n")) >= 0) {
                 const line = input.slice(0, end);
@@ -97,8 +100,7 @@ export function createKubernetesClient(options: KubernetesAccess) {
                 try {
                   onEvent(JSON.parse(line));
                 } catch {
-                  request.destroy(Error("browser_kubernetes_response_invalid"));
-                  return;
+                  return fail("browser_kubernetes_response_invalid");
                 }
               }
             });
@@ -114,9 +116,9 @@ export function createKubernetesClient(options: KubernetesAccess) {
           let size = 0;
           response.on("data", (chunk) => {
             size += chunk.length;
-            if (size > 1048576)
-              request.destroy(Error("browser_kubernetes_response_too_large"));
-            else chunks.push(chunk);
+            if (size <= 1048576) return chunks.push(chunk);
+            reject(Error("browser_kubernetes_response_too_large"));
+            request.destroy();
           });
           response.on("error", () => reject(Error("browser_kubernetes_unavailable")));
           response.on("end", () => {
