@@ -7,7 +7,7 @@ import {
   assertFencedOwner,
   observeSingleRemoval,
   summarizeFailover,
-  verifyWithRolloutOwner,
+  verifyWithRecoveredOwner,
 } from "./active-active-checks.mjs";
 
 /** Runs inside the existing native-architecture k3d job and uses its isolated kubeconfig. */
@@ -155,6 +155,31 @@ export async function activeActive({
       ),
     );
   };
+  const verifyRecoveredOwner = (id, path, previousEpoch, verify, replicaSetUid) =>
+    verifyWithRecoveredOwner(
+      wait,
+      async () => {
+        const candidate = await owner(id);
+        return Number(candidate.lease?.metadata.annotations[prefix + "epoch"]) >
+          previousEpoch
+          ? candidate
+          : {};
+      },
+      replicaSetUid,
+      async (pod) =>
+        JSON.parse(
+          await kubectl(
+            "exec",
+            pod.metadata.name,
+            "--",
+            "node",
+            "--input-type=module",
+            "-e",
+            `import{createControllerRuntime,sessionRequest}from'/opt/browser-sandbox/dist/index.js';const runtime=createControllerRuntime('http://127.0.0.1:8084');const signal=AbortSignal.timeout(5000);try{const status=await runtime.request({op:'controller_status',executionId:${JSON.stringify(id)}},{signal});if(status.execution?.phase==='active')await sessionRequest(${JSON.stringify(`ws://127.0.0.1:8084${path}`)},'status',undefined,signal);console.log(JSON.stringify(status))}finally{runtime.close()}`,
+          ),
+        ),
+      verify,
+    );
   const fixture = JSON.parse(
     await readFile(
       ".github/scripts/managed/fixtures/journal-v0.2.0/11111111-1111-4111-8111-111111111111.json",
@@ -469,7 +494,12 @@ export async function activeActive({
     report.misroutedEpochDoesNotFenceAnotherExecution = true;
     stage = "persistent Profile failover";
     const persistentId = randomUUID();
-    await client("prepare", persistentId, undefined, "ha-persistent");
+    const persistent = await client(
+      "prepare",
+      persistentId,
+      undefined,
+      "ha-persistent",
+    );
     const persistentOwner = await peers(persistentId);
     const persistentEpoch = Number(
       persistentOwner.lease.metadata.annotations[prefix + "epoch"],
@@ -478,15 +508,9 @@ export async function activeActive({
       (pod) => pod.metadata.labels[prefix + "execution"] === persistentId,
     );
     await signalProcess(await controllerProcess(persistentOwner.pod), "KILL");
-    await wait(
-      "Persistent execution ownership did not move",
-      () => owner(persistentId),
-      (value) =>
-        value.pod &&
-        Number(value.lease.metadata.annotations[prefix + "epoch"]) > persistentEpoch,
-      45000,
+    await verifyRecoveredOwner(persistentId, persistent.path, persistentEpoch, () =>
+      client("verify", persistentId),
     );
-    await client("verify", persistentId);
     assert.equal(
       (await list("worker")).find(
         (pod) => pod.metadata.labels[prefix + "execution"] === persistentId,
@@ -514,15 +538,7 @@ export async function activeActive({
       const started = performance.now();
       await signalProcess(killedProcess, "KILL");
       await live.closed;
-      await wait(
-        "Owner kill did not transfer ownership",
-        () => owner(id),
-        (value) =>
-          value.pod &&
-          Number(value.lease.metadata.annotations[prefix + "epoch"]) > epoch,
-        45000,
-      );
-      await client("verify", id);
+      await verifyRecoveredOwner(id, prepared.path, epoch, () => client("verify", id));
       failover.push(performance.now() - started);
       assert.equal(
         (await list("worker")).find(
@@ -587,15 +603,15 @@ export async function activeActive({
         ]),
       (status) => /^State:\s+T/m.test(status),
     );
-    const next = await wait(
-      "Paused owner was not fenced by takeover",
-      () => owner(id),
-      (value) =>
-        value.pod &&
-        Number(value.lease.metadata.annotations[prefix + "epoch"]) > oldEpoch,
-      45000,
+    const next = await verifyRecoveredOwner(
+      id,
+      prepared.path,
+      oldEpoch,
+      async (owner) => {
+        await client("verify", id, owner.pod);
+        return owner;
+      },
     );
-    await client("verify", id, next.pod);
     await signalProcess(pausedProcess, "CONT");
     paused = undefined;
     pausedProcess = undefined;
@@ -685,32 +701,15 @@ export async function activeActive({
       45000,
     );
     const verifyRollout = (verify) =>
-      verifyWithRolloutOwner(
-        wait,
-        async () => {
-          const candidate = await owner(id);
-          return Number(candidate.lease?.metadata.annotations[prefix + "epoch"]) >
-            rollingEpoch
-            ? candidate
-            : {};
-        },
-        replicaSet.metadata.uid,
-        async (pod) =>
-          JSON.parse(
-            await kubectl(
-              "exec",
-              pod.metadata.name,
-              "--",
-              "node",
-              "--input-type=module",
-              "-e",
-              `import{createControllerRuntime,sessionRequest}from'/opt/browser-sandbox/dist/index.js';const runtime=createControllerRuntime('http://127.0.0.1:8084');const signal=AbortSignal.timeout(5000);try{const status=await runtime.request({op:'controller_status',executionId:'${id}'},{signal});if(status.execution?.phase==='active')await sessionRequest('ws://127.0.0.1:8084${prepared.path}','status',undefined,signal);console.log(JSON.stringify(status))}finally{runtime.close()}`,
-            ),
-          ),
+      verifyRecoveredOwner(
+        id,
+        prepared.path,
+        rollingEpoch,
         verify,
+        replicaSet.metadata.uid,
       );
     stage = "during-rollout CDP verification";
-    await verifyRollout((pod) => client("verify-rollout", id, pod));
+    await verifyRollout(({ pod }) => client("verify-rollout", id, pod));
     report.duringRolloutVerifiedReadyOwner = true;
     report.gracefulRollout = {
       takeoverMs: performance.now() - rollingStarted,

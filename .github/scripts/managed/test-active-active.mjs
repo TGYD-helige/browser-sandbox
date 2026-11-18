@@ -11,7 +11,7 @@ import {
   observeSingleRemoval,
   readVerifiedStatus,
   summarizeFailover,
-  verifyWithRolloutOwner,
+  verifyWithRecoveredOwner,
 } from "./active-active-checks.mjs";
 
 test("resumed controller evidence requires its own fencing report and excludes worker removal events", () => {
@@ -209,7 +209,7 @@ test("post-rollout CDP verification waits for recovered ownership on the new Rep
   };
   const probed = [];
   let verified = 0;
-  await verifyWithRolloutOwner(
+  await verifyWithRecoveredOwner(
     async (_description, read, ready) => {
       let candidate;
       do candidate = await read();
@@ -222,7 +222,7 @@ test("post-rollout CDP verification waits for recovered ownership on the new Rep
       probed.push(pod.metadata.uid);
       return { execution: { phase: probed.length === 1 ? "absent" : "active" } };
     },
-    async (pod) => {
+    async ({ pod }) => {
       assert.equal(pod?.metadata.uid, "next-owner");
       assert.deepEqual(probed, ["owner", "owner", "next-owner"]);
       assert.equal(snapshots.length, 0);
@@ -230,6 +230,41 @@ test("post-rollout CDP verification waits for recovered ownership on the new Rep
     },
   );
   assert.equal(verified, 1);
+});
+
+test("failover waits for capability recovery even on the same ReplicaSet", async () => {
+  const owner = {
+    lease: { metadata: { uid: "lease" } },
+    pod: {
+      metadata: {
+        uid: "successor",
+        ownerReferences: [{ kind: "ReplicaSet", uid: "existing", controller: true }],
+      },
+    },
+  };
+  let probes = 0;
+  let verifies = 0;
+  await verifyWithRecoveredOwner(
+    async (_description, read, ready) => {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const result = await read();
+        if (ready(result)) return result;
+      }
+      assert.fail("same-ReplicaSet owner did not become ready");
+    },
+    async () => owner,
+    undefined,
+    async () => {
+      if (++probes === 1) throw Error("browser_access_denied");
+      return { execution: { phase: "active" } };
+    },
+    async ({ pod }) => {
+      assert.equal(pod, owner.pod);
+      assert.equal(probes, 2);
+      verifies++;
+    },
+  );
+  assert.equal(verifies, 1);
 });
 
 test("CDP handshake diagnostics retain sanitized HTTP responses and transport errors", async (t) => {

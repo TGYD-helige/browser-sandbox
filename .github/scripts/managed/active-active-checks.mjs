@@ -37,7 +37,7 @@ export function summarizeFailover(values) {
   };
 }
 
-export async function verifyWithRolloutOwner(
+export async function verifyWithRecoveredOwner(
   wait,
   readOwner,
   replicaSetUid,
@@ -45,14 +45,16 @@ export async function verifyWithRolloutOwner(
   verify,
 ) {
   const owner = await wait(
-    "The new ReplicaSet did not establish a recovered execution owner",
+    "The successor did not establish a recovered execution owner",
     async () => {
       const { pod, lease } = await readOwner();
       if (
-        !pod?.metadata.ownerReferences?.some(
-          (ref) =>
-            ref.kind === "ReplicaSet" && ref.controller && ref.uid === replicaSetUid,
-        )
+        !pod ||
+        (replicaSetUid &&
+          !pod.metadata.ownerReferences?.some(
+            (ref) =>
+              ref.kind === "ReplicaSet" && ref.controller && ref.uid === replicaSetUid,
+          ))
       )
         return false;
       const status = await readStatus(pod).catch(() => undefined);
@@ -69,7 +71,7 @@ export async function verifyWithRolloutOwner(
     Boolean,
     45000,
   );
-  return verify(owner.pod);
+  return verify(owner);
 }
 
 export function observeCdpHandshake(socket) {
