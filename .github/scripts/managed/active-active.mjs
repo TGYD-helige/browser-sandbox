@@ -536,7 +536,8 @@ export async function activeActive({
     report.persistentProfileFailoverBlockedSaveReconnectAndColdRestore = true;
     stage = "owner kills";
     const failover = [];
-    for (let sample = 0; sample < 10; sample++) {
+    // More SIGKILLs push kubelet restart backoff past the rollout-status timeout.
+    for (let sample = 0; sample < 5; sample++) {
       current = await peers(id);
       const epoch = Number(current.lease.metadata.annotations[prefix + "epoch"]);
       const live = await startLive(id, current.pod);
