@@ -684,6 +684,17 @@ test("shared discovery lists execution Leases once for multiple Pods", async (t)
     [worker.id, "second-worker/second-pod"],
   );
   assert.equal(state.leaseLists, 1);
+  assert.equal((await backend.list(signal, executionId)).length, 2);
+  assert.equal(
+    state.leaseLists,
+    1,
+    "Targeted discovery uses the exact authoritative Lease",
+  );
+  current.metadata.ownerReferences[0].name = "another-execution-lease";
+  await assert.rejects(
+    backend.list(signal, executionId),
+    /browser_worker_ownership_mismatch/,
+  );
   await backend.fence(worker, 1, signal, true);
   await backend.remove(worker, signal);
   assert.equal(state.leaseLists, 1);

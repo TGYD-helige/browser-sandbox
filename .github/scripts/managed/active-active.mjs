@@ -155,16 +155,29 @@ export async function activeActive({
       ),
     );
   };
+  const transferredOwner = async (id, epoch) => {
+    const candidate = await owner(id);
+    return Number(candidate.lease?.metadata.annotations[prefix + "epoch"]) > epoch
+      ? candidate.pod && candidate
+      : undefined;
+  };
+  const failoverOwner = (id, epoch) =>
+    wait(
+      "Execution ownership did not move",
+      () => transferredOwner(id, epoch),
+      Boolean,
+      45000,
+    );
+  const reconnects = [];
+  const verifyFailover = async (id, pod) => {
+    const result = await client("verify-failover", id, pod);
+    assert(Number.isSafeInteger(result.cdpOpenAttempts) && result.cdpOpenAttempts >= 1);
+    reconnects.push(result.cdpOpenAttempts);
+  };
   const verifyRecoveredOwner = (id, path, previousEpoch, verify, replicaSetUid) =>
     verifyWithRecoveredOwner(
       wait,
-      async () => {
-        const candidate = await owner(id);
-        return Number(candidate.lease?.metadata.annotations[prefix + "epoch"]) >
-          previousEpoch
-          ? candidate
-          : {};
-      },
+      async () => (await transferredOwner(id, previousEpoch)) ?? {},
       replicaSetUid,
       async (pod) =>
         JSON.parse(
@@ -494,12 +507,7 @@ export async function activeActive({
     report.misroutedEpochDoesNotFenceAnotherExecution = true;
     stage = "persistent Profile failover";
     const persistentId = randomUUID();
-    const persistent = await client(
-      "prepare",
-      persistentId,
-      undefined,
-      "ha-persistent",
-    );
+    await client("prepare", persistentId, undefined, "ha-persistent");
     const persistentOwner = await peers(persistentId);
     const persistentEpoch = Number(
       persistentOwner.lease.metadata.annotations[prefix + "epoch"],
@@ -508,9 +516,8 @@ export async function activeActive({
       (pod) => pod.metadata.labels[prefix + "execution"] === persistentId,
     );
     await signalProcess(await controllerProcess(persistentOwner.pod), "KILL");
-    await verifyRecoveredOwner(persistentId, persistent.path, persistentEpoch, () =>
-      client("verify", persistentId),
-    );
+    await failoverOwner(persistentId, persistentEpoch);
+    await verifyFailover(persistentId);
     assert.equal(
       (await list("worker")).find(
         (pod) => pod.metadata.labels[prefix + "execution"] === persistentId,
@@ -538,7 +545,8 @@ export async function activeActive({
       const started = performance.now();
       await signalProcess(killedProcess, "KILL");
       await live.closed;
-      await verifyRecoveredOwner(id, prepared.path, epoch, () => client("verify", id));
+      await failoverOwner(id, epoch);
+      await verifyFailover(id);
       failover.push(performance.now() - started);
       assert.equal(
         (await list("worker")).find(
@@ -603,19 +611,17 @@ export async function activeActive({
         ]),
       (status) => /^State:\s+T/m.test(status),
     );
-    const next = await verifyRecoveredOwner(
-      id,
-      prepared.path,
-      oldEpoch,
-      async (owner) => {
-        await client("verify", id, owner.pod);
-        return owner;
-      },
-    );
+    const next = await failoverOwner(id, oldEpoch);
+    await verifyFailover(id, next.pod);
     await signalProcess(pausedProcess, "CONT");
     paused = undefined;
     pausedProcess = undefined;
-    await client("verify", id);
+    await verifyFailover(id);
+    report.failoverCdpReconnects = {
+      checks: reconnects.length,
+      ownerMovedResponses: reconnects.reduce((sum, attempts) => sum + attempts - 1, 0),
+      forbiddenResponses: 0,
+    };
     await kubectl(
       "exec",
       current.pod.metadata.name,

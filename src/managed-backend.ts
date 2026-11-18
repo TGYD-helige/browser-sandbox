@@ -43,7 +43,7 @@ export interface ManagedBackend {
     signal: AbortSignal,
   ): Promise<ManagedWorker>;
   /** A failed discovery is unknown ownership; include stopped resources awaiting cleanup. */
-  list?(signal: AbortSignal): Promise<ManagedWorker[]>;
+  list?(signal: AbortSignal, executionId?: string): Promise<ManagedWorker[]>;
   fence?(
     worker: ManagedWorker,
     epoch: number,

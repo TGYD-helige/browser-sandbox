@@ -2,11 +2,12 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import { test } from "node:test";
-import WebSocket from "ws";
+import { WebSocketServer } from "ws";
 import { connectCdp } from "../../../dist/cdp.js";
 import { sessionRequest } from "../../../dist/session.js";
 import {
   assertFencedOwner,
+  connectDiagnosticCdp,
   observeCdpHandshake,
   observeSingleRemoval,
   readVerifiedStatus,
@@ -232,88 +233,114 @@ test("post-rollout CDP verification waits for recovered ownership on the new Rep
   assert.equal(verified, 1);
 });
 
-test("failover waits for capability recovery even on the same ReplicaSet", async () => {
-  const owner = {
-    lease: { metadata: { uid: "lease" } },
-    pod: {
-      metadata: {
-        uid: "successor",
-        ownerReferences: [{ kind: "ReplicaSet", uid: "existing", controller: true }],
-      },
-    },
-  };
-  let probes = 0;
-  let verifies = 0;
-  await verifyWithRecoveredOwner(
-    async (_description, read, ready) => {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        const result = await read();
-        if (ready(result)) return result;
-      }
-      assert.fail("same-ReplicaSet owner did not become ready");
-    },
-    async () => owner,
-    undefined,
-    async () => {
-      if (++probes === 1) throw Error("browser_access_denied");
-      return { execution: { phase: "active" } };
-    },
-    async ({ pod }) => {
-      assert.equal(pod, owner.pod);
-      assert.equal(probes, 2);
-      verifies++;
-    },
-  );
-  assert.equal(verifies, 1);
-});
-
-test("CDP handshake diagnostics retain sanitized HTTP responses and transport errors", async (t) => {
-  const server = createServer((req, res) => {
-    const status = Number(req.url.slice(1));
-    res.writeHead(status).end(
+test("diagnostic CDP retries only a confirmed owner-moved handshake", async (t) => {
+  const requests = new Map();
+  const server = createServer();
+  const sockets = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (req, socket, head) => {
+    const path = req.url;
+    const count = (requests.get(path) ?? 0) + 1;
+    requests.set(path, count);
+    if (path === "/successor" && count === 2) {
+      sockets.handleUpgrade(req, socket, head, (accepted) => {
+        accepted.on("message", (raw) => {
+          const { id } = JSON.parse(String(raw));
+          accepted.send(JSON.stringify({ id, result: { version: "successor" } }));
+        });
+      });
+      return;
+    }
+    const incomplete = path === "/incomplete";
+    const status = path === "/successor" || incomplete ? 503 : Number(path.slice(1));
+    const body =
       status === 502
-        ? "private upstream details"
+        ? "untrusted proxy details"
         : JSON.stringify({
             error:
               status === 503
                 ? "browser_controller_owner_moved"
                 : "browser_access_denied",
             capability: "must-not-log",
-          }),
+          });
+    socket.end(
+      `HTTP/1.1 ${status} Rejected\r\nConnection: close\r\nContent-Length: ${Buffer.byteLength(body) + Number(incomplete)}\r\n\r\n${body}`,
     );
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  t.after(() => {
-    server.closeAllConnections();
-    return new Promise((resolve) => server.close(resolve));
+  t.after(async () => {
+    for (const socket of sockets.clients) socket.terminate();
+    await new Promise((resolve) => sockets.close(resolve));
+    await new Promise((resolve) => server.close(resolve));
   });
   const origin = `ws://127.0.0.1:${server.address().port}`;
-  let diagnostic;
-  class DiagnosticWebSocket extends WebSocket {
-    constructor(...args) {
-      super(...args);
-      diagnostic = observeCdpHandshake(this);
-    }
-  }
+  const signal = AbortSignal.timeout(5000);
   for (const [status, body] of [
     [503, { error: "browser_controller_owner_moved" }],
     [403, { error: "browser_access_denied" }],
     [502, null],
   ]) {
     await assert.rejects(
-      connectCdp(`${origin}/${status}`, AbortSignal.timeout(5000), DiagnosticWebSocket),
-      /browser_cdp_connect_failed/,
+      connectDiagnosticCdp(`${origin}/${status}`, {
+        signal,
+        retryOwnerMoved: status !== 503,
+      }),
+      (error) => {
+        assert.equal(error.message, "browser_cdp_connect_failed");
+        assert.deepEqual(error.handshake, { status, body });
+        return true;
+      },
     );
-    assert.deepEqual(diagnostic, { status, body });
+    assert.equal(requests.get(`/${status}`), 1);
+  }
+  await assert.rejects(
+    connectDiagnosticCdp(`${origin}/incomplete`, { signal, retryOwnerMoved: true }),
+    (error) => {
+      assert.deepEqual(error.handshake, { status: 503, body: null });
+      return true;
+    },
+  );
+  assert.equal(requests.get("/incomplete"), 1);
+  const connection = await connectDiagnosticCdp(`${origin}/successor`, {
+    retryOwnerMoved: true,
+    signal,
+  });
+  try {
+    assert.equal(connection.attempts, 2);
+    assert.equal(requests.get("/successor"), 2);
+    assert.deepEqual(await connection.call("Browser.getVersion"), {
+      version: "successor",
+    });
+  } finally {
+    connection.close();
+    await connection.closed;
   }
   await new Promise((resolve) => server.close(resolve));
-  await assert.rejects(
-    connectCdp(origin, AbortSignal.timeout(5000), DiagnosticWebSocket),
-    /browser_cdp_connect_failed/,
-  );
-  assert.deepEqual(diagnostic, { code: "ECONNREFUSED" });
+  await assert.rejects(connectDiagnosticCdp(origin, { signal }), (error) => {
+    assert.deepEqual(error.handshake, { code: "ECONNREFUSED" });
+    return true;
+  });
   const socket = new EventEmitter();
-  diagnostic = observeCdpHandshake(socket);
+  const diagnostic = observeCdpHandshake(socket);
   socket.emit("error", Error("Opening handshake has timed out"));
   assert.deepEqual(diagnostic, { reason: "Opening handshake has timed out" });
+});
+
+test("runtime CDP uses its own WebSocket while CI diagnoses a handshake separately", async (t) => {
+  const server = new WebSocketServer({ port: 0, host: "127.0.0.1" });
+  t.after(async () => {
+    for (const socket of server.clients) socket.terminate();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  await new Promise((resolve) => server.once("listening", resolve));
+  const runtimeConnection = await connectCdp(
+    `ws://127.0.0.1:${server.address().port}`,
+    AbortSignal.timeout(5000),
+    class {
+      constructor() {
+        assert.fail("Runtime CDP exposes a CI-only socket factory");
+      }
+    },
+  );
+  runtimeConnection.close();
+  await runtimeConnection.closed;
 });

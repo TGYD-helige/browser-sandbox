@@ -422,12 +422,15 @@ export async function createKubernetesBackend(
         throw error;
       }
     },
-    async list(signal) {
+    async list(signal, target) {
+      if (target !== undefined && !identity(target))
+        throw Error("browser_identity_invalid");
+      const scope = target ? await options.ownership?.assertOwned(target) : undefined;
       const selector = encodeURIComponent(
-        `browser-sandbox.io/installation=${options.installation},app.kubernetes.io/component=worker`,
+        `browser-sandbox.io/installation=${options.installation},app.kubernetes.io/component=worker${target ? `,${prefix}execution=${target}` : ""}`,
       );
       const workers: ManagedWorker[] = [];
-      const liveOwner = workerOwnerCheck(api, options, parent, signal);
+      const liveOwner = workerOwnerCheck(api, options, parent, signal, scope);
       for await (const page of listKubernetesPages(
         api,
         `${base}/pods`,
@@ -442,6 +445,7 @@ export async function createKubernetesBackend(
           const profileId = pod.metadata?.annotations?.[prefix + "profile-id"];
           if (
             !identity(executionId) ||
+            (target !== undefined && executionId !== target) ||
             !identity(incarnation) ||
             typeof profileId !== "string" ||
             (profileId && !validProfileId(profileId)) ||

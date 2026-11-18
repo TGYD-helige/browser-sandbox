@@ -242,6 +242,7 @@ export function workerOwnerCheck(
   options: KubernetesAccess & { installation: string },
   parent: ReturnType<typeof kubernetesOwnerReference>,
   signal: AbortSignal,
+  scope?: { name: string; uid: string },
 ) {
   let leases: Promise<Map<string, any>>;
   async function list() {
@@ -267,11 +268,13 @@ export function workerOwnerCheck(
     if (
       typeof ref?.name !== "string" ||
       !ref.name ||
+      (scope && ref.name !== scope.name) ||
       !hasKubernetesOwner(pod, kubernetesOwnerReference("Lease", ref.name, ref.uid))
     )
       throw Error("browser_worker_ownership_mismatch");
-    const lease = (await (leases ??= list())).get(ref.name);
+    const lease = scope ?? (await (leases ??= list())).get(ref.name);
     if (lease?.uid !== ref.uid) return false;
+    if (scope) return true;
     if (
       !hasKubernetesOwner({ metadata: lease }, parent) ||
       lease.labels?.["browser-sandbox.io/state"] !== "execution" ||

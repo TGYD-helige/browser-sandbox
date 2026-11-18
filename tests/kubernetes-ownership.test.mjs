@@ -6,8 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { isDeepStrictEqual } from "node:util";
-import WebSocket from "ws";
+import WebSocket, { WebSocketServer } from "ws";
 import { waitForControl } from "../dist/automation-control.js";
+import { connectCdp } from "../dist/cdp.js";
 import { createController, validateControllerRecord } from "../dist/controller.js";
 import { createKubernetesBackend } from "../dist/kubernetes-backend.js";
 import { importExecutionJournal } from "../dist/kubernetes-migration.js";
@@ -65,6 +66,12 @@ async function fixture(t, extra = {}) {
       return;
     }
     const path = req.url.split("?")[0];
+    if (
+      req.method === "GET" &&
+      !req.url.includes("watch=true") &&
+      /\/(pods|leases)$/.test(path)
+    )
+      state.lists?.push(req.url);
     let previous = objects.get(path);
     const reply = (status, value = {}) =>
       res
@@ -2379,6 +2386,237 @@ test("a recreated Lease cannot inherit an old UID Secret’s record or grants wh
     /browser_controller_fenced/,
   );
   assert.deepEqual((await b.journal.read(id)).data.grants, []);
+});
+
+test("recovering grants report owner movement on agent HTTP, CDP and both viewer routes", async (t) => {
+  const { a, ports, cleanups } = await fixture(t);
+  const entered = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  const signal = AbortSignal.timeout(10000);
+  const echo = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  cleanups.unshift(async () => {
+    for (const socket of echo.clients) socket.terminate();
+    await new Promise((resolve) => echo.close(resolve));
+  });
+  await waitForControl(
+    new Promise((resolve) => echo.once("listening", resolve)),
+    signal,
+  );
+  echo.on("connection", (socket, req) => {
+    socket.on("message", (raw) => {
+      const message = JSON.parse(String(raw));
+      socket.send(
+        JSON.stringify(
+          req.url === "/view/socket"
+            ? { type: "frame" }
+            : {
+                id: message.id,
+                result: { recovered: true },
+              },
+        ),
+      );
+    });
+  });
+  const origin = `http://127.0.0.1:${echo.address().port}`;
+  const upstream = origin.replace("http:", "ws:");
+  const descriptor = {
+    id: "worker/uid",
+    executionId: id,
+    incarnation: other,
+    profileId: "restoring",
+    origin,
+    epoch: 1,
+    runtime: {
+      attachStorage: async () => ({ close() {} }),
+      request: async () => ({
+        protocol: "browser-sandbox.worker/v2",
+        session: { generation: "original", state: "live" },
+      }),
+    },
+  };
+  let worker;
+  const controller = await createController({
+    ownership: {
+      ...a,
+      async acquireProfile(...args) {
+        entered.resolve();
+        await resume.promise;
+        await a.acquireProfile(...args);
+      },
+    },
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: { list: async () => (worker ? [worker] : []), remove: async () => {} },
+  });
+  const sockets = new Set();
+  let recovery;
+  cleanups.unshift(async () => {
+    resume.resolve();
+    for (const socket of sockets) socket.terminate();
+    await recovery?.catch(() => {});
+    await controller.stop({ finalize: false });
+  });
+  const token = "a".repeat(64),
+    viewer = "b".repeat(64);
+  const sessionPath = `/execution/${id}/${token}`;
+  await a.resolve(id, true);
+  await a.journal.create(id, {
+    phase: "active",
+    incarnation: other,
+    profileId: "restoring",
+    profileAcquired: true,
+    storageMode: "host",
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    workerId: descriptor.id,
+    workerProtocol: "browser-sandbox.worker/v2",
+    generation: "original",
+    endpoint: { cdpUrl: `${upstream}/execution/${token}`, viewerToken: viewer },
+    grants: [
+      { kind: "cdp", token, control: false, resize: false },
+      { kind: "view", token: viewer, control: false, resize: false },
+    ],
+  });
+  worker = descriptor;
+  recovery = controller.reconcile();
+  recovery.catch(() => {});
+  await waitForControl(Promise.race([entered.promise, recovery]), signal);
+  const open = (path) => {
+    const socket = new WebSocket(controller.origin.replace("http:", "ws:") + path);
+    sockets.add(socket);
+    socket.on("error", () => {});
+    socket.once("close", () => sockets.delete(socket));
+    return socket;
+  };
+  const refusedUpgrade = (path) =>
+    waitForControl(
+      new Promise((resolve, reject) => {
+        const socket = open(path);
+        socket.once("open", () => {
+          resolve([101]);
+          socket.terminate();
+        });
+        socket.once("unexpected-response", async (_, response) => {
+          const chunks = [];
+          try {
+            for await (const chunk of response) chunks.push(chunk);
+            resolve([
+              response.statusCode,
+              JSON.parse(Buffer.concat(chunks).toString()).error,
+            ]);
+          } catch (error) {
+            reject(error);
+          } finally {
+            socket.terminate();
+          }
+        });
+      }),
+      signal,
+    );
+  const authenticate = (path) => {
+    const socket = open(path);
+    socket.once("open", () =>
+      socket.send(JSON.stringify({ type: "authenticate", token: viewer })),
+    );
+    return socket;
+  };
+  const legacy = authenticate("/view/socket");
+  const closed = new Promise((resolve) =>
+    legacy.once("close", (code, reason) => resolve([code, reason.toString()])),
+  );
+  const session = await fetch(controller.origin + sessionPath + "/session", { signal });
+  const moved = "browser_controller_owner_moved";
+  const responses = await Promise.all([
+    refusedUpgrade(sessionPath),
+    refusedUpgrade(`/execution/${id}/view/socket`),
+    waitForControl(closed, signal),
+  ]);
+  assert.deepEqual(
+    [[session.status, (await session.json().catch(() => null))?.error], ...responses],
+    [
+      [503, moved],
+      [503, moved],
+      [503, moved],
+      [1013, moved],
+    ],
+  );
+  resume.resolve();
+  await waitForControl(recovery, signal);
+  const recovered = await fetch(controller.origin + sessionPath + "/session", {
+    signal,
+  });
+  assert.equal(recovered.status, 200);
+  const cdp = await connectCdp(
+    controller.origin.replace("http:", "ws:") + sessionPath,
+    signal,
+  );
+  try {
+    assert.deepEqual(await cdp.call("Browser.getVersion"), { recovered: true });
+  } finally {
+    cdp.close();
+    await cdp.closed;
+  }
+  for (const path of [`/execution/${id}/view/socket`, "/view/socket"]) {
+    const socket = authenticate(path);
+    await waitForControl(
+      new Promise((resolve, reject) => {
+        socket.once("message", resolve);
+        socket.once("close", (code) => reject(Error(`viewer closed ${code}`)));
+      }),
+      signal,
+    );
+    socket.close();
+  }
+});
+
+test("finished commands discover only Pods for their execution", async (t) => {
+  const { a, ports, apiServer, state, cleanups } = await fixture(t);
+  const backend = await createKubernetesBackend({
+    apiServer,
+    namespace: "test",
+    ownerName: "workers",
+    installation: "test",
+    image: `test/browser@sha256:${"a".repeat(64)}`,
+    ownership: a,
+    template: {
+      securityContext: {
+        seccompProfile: { type: "Localhost", localhostProfile: "browser.json" },
+      },
+    },
+  });
+  const controller = await createController({
+    backend,
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "finished" });
+  await a.complete(id);
+  state.lists = [];
+  for (const op of ["controller_status", "finish", "controller_status", "finish"]) {
+    const result = await controller.command({ op, executionId: id });
+    if (op === "controller_status") assert.equal(result.execution.phase, "finished");
+    else assert.equal(result.status, "absent");
+  }
+  assert.equal(
+    state.lists.length,
+    4,
+    "one targeted Pod LIST per command, without Lease LISTs",
+  );
+  for (const url of state.lists) {
+    assert(new URL(url, apiServer).pathname.endsWith("/pods"));
+    assert(
+      new URL(url, apiServer).searchParams
+        .get("labelSelector")
+        .split(",")
+        .includes(`browser-sandbox.io/execution=${id}`),
+    );
+  }
 });
 
 test("failed Profile acquisition leaves recovery retryable", async (t) => {

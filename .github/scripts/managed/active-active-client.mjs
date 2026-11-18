@@ -8,8 +8,7 @@ const root = process.env.BROWSER_PACKAGE_ROOT ?? "/opt/browser-sandbox";
 const { createControllerRuntime, sessionRequest } = await import(
   `${root}/dist/index.js`
 );
-const { connectCdp } = await import(`${root}/dist/cdp.js`);
-const { observeCdpHandshake, readVerifiedStatus } = await import(
+const { connectDiagnosticCdp, readVerifiedStatus } = await import(
   `${root}/.github/scripts/managed/active-active-checks.mjs`
 );
 const require = createRequire(`${root}/package.json`);
@@ -65,13 +64,6 @@ const adapter = {
 };
 let cdp;
 let storage;
-let handshake;
-class DiagnosticWebSocket extends WebSocket {
-  constructor(...args) {
-    super(...args);
-    handshake = observeCdpHandshake(this);
-  }
-}
 try {
   if (action === "register" || action === "profile-contend") {
     const request = {
@@ -122,7 +114,9 @@ try {
     const destination = new URL(process.env.TEST_AGENT_ORIGIN);
     url.host = destination.host;
     url.protocol = destination.protocol === "https:" ? "wss:" : "ws:";
-    cdp = await connectCdp(url.href, undefined, DiagnosticWebSocket);
+    cdp = await connectDiagnosticCdp(url.href, {
+      retryOwnerMoved: action === "verify-failover",
+    });
     await cdp.call("Browser.getVersion");
     if (action === "prepare" || action === "restore") {
       if (action === "restore") {
@@ -277,6 +271,7 @@ try {
           executionId,
           path: new URL(state.wsEndpoint).pathname,
           verified: true,
+          cdpOpenAttempts: cdp.attempts,
           architecture: process.arch,
         }),
       );
@@ -286,7 +281,7 @@ try {
   console.error(
     JSON.stringify({
       action,
-      handshake,
+      handshake: error.handshake,
       codes: String(error).match(/browser_[a-z_]+/g) ?? [],
       message: String(error.message)
         .replace(/(?:https?|wss?):\/\/[^\s]+/g, "<url>")

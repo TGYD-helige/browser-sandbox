@@ -1455,8 +1455,7 @@ export async function createController(options: ControllerOptions) {
                     forwardControllerViewer(client, owner.origin, id, auth.token);
                     return;
                   }
-                  if (ownership.owns(id) && !bindings.has(id) && !finished.has(id))
-                    throw Error("browser_controller_owner_moved");
+                  if (ownership.owns(id)) assertAgentReady(id);
                   req.executionId = id;
                 }
               }
@@ -1524,21 +1523,19 @@ export async function createController(options: ControllerOptions) {
   async function restoreRecord(
     record,
     discovered: ManagedWorker[],
-    owned: Map<string, ManagedWorker>,
-    finishedRevisions = new Map<string, number>(),
+    owned?: Map<string, ManagedWorker>,
+    finishedRevisions?: Map<string, number>,
   ) {
     const id = record.executionId;
     const data = record.data as any;
     validateControllerRecord(data);
-    if (data.phase === "finished") {
-      finishedRevisions.set(id, record.revision);
-      return;
-    }
-    let worker =
-      owned.get(data.workerId) ??
-      discovered.find(
-        (item) => item.executionId === id && item.incarnation === data.incarnation,
-      );
+    if (data.phase === "finished")
+      return void finishedRevisions?.set(id, record.revision);
+    let worker = owned?.get(data.workerId);
+    if (!owned) worker = discovered.find((item) => item.id === data.workerId);
+    worker ??= discovered.find(
+      (item) => item.executionId === id && item.incarnation === data.incarnation,
+    );
     if (
       worker &&
       (worker.executionId !== id ||
@@ -1548,7 +1545,7 @@ export async function createController(options: ControllerOptions) {
       throw Error("browser_worker_ownership_mismatch");
     if (worker && worker.id !== data.workerId && staleCreation(worker)) {
       await discardStaleCreation(worker);
-      owned.delete(worker.id);
+      owned?.delete(worker.id);
       worker = undefined;
     }
     const binding: ExecutionBinding = {
@@ -1606,7 +1603,7 @@ export async function createController(options: ControllerOptions) {
       }
     }
     if (worker) {
-      owned.delete(worker.id);
+      owned?.delete(worker.id);
       binding.worker = worker;
       binding.starting = Promise.resolve(worker);
       binding.slot = admission.restore();
@@ -1623,17 +1620,13 @@ export async function createController(options: ControllerOptions) {
         worker.runtime.setAutomation?.(automationCallbacks(binding));
         if (!binding.stopConfirmed && data.phase !== "recovery-blocked")
           await attachWorkerStorage(binding, AbortSignal.timeout(10000));
-        const status =
-          binding.stopConfirmed ||
-          ["finalizing", "recovery-blocked"].includes(data.phase)
-            ? { protocol: WORKER_PROTOCOL }
-            : await readWorkerStatus(worker);
-        if (!supportedProtocol(status.protocol))
-          throw Error("browser_worker_protocol_unsupported");
         if (
           !binding.stopConfirmed &&
           !["finalizing", "recovery-blocked"].includes(data.phase)
         ) {
+          const status = await readWorkerStatus(worker);
+          if (!supportedProtocol(status.protocol))
+            throw Error("browser_worker_protocol_unsupported");
           if (
             !status.session ||
             (binding.generation &&
@@ -1747,6 +1740,7 @@ export async function createController(options: ControllerOptions) {
     if (profileLeases.get(binding.profileId) === binding)
       profileLeases.delete(binding.profileId);
   }
+  const restoring = new Set<string>();
   function loadOwned(
     id: string,
     workers?: ManagedWorker[],
@@ -1767,19 +1761,18 @@ export async function createController(options: ControllerOptions) {
         return;
       await ownership.assertOwned(id);
       const record = await journal.read(id);
-      if (record?.data.phase !== "finished") finished.delete(id);
+      const terminal = record?.data.phase === "finished";
+      if (!terminal) finished.delete(id);
       if (!record && orphan === undefined) return;
+      const target = terminal ? id : undefined;
       const discovered =
-        workers ?? (await options.backend.list(AbortSignal.timeout(30000)));
+        workers ?? (await options.backend.list(AbortSignal.timeout(30000), target));
       try {
-        if (record && record.data.phase !== "finished") {
+        if (record && !terminal) {
+          restoring.add(id);
           if (Array.isArray(record.data.grants) && record.data.grants.length)
             await ownership.indexLegacy(record);
-          await restoreRecord(
-            record,
-            discovered,
-            new Map(discovered.map((worker) => [worker.id, worker])),
-          );
+          await restoreRecord(record, discovered);
           return;
         }
         // A finished record can still have a live orphan. Recover it before releasing the Lease.
@@ -1796,6 +1789,7 @@ export async function createController(options: ControllerOptions) {
           rememberFinished(id);
         }
       } finally {
+        restoring.delete(id);
         if (!workers) closeUnusedDiscovery(discovered);
       }
     });
@@ -1845,6 +1839,10 @@ export async function createController(options: ControllerOptions) {
       closeUnusedDiscovery(discovered);
     }
   }
+  function assertAgentReady(id: string) {
+    if (restoring.has(id) || (!bindings.has(id) && !finished.has(id)))
+      throw Error("browser_controller_owner_moved");
+  }
   async function routeAgent(req, destination, head?: Buffer, forwarded = false) {
     if (!ownership) return false;
     const match = /^\/execution\/([a-f0-9-]{36})\/(.+)$/.exec(req.url ?? "");
@@ -1859,8 +1857,7 @@ export async function createController(options: ControllerOptions) {
       forwardControllerRequest(req, destination, owner.origin, head);
       return true;
     }
-    if (!bindings.has(id) && !finished.has(id))
-      throw Error("browser_controller_owner_moved");
+    assertAgentReady(id);
     req.executionId = id;
     if (match)
       req.url = match[2] === "view/socket" ? "/view/socket" : `/execution/${match[2]}`;
