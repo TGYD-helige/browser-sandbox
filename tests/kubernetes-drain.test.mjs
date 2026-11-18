@@ -40,26 +40,32 @@ async function fixture(t) {
           },
         }),
       );
-    } else if (request.url.includes("/leases/")) {
+    } else if (request.url.includes("/leases?")) {
       leaseObserved.resolve();
       response.end(
         JSON.stringify({
-          metadata: {
-            uid: "execution-uid",
-            labels: {
-              "browser-sandbox.io/execution": "execution",
-              "browser-sandbox.io/state": "execution",
-            },
-            ownerReferences: [
-              {
-                apiVersion: "v1",
-                kind: "ConfigMap",
-                name: "trial-browser-workers",
-                uid: state.owner,
-                controller: true,
+          items: [
+            {
+              metadata: {
+                name: "execution-lease",
+                uid: "execution-uid",
+                labels: {
+                  "browser-sandbox.io/execution": "execution",
+                  "browser-sandbox.io/state": "execution",
+                  "browser-sandbox.io/installation": "trial",
+                },
+                ownerReferences: [
+                  {
+                    apiVersion: "v1",
+                    kind: "ConfigMap",
+                    name: "trial-browser-workers",
+                    uid: state.owner,
+                    controller: true,
+                  },
+                ],
               },
-            ],
-          },
+            },
+          ],
         }),
       );
     } else if (request.url.endsWith("/scale")) {

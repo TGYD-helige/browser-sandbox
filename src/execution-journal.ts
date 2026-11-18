@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, link, mkdir, open, opendir, rename, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { createSerialWork } from "./serial-work.js";
 
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MAX_RECORD_BYTES = 65536;
@@ -9,6 +10,17 @@ export interface ExecutionRecord {
   executionId: string;
   revision: number;
   data: Record<string, unknown>;
+}
+
+export function isExecutionRecord(value: any, id: string): value is ExecutionRecord {
+  return (
+    value?.executionId === id &&
+    Number.isSafeInteger(value.revision) &&
+    value.revision > 0 &&
+    value.data &&
+    typeof value.data === "object" &&
+    !Array.isArray(value.data)
+  );
 }
 
 export const isPendingExecutionFile = (name: string) =>
@@ -29,21 +41,20 @@ export async function readExecutionRecord(
     if (!stat.isFile() || stat.size > MAX_RECORD_BYTES)
       throw Error("browser_execution_journal_corrupt");
     const text = await file.readFile("utf8");
-    let body: any;
+    let body: ExecutionRecord & {
+      protocol: string;
+      installationId: string;
+      finishedAt?: number;
+    };
     try {
       body = JSON.parse(text);
     } catch {
       throw Error("browser_execution_journal_corrupt");
     }
     if (
-      body.protocol !== "browser-sandbox.execution/v1" ||
+      body?.protocol !== "browser-sandbox.execution/v1" ||
       body.installationId !== installationId ||
-      body.executionId !== id ||
-      !Number.isSafeInteger(body.revision) ||
-      body.revision < 1 ||
-      !body.data ||
-      typeof body.data !== "object" ||
-      Array.isArray(body.data)
+      !isExecutionRecord(body, id)
     )
       throw Error("browser_execution_journal_corrupt");
     const finishedAt =
@@ -93,7 +104,6 @@ export async function createExecutionJournal({
   await chmod(directory, 0o700);
   const ids = new Set<string>();
   let finished = new Map<string, number>();
-  const mutations = new Map<string, Promise<unknown>>();
   const filename = (id: string) => {
     if (!uuid.test(id)) throw Error("browser_execution_id_invalid");
     return join(directory, `${id}.json`);
@@ -111,13 +121,7 @@ export async function createExecutionJournal({
   };
   const write = async (record: ExecutionRecord, create: boolean) => {
     const target = filename(record.executionId);
-    if (
-      !record.data ||
-      typeof record.data !== "object" ||
-      Array.isArray(record.data) ||
-      !Number.isSafeInteger(record.revision) ||
-      record.revision < 1
-    )
+    if (!isExecutionRecord(record, record.executionId))
       throw Error("browser_execution_record_invalid");
     const finishedAt =
       record.data.phase === "finished"
@@ -151,16 +155,7 @@ export async function createExecutionJournal({
     if (finishedAt !== undefined) finished.set(record.executionId, finishedAt);
     else finished.delete(record.executionId);
   };
-  const serialize = <T>(id: string, action: () => Promise<T>): Promise<T> => {
-    const work = (mutations.get(id) ?? Promise.resolve()).then(action);
-    const settled = work
-      .catch(() => {})
-      .finally(() => {
-        if (mutations.get(id) === settled) mutations.delete(id);
-      });
-    mutations.set(id, settled);
-    return work;
-  };
+  const serialize = createSerialWork();
   let compacting: Promise<unknown> = Promise.resolve();
   const compact = (reserve: number) => {
     const work = compacting.then(async () => {

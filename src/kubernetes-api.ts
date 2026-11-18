@@ -170,6 +170,8 @@ export function hasKubernetesOwner(
   return (
     refs?.length === 1 &&
     refs[0]?.controller === true &&
+    typeof expected.uid === "string" &&
+    expected.uid.length > 0 &&
     ["apiVersion", "kind", "name", "uid"].every((key) => refs[0][key] === expected[key])
   );
 }
@@ -194,40 +196,87 @@ export async function readKubernetesOwner(
   return kubernetesOwnerReference("ConfigMap", options.ownerName, owner.metadata.uid);
 }
 
-/** Resolve the single controller chain; a missing/replaced Lease belongs to GC. */
-export async function readKubernetesWorkerOwner(
-  api: ReturnType<typeof createKubernetesClient>,
-  namespace: string,
-  pod: any,
-  parent: ReturnType<typeof kubernetesOwnerReference>,
+type KubernetesClient = ReturnType<typeof createKubernetesClient>;
+export const executionLeaseSelector = (installation: string) =>
+  encodeURIComponent(
+    `browser-sandbox.io/installation=${installation},browser-sandbox.io/state=execution`,
+  );
+
+export async function* listKubernetesPages(
+  api: KubernetesClient,
+  path: string,
+  selector: string,
   signal: AbortSignal,
-): Promise<ReturnType<typeof kubernetesOwnerReference> | undefined> {
-  const refs = pod.metadata?.ownerReferences;
-  const ref = refs?.[0];
-  if (refs?.length !== 1 || !ref.controller)
-    throw Error("browser_worker_ownership_mismatch");
-  if (hasKubernetesOwner(pod, parent)) return ref;
-  if (ref.apiVersion !== "coordination.k8s.io/v1" || ref.kind !== "Lease")
-    throw Error("browser_worker_ownership_mismatch");
-  let lease: any;
-  try {
-    lease = await api(
-      `/apis/coordination.k8s.io/v1/namespaces/${namespace}/leases/${encodeURIComponent(ref.name)}`,
+  maxItems: number,
+  error: string,
+) {
+  const cursors = new Set<string>();
+  let cursor = "",
+    count = 0;
+  do {
+    const page = await api(
+      `${path}?labelSelector=${selector}&limit=100&continue=${encodeURIComponent(cursor)}`,
       "GET",
       undefined,
       signal,
     );
-  } catch (error) {
-    if (error instanceof KubernetesError && error.status === 404) return;
-    throw error;
+    cursor = page.metadata?.continue ?? "";
+    if (
+      !Array.isArray(page.items) ||
+      page.items.length > 100 ||
+      (count += page.items.length) > maxItems ||
+      typeof cursor !== "string" ||
+      cursor.length > 8192 ||
+      cursors.size >= maxItems ||
+      cursors.has(cursor)
+    )
+      throw Error(error);
+    cursors.add(cursor);
+    yield page;
+  } while (cursor);
+}
+
+/** A missing/replaced Lease belongs to GC; the batch is read only for Lease-owned Pods. */
+export function workerOwnerCheck(
+  api: KubernetesClient,
+  options: KubernetesAccess & { installation: string },
+  parent: ReturnType<typeof kubernetesOwnerReference>,
+  signal: AbortSignal,
+) {
+  let leases: Promise<Map<string, any>>;
+  async function list() {
+    const index = new Map<string, any>();
+    for await (const { items } of listKubernetesPages(
+      api,
+      `/apis/coordination.k8s.io/v1/namespaces/${options.namespace}/leases`,
+      executionLeaseSelector(options.installation),
+      signal,
+      131072,
+      "browser_worker_discovery_failed",
+    )) {
+      for (const { metadata } of items) index.set(metadata.name, metadata);
+    }
+    return index;
   }
-  if (lease.metadata?.uid !== ref.uid) return;
-  if (
-    lease.metadata.labels?.["browser-sandbox.io/state"] !== "execution" ||
-    lease.metadata.labels?.["browser-sandbox.io/execution"] !==
-      pod.metadata.labels?.["browser-sandbox.io/execution"] ||
-    !hasKubernetesOwner(lease, parent)
-  )
-    throw Error("browser_worker_ownership_mismatch");
-  return ref;
+  return async (pod: any) => {
+    if (hasKubernetesOwner(pod, parent)) return true;
+    const ref = pod.metadata?.ownerReferences?.[0];
+    if (
+      typeof ref?.name !== "string" ||
+      !ref.name ||
+      !hasKubernetesOwner(pod, kubernetesOwnerReference("Lease", ref.name, ref.uid))
+    )
+      throw Error("browser_worker_ownership_mismatch");
+    const lease = (await (leases ??= list())).get(ref.name);
+    if (lease?.uid !== ref.uid) return false;
+    if (
+      !hasKubernetesOwner({ metadata: lease }, parent) ||
+      lease.labels?.["browser-sandbox.io/installation"] !== options.installation ||
+      lease.labels?.["browser-sandbox.io/state"] !== "execution" ||
+      lease.labels?.["browser-sandbox.io/execution"] !==
+        pod.metadata.labels?.["browser-sandbox.io/execution"]
+    )
+      throw Error("browser_worker_ownership_mismatch");
+    return true;
+  };
 }

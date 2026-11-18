@@ -4,7 +4,7 @@ import {
   type KubernetesAccess,
   KubernetesError,
   readKubernetesOwner,
-  readKubernetesWorkerOwner,
+  workerOwnerCheck,
 } from "./kubernetes-api.js";
 
 export interface KubernetesDrainOptions extends KubernetesAccess {
@@ -72,6 +72,7 @@ export async function drainKubernetesWorkers(
       signal,
     );
     while ((await list("controller")).length) await delay(100, undefined, { signal });
+    const liveOwner = workerOwnerCheck(api, options, owner, signal);
     while (true) {
       const workers = await list("worker");
       if (!workers.length) return;
@@ -84,10 +85,7 @@ export async function drainKubernetesWorkers(
           )
         )
           throw Error("browser_worker_ownership_mismatch");
-        if (
-          !(await readKubernetesWorkerOwner(api, options.namespace, pod, owner, signal))
-        )
-          continue;
+        if (!(await liveOwner(pod))) continue;
         // A Profile admitted between preflight and controller exit still keeps its recovery copy.
         if (persistent(pod)) throw Error("browser_profile_busy");
         if (!pod.metadata.deletionTimestamp) {

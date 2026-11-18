@@ -113,6 +113,8 @@ async function fixture(
     replacement: false,
     observed: undefined,
     podReads: 0,
+    leaseLists: 0,
+    extraPods: [],
     listOwner: "release-uid",
     listFailure: false,
     statusOverride: undefined,
@@ -135,27 +137,36 @@ async function fixture(
           },
         }),
       );
-    } else if (request.url.includes("/leases/")) {
+    } else if (request.url.includes("/leases?")) {
+      state.leaseLists++;
       response.end(
         JSON.stringify({
-          metadata: {
-            uid: "execution-uid",
-            labels: {
-              "browser-sandbox.io/execution": executionId,
-              "browser-sandbox.io/state": "execution",
-            },
-            ownerReferences: [
-              {
-                apiVersion: "v1",
-                kind: "ConfigMap",
-                name: "trial-browser-workers",
-                uid: "release-uid",
-                controller: true,
+          items: [
+            {
+              metadata: {
+                name: "execution-lease",
+                uid: "execution-uid",
+                labels: {
+                  "browser-sandbox.io/execution": executionId,
+                  "browser-sandbox.io/state": "execution",
+                  "browser-sandbox.io/installation": "trial",
+                },
+                ownerReferences: [
+                  {
+                    apiVersion: "v1",
+                    kind: "ConfigMap",
+                    name: "trial-browser-workers",
+                    uid: "release-uid",
+                    controller: true,
+                  },
+                ],
               },
-            ],
-          },
+            },
+          ],
         }),
       );
+    } else if (request.url.includes("/leases/")) {
+      response.writeHead(500).end("{}");
     } else if (request.url.includes("/pods?")) {
       if (state.listFailure) response.writeHead(503).end("{}");
       else
@@ -174,6 +185,7 @@ async function fixture(
                 },
                 status: { phase: "Running", podIP: "10.42.1.4" },
               },
+              ...state.extraPods,
             ],
           }),
         );
@@ -643,4 +655,35 @@ test("shared fencing adopts a compatible release-owned worker into its execution
     },
   ]);
   assert.equal(state.pod.metadata.annotations["browser-sandbox.io/epoch"], "1");
+});
+
+test("shared discovery lists execution Leases once for multiple Pods", async (t) => {
+  const ownership = {
+    assertOwned: async () => ({
+      epoch: 1,
+      uid: "execution-uid",
+      name: "execution-lease",
+    }),
+  };
+  const { backend, state } = await fixture(t, { ownership });
+  const signal = AbortSignal.timeout(5000);
+  const worker = await backend.create({ executionId, incarnation }, signal);
+  t.after(() => worker.runtime.close());
+  state.listOwner = "execution-uid";
+  const old = structuredClone(state.pod);
+  old.metadata.name = "old-worker";
+  old.metadata.uid = "old-pod";
+  old.metadata.ownerReferences[0].uid = "deleted-lease-uid";
+  const current = structuredClone(state.pod);
+  current.metadata.name = "second-worker";
+  current.metadata.uid = "second-pod";
+  state.extraPods.push(old, current);
+  assert.deepEqual(
+    (await backend.list(signal)).map((pod) => pod.id),
+    [worker.id, "second-worker/second-pod"],
+  );
+  assert.equal(state.leaseLists, 1);
+  await backend.fence(worker, 1, signal, true);
+  await backend.remove(worker, signal);
+  assert.equal(state.leaseLists, 1);
 });

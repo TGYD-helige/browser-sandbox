@@ -251,3 +251,35 @@ test("an already disconnected forwarding peer cannot execute commands on the own
   );
   assert.equal(calls, 0);
 });
+
+test("an in-flight forwarded command reports disconnect without inviting replay", async (t) => {
+  const server = createServer();
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  const host = createNetworkHostControl({
+    server,
+    async dispatch() {
+      entered.resolve();
+      await resume.promise;
+      return { stopped: true };
+    },
+  });
+  const forwarding = createHostForwarding();
+  t.after(async () => {
+    resume.resolve();
+    forwarding.close();
+    host.close();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const pending = forwarding.request(
+    `http://127.0.0.1:${server.address().port}`,
+    { op: "finalize", executionId: "example" },
+    { signal: new AbortController().signal, callback: async () => {} },
+    AbortSignal.timeout(5000),
+  );
+  const outcome = assert.rejects(pending, { message: "browser_control_disconnected" });
+  await entered.promise;
+  host.close();
+  await outcome;
+});

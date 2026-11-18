@@ -29,6 +29,7 @@ import {
 import { normalizeAllowedDomains } from "./network-policy.js";
 import type { createProfileStore } from "./profile-store.js";
 import { MAX_ARCHIVE_BYTES } from "./profiles.js";
+import { createSerialWork } from "./serial-work.js";
 import type { SessionStatus } from "./session.js";
 import { createWorkerAdmission, type WorkerSlot } from "./worker-admission.js";
 import {
@@ -1300,17 +1301,7 @@ export async function createController(options: ControllerOptions) {
     }
     return result;
   }
-  const mutations = new Map<string, Promise<unknown>>();
-  function serializeExecution<T>(id: string, action: () => Promise<T>): Promise<T> {
-    const work = (mutations.get(id) ?? Promise.resolve()).then(action);
-    const settled = work
-      .catch(() => {})
-      .finally(() => {
-        if (mutations.get(id) === settled) mutations.delete(id);
-      });
-    mutations.set(id, settled);
-    return work;
-  }
+  const serializeExecution = createSerialWork();
   async function command(
     request: any,
     peer?: ControlPeer,
@@ -1576,7 +1567,6 @@ export async function createController(options: ControllerOptions) {
       endpoint: data.endpoint,
       life: new AbortController(),
       revoked: false,
-      worker,
       stopConfirmed: data.stopConfirmed,
       finalResult: data.finalResult,
       confirmedCommit: data.confirmedCommit,
@@ -1603,15 +1593,21 @@ export async function createController(options: ControllerOptions) {
       !binding.infrastructureOnly &&
       binding.profileAcquired !== false
     ) {
-      if (profileLeases.has(binding.profileId))
-        throw Error("browser_profile_lease_recovery_failed");
-      profileLeases.set(binding.profileId, binding);
-      bindStorage(binding);
-      if (ownership) await ownership.acquireProfile(id, binding.profileId);
-      if (binding.revoked) return;
+      try {
+        if (profileLeases.has(binding.profileId))
+          throw Error("browser_profile_lease_recovery_failed");
+        profileLeases.set(binding.profileId, binding);
+        if (ownership) await ownership.acquireProfile(id, binding.profileId);
+        if (binding.revoked) return;
+        bindStorage(binding);
+      } catch (error) {
+        if (ownership && bindings.get(id) === binding) dropOwned(id, false);
+        throw error;
+      }
     }
     if (worker) {
       owned.delete(worker.id);
+      binding.worker = worker;
       binding.starting = Promise.resolve(worker);
       binding.slot = admission.restore();
       try {
@@ -1737,10 +1733,10 @@ export async function createController(options: ControllerOptions) {
     }
     await persist(binding);
   }
-  function dropOwned(id: string) {
+  function dropOwned(id: string, fenced = true) {
     const binding = bindings.get(id);
     if (!binding) return;
-    if (!closing && binding.phase !== "finished")
+    if (fenced && !closing && binding.phase !== "finished")
       event(binding, "fenced", { error: "browser_controller_fenced" });
     revokeExecution(binding);
     binding.storageDisconnect?.();
@@ -1748,7 +1744,8 @@ export async function createController(options: ControllerOptions) {
     closeWorkerChannel(binding.worker);
     binding.slot?.release();
     bindings.delete(id);
-    if (binding.profileId) profileLeases.delete(binding.profileId);
+    if (profileLeases.get(binding.profileId) === binding)
+      profileLeases.delete(binding.profileId);
   }
   const loading = new Map<string, Promise<void>>();
   function loadOwned(id: string, workers?: ManagedWorker[]): Promise<void> {
@@ -2443,18 +2440,17 @@ export function validateControllerRecord(data: any) {
   } catch {
     invalid();
   }
-  if (
-    data.generation !== undefined &&
-    (typeof data.generation !== "string" ||
-      !data.generation ||
-      data.generation.length > 128)
-  )
-    invalid();
-  if (
-    data.workerId !== undefined &&
-    (typeof data.workerId !== "string" || !data.workerId || data.workerId.length > 256)
-  )
-    invalid();
+  for (const [key, limit] of [
+    ["generation", 128],
+    ["workerId", 256],
+  ] as const) {
+    const value = data[key];
+    if (
+      value !== undefined &&
+      (typeof value !== "string" || !value || value.length > limit)
+    )
+      invalid();
+  }
   if (data.endpoint !== undefined) {
     if (
       !data.endpoint ||

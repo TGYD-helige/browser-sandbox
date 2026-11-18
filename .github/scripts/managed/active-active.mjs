@@ -873,7 +873,59 @@ export async function activeActive({
     );
     report.sharedStateDrainWithoutForce = true;
 
+    stage = "conditional Lease delete";
+    const compactId = randomUUID();
+    await client("register", compactId);
+    const compactOwner = await peers(compactId);
+    await client("finish", compactId);
+    await kubectl(
+      "exec",
+      compactOwner.pod.metadata.name,
+      "--",
+      "node",
+      "--input-type=module",
+      "-e",
+      `import assert from 'node:assert/strict';
+       import{createKubernetesClient,readKubernetesAccess,KubernetesError}from'/opt/browser-sandbox/dist/kubernetes-api.js';
+       const access=await readKubernetesAccess(), api=createKubernetesClient(access);
+       const path='/apis/coordination.k8s.io/v1/namespaces/'+access.namespace+'/leases/${compactOwner.lease.metadata.name}';
+       const signal=AbortSignal.timeout(15000);
+       const {metadata,spec}=await api(path,'GET',undefined,signal);
+       assert.equal(metadata.annotations['browser-sandbox.io/phase'],'finished');
+       assert(!spec.holderIdentity);
+       await assert.rejects(api(path,'DELETE',{preconditions:{uid:metadata.uid,resourceVersion:${JSON.stringify(compactOwner.lease.metadata.resourceVersion)}}},signal),error=>error instanceof KubernetesError && error.status===409);
+       await api(path,'DELETE',{preconditions:{uid:metadata.uid,resourceVersion:metadata.resourceVersion}},signal);
+       await assert.rejects(api(path,'GET',undefined,signal),error=>error instanceof KubernetesError && error.status===404);`,
+    );
+    report.conditionalLeaseDeleteAccepted = true;
+
     stage = "shared state uninstall";
+    const sharedState = async () =>
+      JSON.parse(
+        await kubectl(
+          "get",
+          "leases,secrets",
+          "-l",
+          `${prefix}installation=${release}`,
+          "-o",
+          "json",
+        ),
+      ).items;
+    const beforeUninstall = await sharedState();
+    for (const [kind, state] of [
+      ["Lease", "execution"],
+      ["Secret", "execution"],
+      ["Lease", "profile"],
+      ["Secret", "migration"],
+    ])
+      assert(
+        beforeUninstall.some(
+          (item) =>
+            item.kind === kind && item.metadata.labels?.[prefix + "state"] === state,
+        ),
+        `Uninstall fixture missing ${state} ${kind}`,
+      );
+    report.uninstallHadAllSharedStateKinds = true;
     await run(
       "helm",
       ["uninstall", release, "-n", namespace, "--wait", "--timeout", "120s"],
@@ -882,17 +934,7 @@ export async function activeActive({
     installed = false;
     await wait(
       "Uninstall retained shared Leases or Secrets",
-      async () =>
-        JSON.parse(
-          await kubectl(
-            "get",
-            "leases,secrets",
-            "-l",
-            `${prefix}installation=${release}`,
-            "-o",
-            "json",
-          ),
-        ).items,
+      sharedState,
       (items) => items.length === 0,
     );
     report.uninstallRemovedAllSharedLeasesAndSecrets = true;

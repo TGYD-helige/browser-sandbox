@@ -225,7 +225,7 @@ class ChartTest(unittest.TestCase):
         self.assertEqual(set(next(rule["verbs"] for rule in rules if "leases" in rule["resources"])), {"get", "list", "watch", "create", "update", "delete"})
         self.assertEqual(set(next(rule["verbs"] for rule in rules if "secrets" in rule["resources"])), {"get", "create", "update", "delete"})
         drain_rules = next(item["rules"] for item in resources if item["kind"] == "Role" and item["metadata"]["name"].endswith("-drain"))
-        self.assertEqual(next(rule for rule in drain_rules if "leases" in rule["resources"]), {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["get"]})
+        self.assertEqual(next(rule for rule in drain_rules if "leases" in rule["resources"]), {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["list"]})
         self.assertFalse(any("leases" in rule["resources"] for item in render() if item["kind"] == "Role" and item["metadata"]["name"].endswith("-drain") for rule in item["rules"]))
         with self.assertRaises(subprocess.CalledProcessError):
             render("--set", "controller.replicas=3", "--set", "profileStore.enabled=true")

@@ -131,6 +131,7 @@ async function fixture(t, extra = {}) {
     if (req.method === "PUT") {
       await state.beforeWrite?.(path, body);
       previous = objects.get(path);
+      if (!previous) return reply(404);
       if (body.metadata.resourceVersion !== previous.metadata.resourceVersion)
         return reply(409);
       body.metadata.uid = previous.metadata.uid;
@@ -158,7 +159,14 @@ async function fixture(t, extra = {}) {
       return reply(200, updated);
     }
     if (req.method === "DELETE") {
-      if (path.includes("/leases/") && state.failLeaseDelete) {
+      await state.beforeDelete?.(path);
+      previous = objects.get(path);
+      if (!previous) return reply(404);
+      if (
+        path.includes("/leases/") &&
+        state.failLeaseDelete &&
+        (state.failLeaseDelete === true || path.endsWith(state.failLeaseDelete))
+      ) {
         state.failLeaseDelete = false;
         return reply(503);
       }
@@ -1495,7 +1503,7 @@ test("an older LIST snapshot does not erase or replace a newer local observation
   assert.equal(a.owns(id), true);
 });
 
-test("compaction skips a candidate changed during its record read and continues", async (t) => {
+test("compaction skips a candidate changed before its conditional delete and continues", async (t) => {
   const { a, b, state, advance } = await fixture(t, { maxFinished: 1 });
   const third = "33333333-3333-4333-8333-333333333333";
   for (const executionId of [id, other, third]) {
@@ -1505,10 +1513,9 @@ test("compaction skips a candidate changed during its record read and continues"
   }
   const entered = Promise.withResolvers(),
     resume = Promise.withResolvers();
-  state.readAfterGet = true;
-  state.beforeGet = async (path) => {
-    if (!path.includes("/secrets/") || !path.endsWith(id)) return;
-    state.beforeGet = undefined;
+  state.beforeDelete = async (path) => {
+    if (!path.includes("/leases/") || !path.endsWith(id)) return;
+    state.beforeDelete = undefined;
     entered.resolve();
     await resume.promise;
   };
@@ -1826,7 +1833,7 @@ test("shared execution resources belong to the release and Secrets follow the ex
 });
 
 test("maintenance cleanup does not claim unready executions and API failures do not stop recovery", async (t) => {
-  const { a, state, objects } = await fixture(t, { maxFinished: 1 });
+  const { a, state } = await fixture(t, { maxFinished: 1 });
   const third = "33333333-3333-4333-8333-333333333333";
   for (const executionId of [id, other, third]) {
     await a.resolve(executionId, true);
@@ -1834,24 +1841,17 @@ test("maintenance cleanup does not claim unready executions and API failures do 
     await a.complete(executionId);
   }
   // A controlled API failure on the first candidate must not block the next one.
-  state.failGet = id;
+  state.failLeaseDelete = id;
   assert.deepEqual(await a.refresh(), []);
   assert.equal(a.owns(id), false);
   assert.equal(await a.journal.read(other), undefined);
-  state.failGet = undefined;
-  const secret = [...objects.values()].find(
-    (value) => value.kind === "Secret" && value.metadata.name.endsWith(id),
-  );
-  const body = JSON.parse(Buffer.from(secret.data.record, "base64").toString());
-  body.record.data.phase = "registered";
-  secret.data.record = Buffer.from(JSON.stringify(body)).toString("base64");
   await a.refresh();
   assert.equal(
     a.owns(id),
     false,
     "maintenance must never keep an unloaded binding owned",
   );
-  assert.equal((await a.journal.read(id)).data.phase, "registered");
+  assert.equal(await a.journal.read(id), undefined);
 });
 
 test("Secret snapshot precedes fresh Lease check even when the response arrives after handoff", async (t) => {
@@ -2379,4 +2379,163 @@ test("a recreated Lease cannot inherit an old UID Secret’s record or grants wh
     /browser_controller_fenced/,
   );
   assert.deepEqual((await b.journal.read(id)).data.grants, []);
+});
+
+test("failed Profile acquisition leaves recovery retryable", async (t) => {
+  const { a, ports, cleanups } = await fixture(t);
+  let attempts = 0;
+  const controller = await createController({
+    ownership: {
+      ...a,
+      async acquireProfile(...args) {
+        if (++attempts === 1) throw Error("browser_profile_busy");
+        return a.acquireProfile(...args);
+      },
+    },
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => [],
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {},
+    },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  await a.resolve(id, true);
+  await a.journal.create(id, {
+    phase: "registered",
+    profileId: "retry-profile",
+    profileAcquired: true,
+    storageMode: "host",
+    incarnation: other,
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+  });
+  await assert.rejects(controller.reconcile(), /browser_profile_busy/);
+  await controller.reconcile();
+  assert.equal(attempts, 2);
+  assert.equal(controller.bindings.get(id)?.phase, "registered");
+});
+
+test("Lease deletion during a takeover PUT does not stop the next recovery", async (t) => {
+  const { a, b, state, ports, cleanups } = await fixture(t, { maxFinished: 1 });
+  const third = "33333333-3333-4333-8333-333333333333";
+  const controller = await createController({
+    ownership: b,
+    peerPort: ports[1],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => [],
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {},
+    },
+  });
+  const entered = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  cleanups.unshift(async () => {
+    resume.resolve();
+    await controller.stop({ finalize: false });
+  });
+  for (const executionId of [id, other]) await a.resolve(executionId, true);
+  await a.journal.create(id, { phase: "finished" });
+  await a.journal.create(other, {
+    phase: "registered",
+    incarnation: id,
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+  });
+  await a.release();
+  state.beforeWrite = async (path, body) => {
+    if (!path.endsWith(id) || body.spec?.holderIdentity !== "b") return;
+    state.beforeWrite = undefined;
+    entered.resolve();
+    await resume.promise;
+  };
+  const recovery = controller.reconcile();
+  recovery.catch(() => {});
+  await waitForControl(entered.promise, AbortSignal.timeout(5000));
+  try {
+    for (const executionId of [id, third]) {
+      await a.resolve(executionId, true);
+      if (executionId === third) await a.journal.create(third, { phase: "finished" });
+      await a.complete(executionId);
+    }
+    await a.compact();
+    assert.equal(await a.journal.read(id), undefined);
+  } finally {
+    resume.resolve();
+  }
+  await recovery;
+  assert.equal(b.lookup(id), undefined);
+  assert.equal(controller.bindings.get(other)?.phase, "registered");
+});
+
+test("compaction preserves a reopened execution after its owner releases the Lease", async (t) => {
+  const { a, b } = await fixture(t, { maxFinished: 1 });
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "finished" });
+  await a.complete(id);
+  await a.resolve(id, true);
+  // Orphan recovery can reopen a finished record before the worker is removed.
+  await a.journal.update(id, 1, { phase: "recovery-required" });
+  await a.release();
+  for (const executionId of [other, "33333333-3333-4333-8333-333333333333"]) {
+    await b.resolve(executionId, true);
+    await b.journal.create(executionId, { phase: "finished" });
+    await b.complete(executionId);
+  }
+  await b.refresh();
+  assert.equal((await b.journal.read(id))?.data.phase, "recovery-required");
+  assert.equal(await b.journal.read(other), undefined);
+});
+
+test("a local Profile collision preserves the current binding and allows later recovery", async (t) => {
+  const { a, ports, cleanups } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => [],
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {},
+    },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  const profileId = "collision";
+  await controller.command(
+    { op: "register", executionId: id, profileId, storage: true },
+    { signal: new AbortController().signal, callback: async () => {} },
+  );
+  await a.resolve(other, true);
+  await a.journal.create(other, {
+    phase: "registered",
+    profileId,
+    profileAcquired: true,
+    storageMode: "host",
+    incarnation: id,
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+  });
+  await assert.rejects(controller.reconcile(), /browser_profile_lease_recovery_failed/);
+  assert.equal(controller.bindings.get(id)?.profileId, profileId);
+  assert.equal(controller.bindings.has(other), false);
+  await controller.command({ op: "finalize", executionId: id });
+  await controller.reconcile();
+  assert.equal(controller.bindings.get(other)?.profileId, profileId);
 });

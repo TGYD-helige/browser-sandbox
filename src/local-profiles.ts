@@ -4,7 +4,7 @@ import { constants } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-export const validProfileId = (value) =>
+export const validProfileId = (value: unknown): value is string =>
   typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/.test(value);
 /** Every recursive walk holds a descriptor per level, so all walks share one depth bound. */
 export const MAX_TREE_DEPTH = 128;

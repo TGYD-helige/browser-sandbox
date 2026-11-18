@@ -60,7 +60,7 @@ rules:
   {{- if or (gt (int .Values.controller.replicas) 1) .Values.controller.sharedState }}
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    verbs: [get]
+    verbs: [list]
   {{- end }}
   - apiGroups: [apps]
     resources: [deployments/scale]
