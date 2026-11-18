@@ -1309,15 +1309,20 @@ export async function createController(options: ControllerOptions) {
     forwarded = false,
   ) {
     if (ownership && request?.executionId) {
-      const owner = await ownership.resolve(
-        request.executionId,
-        ["register", "storage_attach", "finish", "finalize"].includes(request.op),
-      );
-      if (owner && !ownership.owns(request.executionId)) {
-        if (forwarded) throw Error("browser_controller_owner_moved");
-        return forwarding.request(owner.origin, request, peer, signal);
+      const cached = ownership.lookup(request.executionId);
+      // A released finished Lease is final; answering locally avoids a takeover per poll.
+      if (cached?.finished && !cached.replica) rememberFinished(request.executionId);
+      else {
+        const owner = await ownership.resolve(
+          request.executionId,
+          ["register", "storage_attach", "finish", "finalize"].includes(request.op),
+        );
+        if (owner && !ownership.owns(request.executionId)) {
+          if (forwarded) throw Error("browser_controller_owner_moved");
+          return forwarding.request(owner.origin, request, peer, signal);
+        }
+        if (owner) await loadOwned(request.executionId);
       }
-      if (owner) await loadOwned(request.executionId);
     }
     if (request?.op === "controller_status") return dispatch(request, peer, signal);
     return serializeExecution(request?.executionId, () =>
@@ -1447,15 +1452,13 @@ export async function createController(options: ControllerOptions) {
                 throw Error("browser_access_denied");
               }
               if (ownership && !req.executionId && auth?.type === "authenticate") {
-                const id = await ownership.findCapability(auth.token);
+                const id = ownership.findCapability(auth.token);
                 if (id) {
-                  const owner = ownership.lookup(id);
-                  if (owner && !ownership.owns(id)) {
-                    if (forwarded) throw Error("browser_controller_owner_moved");
-                    forwardControllerViewer(client, owner.origin, id, auth.token);
+                  const peer = agentPeer(id, forwarded);
+                  if (peer) {
+                    forwardControllerViewer(client, peer, id, auth.token);
                     return;
                   }
-                  if (ownership.owns(id)) assertAgentReady(id);
                   req.executionId = id;
                 }
               }
@@ -1804,13 +1807,30 @@ export async function createController(options: ControllerOptions) {
     await removeWorker(worker, signal);
     event(worker, "removed", { reason: "stale-creation" });
   }
+  // The watch keeps ownership current; full relists and orphan scans run on this slower cadence.
+  const relistMs = Math.max(60000, reconciliationMs);
+  let relistAt = 0;
+  const takenOver = new Set<string>();
   async function refreshOwnership() {
-    const ids = await ownership.refresh();
-    for (const id of ids) await ownership.resolve(id);
+    const relist = ownership.needsRelist() || performance.now() >= relistAt;
+    const ids = relist ? await ownership.refresh() : ownership.active();
+    if (relist) relistAt = performance.now() + relistMs;
+    for (const id of ids) {
+      const held = ownership.owns(id);
+      await ownership.resolve(id);
+      if (!held && ownership.owns(id)) takenOver.add(id);
+    }
+    for (const id of takenOver) if (!ownership.owns(id)) takenOver.delete(id);
+    if (!relist && !takenOver.size) return;
     const discovered = await options.backend.list(AbortSignal.timeout(30000));
     const candidates = new Set<string>();
     try {
-      for (const id of ids) if (ownership.owns(id)) await loadOwned(id, discovered);
+      for (const id of relist ? ids : [...takenOver])
+        if (ownership.owns(id)) {
+          await loadOwned(id, discovered);
+          takenOver.delete(id);
+        }
+      if (!relist) return;
       for (const worker of discovered) {
         const binding = bindings.get(worker.executionId);
         if (binding) {
@@ -1843,21 +1863,32 @@ export async function createController(options: ControllerOptions) {
     if (restoring.has(id) || (!bindings.has(id) && !finished.has(id)))
       throw Error("browser_controller_owner_moved");
   }
+  /** Returns the live peer origin, or undefined when this replica serves the request. */
+  function agentPeer(id: string, forwarded: boolean) {
+    if (ownership.owns(id)) {
+      assertAgentReady(id);
+      return undefined;
+    }
+    const owner = ownership.lookup(id);
+    // An unseen or released Lease is retryable; only a finished one is final.
+    if (!owner?.replica)
+      throw Error(
+        owner?.finished ? "browser_access_denied" : "browser_controller_owner_moved",
+      );
+    if (forwarded) throw Error("browser_controller_owner_moved");
+    return owner.origin;
+  }
   async function routeAgent(req, destination, head?: Buffer, forwarded = false) {
     if (!ownership) return false;
     const match = /^\/execution\/([a-f0-9-]{36})\/(.+)$/.exec(req.url ?? "");
     const legacy = /^\/execution\/([a-f0-9]{64})(?:\/|$)/.exec(req.url ?? "");
-    const id =
-      match?.[1] ?? (legacy ? await ownership.findCapability(legacy[1]) : undefined);
+    const id = match?.[1] ?? (legacy ? ownership.findCapability(legacy[1]) : undefined);
     if (!id) return false;
-    const owner = ownership.lookup(id);
-    if (!owner) throw Error("browser_access_denied");
-    if (!ownership.owns(id)) {
-      if (forwarded) throw Error("browser_controller_owner_moved");
-      forwardControllerRequest(req, destination, owner.origin, head);
+    const peer = agentPeer(id, forwarded);
+    if (peer) {
+      forwardControllerRequest(req, destination, peer, head);
       return true;
     }
-    assertAgentReady(id);
     req.executionId = id;
     if (match)
       req.url = match[2] === "view/socket" ? "/view/socket" : `/execution/${match[2]}`;

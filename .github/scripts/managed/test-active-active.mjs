@@ -67,9 +67,12 @@ test("orphan evidence continues observing after the first removal and detects a 
 test("five failover observations report a maximum rather than a population P95", () => {
   assert.deepEqual(summarizeFailover([5, 1, 3, 4, 2]), {
     medianMs: 3,
+    p95Ms: 5,
     maxMs: 5,
     samples: 5,
   });
+  const twenty = Array.from({ length: 20 }, (_, i) => i + 1);
+  assert.equal(summarizeFailover(twenty).p95Ms, 19);
 });
 
 test("takeover status reconnects after a controlled HTTP connection loss without replaying CDP", async (t) => {

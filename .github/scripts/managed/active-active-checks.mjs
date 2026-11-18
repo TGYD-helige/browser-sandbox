@@ -33,6 +33,8 @@ export function summarizeFailover(values) {
   const sorted = [...values].sort((a, b) => a - b);
   return {
     medianMs: sorted[Math.floor(sorted.length / 2)],
+    // Nearest-rank P95; with fewer than 20 samples it equals the maximum.
+    p95Ms: sorted[Math.ceil(sorted.length * 0.95) - 1],
     maxMs: sorted.at(-1),
     samples: sorted.length,
   };

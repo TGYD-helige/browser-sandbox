@@ -58,11 +58,15 @@ export interface ExecutionOwner {
   origin: string;
   epoch: number;
   uid: string;
+  finished?: boolean;
 }
 
 /** Shared ownership contract; platform arbitration and persistence stay in its adapter. */
 export interface ExecutionOwnership {
   lookup(id: string): ExecutionOwner | undefined;
+  /** Cached unfinished executions; refresh() relists them from the platform. */
+  active(): string[];
+  needsRelist(): boolean;
   resolve(id: string, create?: boolean): Promise<ExecutionOwner | undefined>;
   assertOwned(id: string): Promise<{ epoch: number; uid: string }>;
   epoch(id: string): number | undefined;

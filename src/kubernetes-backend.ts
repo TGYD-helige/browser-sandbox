@@ -430,7 +430,14 @@ export async function createKubernetesBackend(
         `browser-sandbox.io/installation=${options.installation},app.kubernetes.io/component=worker${target ? `,${prefix}execution=${target}` : ""}`,
       );
       const workers: ManagedWorker[] = [];
-      const liveOwner = workerOwnerCheck(api, options, parent, signal, scope);
+      const liveOwner = workerOwnerCheck(
+        api,
+        options,
+        parent,
+        signal,
+        scope,
+        options.ownership?.leaseMetadata,
+      );
       for await (const page of listKubernetesPages(
         api,
         `${base}/pods`,

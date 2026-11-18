@@ -10,7 +10,7 @@
       "scripts/**/*.mjs",
       "skills/**/*.mjs",
       ".github/scripts/**",
-      "!.github/scripts/managed/fixtures/journal-v0.2.0",
+      "!tests/fixtures/journal-v0.2.0",
       "package.json",
       "tsconfig.json",
       "biome.json",

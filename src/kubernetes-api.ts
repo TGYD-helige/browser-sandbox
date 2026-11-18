@@ -236,13 +236,14 @@ export async function* listKubernetesPages(
   } while (cursor);
 }
 
-/** A missing/replaced Lease belongs to GC; the batch is read only for Lease-owned Pods. */
+/** A missing/replaced Lease belongs to GC; without a watch cache the batch is read only for Lease-owned Pods. */
 export function workerOwnerCheck(
   api: KubernetesClient,
   options: KubernetesAccess & { installation: string },
   parent: ReturnType<typeof kubernetesOwnerReference>,
   signal: AbortSignal,
   scope?: { name: string; uid: string },
+  cached?: (executionId: string) => any,
 ) {
   let leases: Promise<Map<string, any>>;
   async function list() {
@@ -272,7 +273,11 @@ export function workerOwnerCheck(
       !hasKubernetesOwner(pod, kubernetesOwnerReference("Lease", ref.name, ref.uid))
     )
       throw Error("browser_worker_ownership_mismatch");
-    const lease = scope ?? (await (leases ??= list())).get(ref.name);
+    const lease =
+      scope ??
+      (cached
+        ? cached(pod.metadata.labels?.["browser-sandbox.io/execution"])
+        : (await (leases ??= list())).get(ref.name));
     if (lease?.uid !== ref.uid) return false;
     if (scope) return true;
     if (

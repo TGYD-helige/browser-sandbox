@@ -195,12 +195,12 @@ export async function activeActive({
     );
   const fixture = JSON.parse(
     await readFile(
-      ".github/scripts/managed/fixtures/journal-v0.2.0/11111111-1111-4111-8111-111111111111.json",
+      "tests/fixtures/journal-v0.2.0/11111111-1111-4111-8111-111111111111.json",
       "utf8",
     ),
   );
   fixture.installationId = release;
-  // Only installation identity is substituted; the record itself came from the previous release.
+  // Synthetic v0.2.0-format record; only the installation identity is substituted.
   const fixtureText = JSON.stringify(fixture);
   async function journalJob(action) {
     const name = `ha-journal-${randomUUID().slice(0, 8)}`;
@@ -388,7 +388,7 @@ export async function activeActive({
     await kubectl("rollout", "restart", `deployment/${deployment}`);
     await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
     report.journalMigration = {
-      previousRelease: "v0.2.0",
+      sourceFormat: "v0.2.0 journal, synthetic record seeded by the current image",
       idempotent: true,
       corruptSourcePreserved: true,
     };
@@ -466,7 +466,7 @@ export async function activeActive({
           "--",
           "node",
           "-e",
-          String.raw`const fs=require('node:fs');const s=fs.readFileSync('/proc/1/stat','utf8').split(' ');const n=fs.readFileSync('/proc/net/dev','utf8').split('\n').find(x=>x.includes('eth0:')).split(':')[1].trim().split(/\s+/).map(Number);const result={cpuTicks:Number(s[13])+Number(s[14]),rx:n[0],tx:n[8]};if(!Object.values(result).every(Number.isFinite))throw Error('counter_invalid');console.log(JSON.stringify(result))`,
+          String.raw`const fs=require('node:fs');const cpu=fs.readFileSync('/sys/fs/cgroup/cpu.stat','utf8').match(/^usage_usec (\d+)$/m);const n=fs.readFileSync('/proc/net/dev','utf8').split('\n').find(x=>x.includes('eth0:')).split(':')[1].trim().split(/\s+/).map(Number);const result={cpuMicros:Number(cpu?.[1]),rx:n[0],tx:n[8]};if(!Object.values(result).every(Number.isFinite))throw Error('counter_invalid');console.log(JSON.stringify(result))`,
         ),
       );
     const measure = async (pod) => {
@@ -478,17 +478,16 @@ export async function activeActive({
       const after = await Promise.all([snapshot(current.pod), snapshot(current.other)]);
       return {
         ...latency,
-        cpuTicks: after.reduce((n, v, i) => n + v.cpuTicks - before[i].cpuTicks, 0),
+        cpuMicros: after.reduce((n, v, i) => n + v.cpuMicros - before[i].cpuMicros, 0),
         rxBytes: after.reduce((n, v, i) => n + v.rx - before[i].rx, 0),
         txBytes: after.reduce((n, v, i) => n + v.tx - before[i].tx, 0),
-        cpuTickHz: 100,
       };
     };
     report.forwarding = {
       ownerDirect: await measure(current.pod),
       nonOwner: await measure(current.other),
       environment:
-        "native k3d; sum of owner and receiving controller /proc CPU/network counters; includes maintenance traffic",
+        "native k3d; sum of owner and receiving controller cgroup CPU and /proc network counters; includes maintenance traffic",
     };
     const worker = (await list("worker")).find(
       (pod) => pod.metadata.labels[prefix + "execution"] === id,
@@ -537,7 +536,7 @@ export async function activeActive({
     report.persistentProfileFailoverBlockedSaveReconnectAndColdRestore = true;
     stage = "owner kills";
     const failover = [];
-    for (let sample = 0; sample < 5; sample++) {
+    for (let sample = 0; sample < 10; sample++) {
       current = await peers(id);
       const epoch = Number(current.lease.metadata.annotations[prefix + "epoch"]);
       const live = await startLive(id, current.pod);
@@ -620,7 +619,8 @@ export async function activeActive({
     report.failoverCdpReconnects = {
       checks: reconnects.length,
       ownerMovedResponses: reconnects.reduce((sum, attempts) => sum + attempts - 1, 0),
-      forbiddenResponses: 0,
+      // connectDiagnosticCdp aborts the run on any other handshake status, including 403.
+      otherHandshakeFailuresAbort: true,
     };
     await kubectl(
       "exec",
@@ -667,72 +667,76 @@ export async function activeActive({
     );
     report.splitBrainFenced = true;
     stage = "rolling update";
-    current = await peers(id);
-    const live = await startLive(id, current.pod);
-    const rollingEpoch = Number(current.lease.metadata.annotations[prefix + "epoch"]);
-    const oldReplicaSet = current.pod.metadata.ownerReferences.find(
-      (ref) => ref.kind === "ReplicaSet" && ref.controller,
-    ).uid;
-    const rollingStarted = performance.now();
-    const rolling = kubectl("rollout", "restart", `deployment/${deployment}`);
-    rolling.catch(() => {});
-    await live.closed;
-    await rolling;
-    const revision = "deployment.kubernetes.io/revision";
-    const replicaSet = await wait(
-      "Deployment did not create its new ReplicaSet",
-      async () => {
-        const rolled = JSON.parse(
-          await kubectl("get", "deployment", deployment, "-o", "json"),
-        );
-        return JSON.parse(
-          await kubectl(
-            "get",
-            "replicasets",
-            "-l",
-            `app.kubernetes.io/instance=${release},app.kubernetes.io/component=controller`,
-            "-o",
-            "json",
-          ),
-        ).items.find(
-          (item) =>
-            item.metadata.annotations?.[revision] ===
-              rolled.metadata.annotations[revision] &&
-            item.metadata.ownerReferences?.some(
-              (ref) => ref.controller && ref.uid === rolled.metadata.uid,
+    const takeovers = [];
+    for (let sample = 0; sample < 3; sample++) {
+      current = await peers(id);
+      const live = await startLive(id, current.pod);
+      const rollingEpoch = Number(current.lease.metadata.annotations[prefix + "epoch"]);
+      const oldReplicaSet = current.pod.metadata.ownerReferences.find(
+        (ref) => ref.kind === "ReplicaSet" && ref.controller,
+      ).uid;
+      const rollingStarted = performance.now();
+      const rolling = kubectl("rollout", "restart", `deployment/${deployment}`);
+      rolling.catch(() => {});
+      await live.closed;
+      await rolling;
+      const revision = "deployment.kubernetes.io/revision";
+      const replicaSet = await wait(
+        "Deployment did not create its new ReplicaSet",
+        async () => {
+          const rolled = JSON.parse(
+            await kubectl("get", "deployment", deployment, "-o", "json"),
+          );
+          return JSON.parse(
+            await kubectl(
+              "get",
+              "replicasets",
+              "-l",
+              `app.kubernetes.io/instance=${release},app.kubernetes.io/component=controller`,
+              "-o",
+              "json",
             ),
-        );
-      },
-      (item) => item?.metadata.uid && item.metadata.uid !== oldReplicaSet,
-      45000,
-    );
-    const verifyRollout = (verify) =>
-      verifyRecoveredOwner(
-        id,
-        prepared.path,
-        rollingEpoch,
-        verify,
-        replicaSet.metadata.uid,
+          ).items.find(
+            (item) =>
+              item.metadata.annotations?.[revision] ===
+                rolled.metadata.annotations[revision] &&
+              item.metadata.ownerReferences?.some(
+                (ref) => ref.controller && ref.uid === rolled.metadata.uid,
+              ),
+          );
+        },
+        (item) => item?.metadata.uid && item.metadata.uid !== oldReplicaSet,
+        45000,
       );
-    stage = "during-rollout CDP verification";
-    await verifyRollout(({ pod }) => client("verify-rollout", id, pod));
-    report.duringRolloutVerifiedReadyOwner = true;
+      const verifyRollout = (verify) =>
+        verifyRecoveredOwner(
+          id,
+          prepared.path,
+          rollingEpoch,
+          verify,
+          replicaSet.metadata.uid,
+        );
+      stage = "during-rollout CDP verification";
+      await verifyRollout(({ pod }) => client("verify-rollout", id, pod));
+      report.duringRolloutVerifiedReadyOwner = true;
+      takeovers.push(performance.now() - rollingStarted);
+      await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=180s");
+      stage = "post-rollout CDP verification";
+      await verifyRollout(() => client("verify", id));
+      report.postRolloutVerifiedReadyOwner = true;
+      assert.equal(
+        (await list("worker")).find(
+          (pod) => pod.metadata.labels[prefix + "execution"] === id,
+        ).metadata.uid,
+        worker.metadata.uid,
+      );
+      report.rollingUpdatePreservedOriginalPageAndWorker = true;
+    }
     report.gracefulRollout = {
-      takeoverMs: performance.now() - rollingStarted,
-      samples: 1,
+      ...summarizeFailover(takeovers),
       liveCdpBeforeShutdown: true,
     };
-    await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=180s");
-    stage = "post-rollout CDP verification";
-    await verifyRollout(() => client("verify", id));
-    report.postRolloutVerifiedReadyOwner = true;
-    assert.equal(
-      (await list("worker")).find(
-        (pod) => pod.metadata.labels[prefix + "execution"] === id,
-      ).metadata.uid,
-      worker.metadata.uid,
-    );
-    report.rollingUpdatePreservedOriginalPageAndWorker = true;
+    report.noReplayedPageWrites = true;
     await client("finish", id);
     // A worker created through the normal adapter with no record is an orphan, claimed by one Lease winner.
     stage = "orphan reclamation";

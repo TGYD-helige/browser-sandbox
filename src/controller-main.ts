@@ -56,6 +56,15 @@ if (backendName === "kubernetes") {
     creationTimeoutMs: Number(process.env.BROWSER_WORKER_CREATION_TIMEOUT ?? 90000),
     maxExecutionMs,
   });
+  // Release-owned (epoch 0) workers predate shared state; without the import their records are unreachable.
+  if (
+    replicas > 1 &&
+    !(await ownership.migrationComplete()) &&
+    (await backend.list(AbortSignal.timeout(30000))).some(
+      (worker) => worker.epoch === 0,
+    )
+  )
+    throw Error("browser_execution_migration_required");
 } else if (backendName === "docker") {
   const { createDockerBackend, createDockerClient, readDockerSeccomp } = await import(
     "./docker-backend.js"

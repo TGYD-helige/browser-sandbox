@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -170,6 +170,26 @@ try {
         sessionId,
       );
       assert.equal(value.result.value, "original-page");
+      const writes = () =>
+        cdp.call(
+          "Runtime.evaluate",
+          { expression: "globalThis.haWrites ?? 0", returnByValue: true },
+          sessionId,
+        );
+      const writesFile = `/tmp/ha-live-${executionId}.writes`;
+      const written = await readFile(writesFile, "utf8").then(JSON.parse, (error) => {
+        if (error.code !== "ENOENT") throw error;
+      });
+      if (written) {
+        // One unacknowledged write may have run before the disconnect; more means a replay.
+        const count = (await writes()).result.value;
+        assert(
+          count >= written.base + written.acked &&
+            count <= written.base + written.acked + 1,
+          `CDP write replayed: ${count} for ${written.acked} acknowledged`,
+        );
+        await unlink(writesFile);
+      }
       const cookies = await cdp.call("Storage.getCookies");
       assert(
         cookies.cookies.some(
@@ -183,6 +203,8 @@ try {
       );
       assert.equal(status.generation, state.generation);
       if (action === "live") {
+        const base = (await writes()).result.value;
+        let acked = 0;
         await writeFile(`/tmp/ha-live-${executionId}.ready`, "ready");
         let closed = false;
         void cdp.closed.then(() => {
@@ -190,12 +212,18 @@ try {
         });
         while (!closed) {
           try {
-            await cdp.call("Browser.getVersion");
+            await cdp.call(
+              "Runtime.evaluate",
+              { expression: "globalThis.haWrites = (globalThis.haWrites ?? 0) + 1" },
+              sessionId,
+            );
+            acked++;
           } catch (error) {
             if (!closed) throw error;
           }
           if (!closed) await delay(100);
         }
+        await writeFile(writesFile, JSON.stringify({ base, acked }), { mode: 0o600 });
       } else if (action === "functional") {
         const base = url.href.replace(/^ws/, "http");
         const filename = `ha-${randomUUID()}.txt`;

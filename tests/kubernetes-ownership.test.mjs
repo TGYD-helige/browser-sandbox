@@ -15,7 +15,7 @@ import { importExecutionJournal } from "../dist/kubernetes-migration.js";
 import { createKubernetesOwnership } from "../dist/kubernetes-ownership.js";
 import { createControllerRuntime } from "../dist/network-control.js";
 
-async function fixture(t, extra = {}) {
+async function fixture(t, { relist = false, ...extra } = {}) {
   const objects = new Map();
   const cleanups = [];
   const state = { requests: 0 };
@@ -236,6 +236,8 @@ async function fixture(t, extra = {}) {
     await a.close();
     await b.close();
   });
+  // Exercise the full relist and orphan scan on every reconciliation.
+  if (relist) a.needsRelist = b.needsRelist = () => true;
   return {
     a,
     b,
@@ -290,11 +292,9 @@ test("the previous release's journal imports idempotently without rewriting the 
   const { a } = await fixture(t);
   const directory = await mkdtemp(join(tmpdir(), "journal-import-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  await cp(
-    new URL("../.github/scripts/managed/fixtures/journal-v0.2.0/", import.meta.url),
-    directory,
-    { recursive: true },
-  );
+  await cp(new URL("./fixtures/journal-v0.2.0/", import.meta.url), directory, {
+    recursive: true,
+  });
   const filename = join(directory, `${id}.json`);
   const original = await readFile(filename);
   const pending = join(directory, ".pending-33333333-3333-4333-8333-333333333333");
@@ -323,11 +323,9 @@ test("corrupt and unsupported migration input preserves every source byte and pu
     const { a } = await fixture(t);
     const directory = await mkdtemp(join(tmpdir(), "journal-corrupt-"));
     t.after(() => rm(directory, { recursive: true, force: true }));
-    await cp(
-      new URL("../.github/scripts/managed/fixtures/journal-v0.2.0/", import.meta.url),
-      directory,
-      { recursive: true },
-    );
+    await cp(new URL("./fixtures/journal-v0.2.0/", import.meta.url), directory, {
+      recursive: true,
+    });
     await writeFile(join(directory, `${other}.json`), corrupt);
     const original = await readFile(join(directory, `${id}.json`));
     await assert.rejects(
@@ -759,11 +757,9 @@ test("restarting migration accepts an imported record while its previous owner L
   const { a, b } = await fixture(t);
   const directory = await mkdtemp(join(tmpdir(), "journal-restart-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  await cp(
-    new URL("../.github/scripts/managed/fixtures/journal-v0.2.0/", import.meta.url),
-    directory,
-    { recursive: true },
-  );
+  await cp(new URL("./fixtures/journal-v0.2.0/", import.meta.url), directory, {
+    recursive: true,
+  });
   await importExecutionJournal({
     directory,
     installationId: "fixture",
@@ -804,8 +800,9 @@ test("unauthenticated execution routes cannot amplify requests to Kubernetes", a
     const response = await fetch(
       `${controller.origin}/execution/${id}/${"a".repeat(64)}/${route}`,
     );
-    assert.equal(response.status, 403);
-    await response.body.cancel();
+    // An unseen Lease may be a watch lag; the agent retries instead of failing permanently.
+    assert.equal(response.status, 503);
+    assert.equal((await response.json()).error, "browser_controller_owner_moved");
   }
   const status = await new Promise((resolve, reject) => {
     const req = request(`${controller.origin}/execution/${other}/view/socket`, {
@@ -818,7 +815,7 @@ test("unauthenticated execution routes cannot amplify requests to Kubernetes", a
     req.on("error", reject);
     req.end();
   });
-  assert.equal(status, 403);
+  assert.equal(status, 503);
   assert.equal(
     state.requests,
     before,
@@ -830,11 +827,9 @@ test("completed migration cannot resurrect compacted v1 grants on a later single
   const { a } = await fixture(t, { maxFinished: 1 });
   const directory = await mkdtemp(join(tmpdir(), "migration-once-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
-  await cp(
-    new URL("../.github/scripts/managed/fixtures/journal-v0.2.0/", import.meta.url),
-    directory,
-    { recursive: true },
-  );
+  await cp(new URL("./fixtures/journal-v0.2.0/", import.meta.url), directory, {
+    recursive: true,
+  });
   const options = {
     directory,
     installationId: "fixture",
@@ -900,7 +895,7 @@ test("startup renews ownership during delayed discovery and lists workers once p
   const data = JSON.parse(
     await readFile(
       new URL(
-        "../.github/scripts/managed/fixtures/journal-v0.2.0/11111111-1111-4111-8111-111111111111.json",
+        "./fixtures/journal-v0.2.0/11111111-1111-4111-8111-111111111111.json",
         import.meta.url,
       ),
       "utf8",
@@ -1042,11 +1037,11 @@ test("slow graceful shutdown keeps renewing until it conditionally releases owne
 
 for (const deletionFails of [false, true])
   test(`post-takeover discovery rejects a late lower-epoch Pod (${deletionFails ? "retry deletion" : "normal deletion"})`, async (t) => {
-    const { a, b, ports, advance, cleanups } = await fixture(t);
+    const { a, b, ports, advance, cleanups } = await fixture(t, { relist: true });
     const data = JSON.parse(
       await readFile(
         new URL(
-          "../.github/scripts/managed/fixtures/journal-v0.2.0/11111111-1111-4111-8111-111111111111.json",
+          "./fixtures/journal-v0.2.0/11111111-1111-4111-8111-111111111111.json",
           import.meta.url,
         ),
         "utf8",
@@ -1209,7 +1204,7 @@ test("an expired legacy viewer capability cannot trigger cluster reads before au
   const data = JSON.parse(
     await readFile(
       new URL(
-        "../.github/scripts/managed/fixtures/journal-v0.2.0/11111111-1111-4111-8111-111111111111.json",
+        "./fixtures/journal-v0.2.0/11111111-1111-4111-8111-111111111111.json",
         import.meta.url,
       ),
       "utf8",
@@ -1457,11 +1452,9 @@ test("a missing migration mount does not mark the journal imported forever", asy
   };
   assert.equal(await importExecutionJournal(options), 0);
   assert.equal(await a.migrationComplete(), false);
-  await cp(
-    new URL("../.github/scripts/managed/fixtures/journal-v0.2.0/", import.meta.url),
-    directory,
-    { recursive: true },
-  );
+  await cp(new URL("./fixtures/journal-v0.2.0/", import.meta.url), directory, {
+    recursive: true,
+  });
   assert.equal(await importExecutionJournal(options), 1);
 });
 
@@ -2103,7 +2096,7 @@ test("ambiguous Secret owners fail closed and never delete the persisted record"
 });
 
 test("orphan recovery releases its binding and admission slot when ownership is lost during status", async (t) => {
-  const { a, b, ports, advance, cleanups } = await fixture(t);
+  const { a, b, ports, advance, cleanups } = await fixture(t, { relist: true });
   const entered = Promise.withResolvers(),
     resume = Promise.withResolvers();
   let workers = [],
@@ -2389,7 +2382,7 @@ test("a recreated Lease cannot inherit an old UID Secret’s record or grants wh
 });
 
 test("recovering grants report owner movement on agent HTTP, CDP and both viewer routes", async (t) => {
-  const { a, ports, cleanups } = await fixture(t);
+  const { a, ports, cleanups } = await fixture(t, { relist: true });
   const entered = Promise.withResolvers();
   const resume = Promise.withResolvers();
   const signal = AbortSignal.timeout(10000);
@@ -2571,7 +2564,78 @@ test("recovering grants report owner movement on agent HTTP, CDP and both viewer
   }
 });
 
-test("finished commands discover only Pods for their execution", async (t) => {
+test("reconciliation between relists reads only the watch cache and lists Pods once after a takeover", async (t) => {
+  const { a, b, ports, state, advance, cleanups } = await fixture(t);
+  let lists = 0;
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => {
+        lists++;
+        return [];
+      },
+      create: async () => {
+        throw Error("unexpected");
+      },
+      remove: async () => {},
+    },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  await b.resolve(id, true);
+  await a.refresh();
+  lists = 0;
+  const before = state.requests;
+  for (let i = 0; i < 3; i++) await controller.reconcile();
+  assert.equal(state.requests, before, "a cached reconciliation must not call the API");
+  assert.equal(lists, 0);
+  advance(15001);
+  await controller.reconcile();
+  assert.equal(a.owns(id), true);
+  assert.equal(lists, 1);
+  await controller.reconcile();
+  assert.equal(lists, 1, "a loaded takeover is not rediscovered");
+});
+
+test("renewal writes the cached Lease without a preceding read", async (t) => {
+  const { a, state } = await fixture(t);
+  await a.resolve(id, true);
+  const before = state.requests;
+  await a.renew();
+  assert.equal(state.requests, before + 1);
+  assert.equal(a.owns(id), true);
+});
+
+test("released and finished Leases are never forwarded to their previous peer", async (t) => {
+  const { a, b, ports, cleanups } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: { list: async () => [], remove: async () => {} },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  const probe = async (execution) => {
+    const response = await fetch(
+      `${controller.origin}/execution/${execution}/${"a".repeat(64)}/session`,
+    );
+    return [response.status, (await response.json()).error];
+  };
+  await b.resolve(id, true);
+  await b.release();
+  await a.refresh();
+  assert.deepEqual(await probe(id), [503, "browser_controller_owner_moved"]);
+  await b.resolve(other, true);
+  await b.journal.create(other, { phase: "finished" });
+  await b.complete(other);
+  await a.refresh();
+  assert.deepEqual(await probe(other), [403, "browser_access_denied"]);
+});
+
+test("commands on a released finished Lease neither take it over nor discover Pods", async (t) => {
   const { a, ports, apiServer, state, cleanups } = await fixture(t);
   const backend = await createKubernetesBackend({
     apiServer,
@@ -2598,6 +2662,7 @@ test("finished commands discover only Pods for their execution", async (t) => {
   await a.journal.create(id, { phase: "finished" });
   await a.complete(id);
   state.lists = [];
+  const before = a.lookup(id);
   for (const op of ["controller_status", "finish", "controller_status", "finish"]) {
     const result = await controller.command({ op, executionId: id });
     if (op === "controller_status") assert.equal(result.execution.phase, "finished");
@@ -2605,22 +2670,15 @@ test("finished commands discover only Pods for their execution", async (t) => {
   }
   assert.equal(
     state.lists.length,
-    4,
-    "one targeted Pod LIST per command, without Lease LISTs",
+    0,
+    "a released finished Lease is answered without takeover or discovery",
   );
-  for (const url of state.lists) {
-    assert(new URL(url, apiServer).pathname.endsWith("/pods"));
-    assert(
-      new URL(url, apiServer).searchParams
-        .get("labelSelector")
-        .split(",")
-        .includes(`browser-sandbox.io/execution=${id}`),
-    );
-  }
+  assert.deepEqual(a.lookup(id), before);
+  assert.equal(before.replica, "");
 });
 
 test("failed Profile acquisition leaves recovery retryable", async (t) => {
-  const { a, ports, cleanups } = await fixture(t);
+  const { a, ports, cleanups } = await fixture(t, { relist: true });
   let attempts = 0;
   const controller = await createController({
     ownership: {
@@ -2661,7 +2719,10 @@ test("failed Profile acquisition leaves recovery retryable", async (t) => {
 });
 
 test("Lease deletion during a takeover PUT does not stop the next recovery", async (t) => {
-  const { a, b, state, ports, cleanups } = await fixture(t, { maxFinished: 1 });
+  const { a, b, state, ports, cleanups } = await fixture(t, {
+    relist: true,
+    maxFinished: 1,
+  });
   const third = "33333333-3333-4333-8333-333333333333";
   const controller = await createController({
     ownership: b,
@@ -2740,6 +2801,7 @@ test("compaction preserves a reopened execution after its owner releases the Lea
 for (const lateWrite of [false, true])
   test(`compaction preserves an orphan with a ${lateWrite ? "pending" : "committed"} reopen during stale completion`, async (t) => {
     const { a, b, objects, state, ports, cleanups } = await fixture(t, {
+      relist: true,
       maxFinished: 1,
     });
     const listing = Promise.withResolvers();
@@ -2846,7 +2908,7 @@ for (const lateWrite of [false, true])
   });
 
 test("a vanished discovery candidate cannot release the Lease of a surviving orphan", async (t) => {
-  const { a, ports, cleanups } = await fixture(t);
+  const { a, ports, cleanups } = await fixture(t, { relist: true });
   const worker = {
     id: "survivor/pod-uid",
     executionId: id,
@@ -2932,7 +2994,7 @@ test("concurrent status requests can observe the same completed Lease", async (t
 });
 
 test("a local Profile collision preserves the current binding and allows later recovery", async (t) => {
-  const { a, ports, cleanups } = await fixture(t);
+  const { a, ports, cleanups } = await fixture(t, { relist: true });
   const controller = await createController({
     ownership: a,
     peerPort: ports[0],

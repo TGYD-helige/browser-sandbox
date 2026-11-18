@@ -92,11 +92,16 @@ export async function createKubernetesOwnership(
   >();
   const legacyCapabilities = new Map<string, string>();
   let listing: Set<string> | undefined;
+  // A watch gap can hide DELETED events; the next reconciliation relists.
+  let gap = true;
+  const isFinished = (lease: any) =>
+    lease.metadata.annotations[prefix + "phase"] === "finished";
   const ownerOf = (lease: any): ExecutionOwner => ({
     replica: lease.spec.holderIdentity,
     origin: lease.metadata.annotations[prefix + "peer"],
     epoch: Number(lease.metadata.annotations[prefix + "epoch"]),
     uid: lease.metadata.uid,
+    finished: isFinished(lease),
   });
   const clearLegacy = (id: string) => {
     for (const hash of observed.get(id)?.hashes ?? []) legacyCapabilities.delete(hash);
@@ -530,10 +535,7 @@ export async function createKubernetesOwnership(
   };
   const compact = async () => {
     const finished = [...observed.entries()]
-      .filter(
-        ([, entry]) =>
-          entry.lease.metadata.annotations[prefix + "phase"] === "finished",
-      )
+      .filter(([, entry]) => isFinished(entry.lease))
       .sort(
         (a, b) =>
           Number(a[1].lease.metadata.annotations[prefix + "finished-at"]) -
@@ -551,18 +553,34 @@ export async function createKubernetesOwnership(
     }
   };
 
+  const active = () =>
+    [...observed].filter(([, entry]) => !isFinished(entry.lease)).map(([id]) => id);
   let renewing: Promise<void>;
+  const renewLease = async (id: string, local: { epoch: number; uid: string }) => {
+    const cached = observed.get(id)?.lease;
+    if (
+      cached?.spec.holderIdentity === options.replica &&
+      cached.metadata.uid === local.uid &&
+      ownerOf(cached).epoch === local.epoch
+    )
+      try {
+        return await saveLease(cached, {}, { renewTime: renewTime() });
+      } catch (error) {
+        if (!conflict(error)) throw error;
+      }
+    // A stale cache costs one read; a real takeover still fails the conditional write.
+    return saveLease(await readOwnedLease(id), {}, { renewTime: renewTime() });
+  };
   const renew = () =>
     (renewing ??= (async () => {
       const entries = [...owned];
-      for (let start = 0; start < entries.length; start += 8)
+      for (let start = 0; start < entries.length; start += 32)
         await Promise.all(
-          entries.slice(start, start + 8).map(async ([id, local]) => {
+          entries.slice(start, start + 32).map(async ([id, local]) => {
             try {
               if (!local.ready) return;
-              const lease = await readOwnedLease(id);
               const started = now();
-              await saveLease(lease, {}, { renewTime: renewTime() });
+              await renewLease(id, local);
               if (owned.get(id) === local) local.deadline = started + leaseMs;
             } catch (error) {
               if (
@@ -585,6 +603,9 @@ export async function createKubernetesOwnership(
       const lease = observed.get(id)?.lease;
       return lease && ownerOf(lease);
     },
+    active,
+    needsRelist: () => gap,
+    leaseMetadata: (id: string) => observed.get(id)?.lease.metadata,
     resolve,
     assertOwned,
     complete,
@@ -646,6 +667,7 @@ export async function createKubernetesOwnership(
     async refresh() {
       const missing = new Set(observed.keys());
       listing = new Set<string>();
+      gap = false;
       try {
         const version = leaseVersion;
         let listedVersion = version;
@@ -666,16 +688,14 @@ export async function createKubernetesOwnership(
         }
         for (const id of missing) if (!listing.has(id)) evict(id);
         if (leaseVersion === version) leaseVersion = listedVersion;
+      } catch (error) {
+        gap = true;
+        throw error;
       } finally {
         listing = undefined;
       }
       await compact();
-      return [...observed]
-        .filter(
-          ([, entry]) =>
-            entry.lease.metadata.annotations[prefix + "phase"] !== "finished",
-        )
-        .map(([id]) => id);
+      return active();
     },
     renew,
     watch() {
@@ -690,6 +710,7 @@ export async function createKubernetesOwnership(
               (event) => {
                 if (event.type === "ERROR") {
                   leaseVersion = "";
+                  gap = true;
                   throw Error("browser_kubernetes_watch_expired");
                 }
                 leaseVersion = event.object?.metadata?.resourceVersion ?? leaseVersion;
@@ -701,7 +722,11 @@ export async function createKubernetesOwnership(
                 }
               },
             );
-          } catch {
+          } catch (error) {
+            if (error instanceof KubernetesError && error.status === 410) {
+              leaseVersion = "";
+              gap = true;
+            }
             if (!life.signal.aborted)
               await delay(250, undefined, { signal: life.signal }).catch(() => {});
           }

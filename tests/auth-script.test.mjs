@@ -50,6 +50,7 @@ async function fixture(t, respond) {
   const endpoint = `ws://127.0.0.1:${server.address().port}/execution/${"a".repeat(64)}`;
   return {
     calls,
+    endpoint,
     run(input = spec, url = endpoint) {
       const running = exec(
         process.execPath,
@@ -79,6 +80,14 @@ test("the copied skill runs through a symlink without SDK dependencies and emits
   assert.deepEqual(f.calls, [
     { path: `/execution/${"a".repeat(64)}/auth`, body: spec },
   ]);
+});
+
+test("the script accepts execution-scoped multi-controller endpoints", async (t) => {
+  const f = await fixture(t, (res) => res.end(JSON.stringify(result)));
+  const scoped = `/execution/11111111-1111-4111-8111-111111111111/${"a".repeat(64)}`;
+  const output = await f.run(spec, f.endpoint.replace(/\/execution\/.*/, scoped));
+  assert.deepEqual(JSON.parse(output.stdout), result);
+  assert.deepEqual(f.calls, [{ path: `${scoped}/auth`, body: spec }]);
 });
 
 test("the script rejects malformed, oversized, and credential-bearing requests before forwarding", async (t) => {
