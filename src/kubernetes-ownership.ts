@@ -690,7 +690,8 @@ export async function createKubernetesOwnership(
           listedVersion = page.metadata?.resourceVersion ?? listedVersion;
         }
         for (const id of missing) if (!listing.has(id)) evict(id);
-        if (leaseVersion === version) leaseVersion = listedVersion;
+        // After expiry the watched version is unusable; take the listed snapshot instead.
+        if (leaseVersion === version || expired) leaseVersion = listedVersion;
         expired = false;
       } catch (error) {
         gap = true;
