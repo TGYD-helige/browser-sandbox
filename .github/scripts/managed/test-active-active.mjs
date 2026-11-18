@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { test } from "node:test";
+import WebSocket from "ws";
+import { connectCdp } from "../../../dist/cdp.js";
 import { sessionRequest } from "../../../dist/session.js";
 import {
   assertFencedOwner,
+  observeCdpHandshake,
   observeSingleRemoval,
   readVerifiedStatus,
   summarizeFailover,
+  verifyAfterRollout,
 } from "./active-active-checks.mjs";
 
 test("resumed controller evidence requires its own fencing report and excludes worker removal events", () => {
@@ -176,4 +180,96 @@ test("steady-state verification never reconnects even for retryable transport or
     );
     assert.equal(reads, 1);
   }
+});
+
+test("post-rollout CDP verification waits for recovered ownership on the new ReplicaSet", async () => {
+  const owner = (rs, uid = "owner") => ({
+    lease: { metadata: { uid: "lease" }, spec: { holderIdentity: uid } },
+    pod: {
+      metadata: {
+        uid,
+        ownerReferences: [{ kind: "ReplicaSet", uid: rs, controller: true }],
+      },
+    },
+  });
+  // Synthetic rollout states include a second handoff while the first new owner answers status.
+  const snapshots = [
+    owner("old"),
+    {},
+    owner("new"),
+    owner("new"),
+    owner("new", "next-owner"),
+    owner("new", "next-owner"),
+    owner("new", "next-owner"),
+  ];
+  const readOwner = () => {
+    assert(snapshots.length > 0, "owner readiness probe did not converge");
+    return snapshots.shift();
+  };
+  const probed = [];
+  let verified = 0;
+  await verifyAfterRollout(
+    async (_description, read, ready) => {
+      while (!ready(await read())) {}
+    },
+    readOwner,
+    "new",
+    async (pod) => {
+      probed.push(pod.metadata.uid);
+      return { execution: { phase: probed.length === 1 ? "absent" : "active" } };
+    },
+    async () => {
+      assert.deepEqual(probed, ["owner", "owner", "next-owner"]);
+      assert.equal(snapshots.length, 0);
+      verified++;
+    },
+  );
+  assert.equal(verified, 1);
+});
+
+test("CDP handshake diagnostics retain sanitized HTTP responses and transport errors", async (t) => {
+  const server = createServer((req, res) => {
+    const status = Number(req.url.slice(1));
+    res.writeHead(status).end(
+      status === 502
+        ? "private upstream details"
+        : JSON.stringify({
+            error:
+              status === 503
+                ? "browser_controller_owner_moved"
+                : "browser_access_denied",
+            capability: "must-not-log",
+          }),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => {
+    server.closeAllConnections();
+    return new Promise((resolve) => server.close(resolve));
+  });
+  const origin = `ws://127.0.0.1:${server.address().port}`;
+  let diagnostic;
+  class DiagnosticWebSocket extends WebSocket {
+    constructor(...args) {
+      super(...args);
+      diagnostic = observeCdpHandshake(this);
+    }
+  }
+  for (const [status, body] of [
+    [503, { error: "browser_controller_owner_moved" }],
+    [403, { error: "browser_access_denied" }],
+    [502, null],
+  ]) {
+    await assert.rejects(
+      connectCdp(`${origin}/${status}`, AbortSignal.timeout(5000), DiagnosticWebSocket),
+      /browser_cdp_connect_failed/,
+    );
+    assert.deepEqual(diagnostic, { status, body });
+  }
+  await new Promise((resolve) => server.close(resolve));
+  await assert.rejects(
+    connectCdp(origin, AbortSignal.timeout(5000), DiagnosticWebSocket),
+    /browser_cdp_connect_failed/,
+  );
+  assert.deepEqual(diagnostic, { code: "ECONNREFUSED" });
 });

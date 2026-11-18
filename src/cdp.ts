@@ -1,8 +1,12 @@
 import WebSocket from "ws";
 
 /** A bounded private CDP connection, independent of any harness package. */
-export async function connectCdp(endpoint: string, signal?: AbortSignal) {
-  const socket = new WebSocket(endpoint, {
+export async function connectCdp(
+  endpoint: string,
+  signal?: AbortSignal,
+  Socket = WebSocket,
+) {
+  const socket = new Socket(endpoint, {
     maxPayload: 32 * 1024 * 1024,
     handshakeTimeout: 30_000,
   });

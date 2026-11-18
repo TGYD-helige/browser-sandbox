@@ -11,7 +11,7 @@ import {
   forwardControllerRequest,
   forwardControllerViewer,
 } from "./controller-forwarding.js";
-import { createExecutionJournal, type ExecutionRecord } from "./execution-journal.js";
+import { createExecutionJournal } from "./execution-journal.js";
 import { MAX_FILE_BYTES } from "./files.js";
 import type { StorageAdapter } from "./host-client.js";
 import { WorkerCleanupFailure } from "./lifecycle-errors.js";
@@ -1747,38 +1747,58 @@ export async function createController(options: ControllerOptions) {
     if (profileLeases.get(binding.profileId) === binding)
       profileLeases.delete(binding.profileId);
   }
-  const loading = new Map<string, Promise<void>>();
-  function loadOwned(id: string, workers?: ManagedWorker[]): Promise<void> {
-    if (bindings.has(id) || (finished.has(id) && !ownership)) return Promise.resolve();
-    let pending = loading.get(id);
-    if (!pending) {
-      pending = (async () => {
-        await ownership.assertOwned(id);
-        const record = await ownership.journal.read(id);
-        if (record?.data.phase === "finished") {
-          await ownership.complete(id);
-          rememberFinished(id);
-          return;
-        }
-        finished.delete(id);
-        if (!record) return;
-        if (Array.isArray(record.data.grants) && record.data.grants.length)
-          await ownership.indexLegacy(record);
-        const discovered =
-          workers ?? (await options.backend.list(AbortSignal.timeout(30000)));
-        try {
+  function loadOwned(
+    id: string,
+    workers?: ManagedWorker[],
+    orphan?: ManagedWorker | null,
+  ) {
+    if (bindings.has(id)) return Promise.resolve();
+    const requested = ownership.lookup(id);
+    return serializeExecution(id, async () => {
+      if (bindings.has(id)) return;
+      const current = ownership.lookup(id);
+      if (
+        finished.has(id) &&
+        current &&
+        !current.replica &&
+        current.uid === requested?.uid &&
+        current.epoch === requested.epoch
+      )
+        return;
+      await ownership.assertOwned(id);
+      const record = await journal.read(id);
+      if (record?.data.phase !== "finished") finished.delete(id);
+      if (!record && orphan === undefined) return;
+      const discovered =
+        workers ?? (await options.backend.list(AbortSignal.timeout(30000)));
+      try {
+        if (record && record.data.phase !== "finished") {
+          if (Array.isArray(record.data.grants) && record.data.grants.length)
+            await ownership.indexLegacy(record);
           await restoreRecord(
             record,
             discovered,
             new Map(discovered.map((worker) => [worker.id, worker])),
           );
-        } finally {
-          if (!workers) closeUnusedDiscovery(discovered);
+          return;
         }
-      })().finally(() => loading.delete(id));
-      loading.set(id, pending);
-    }
-    return pending;
+        // A finished record can still have a live orphan. Recover it before releasing the Lease.
+        const liveOrphan =
+          orphan === undefined
+            ? discovered.find((worker) => worker.executionId === id)
+            : orphan;
+        if (liveOrphan) {
+          finished.delete(id);
+          await restoreOrphan(liveOrphan, record?.revision ?? 0);
+        } else {
+          if (!record) await journal.create(id, { phase: "finished" });
+          await ownership.complete(id);
+          rememberFinished(id);
+        }
+      } finally {
+        if (!workers) closeUnusedDiscovery(discovered);
+      }
+    });
   }
   const staleCreation = (worker: ManagedWorker) =>
     ownership &&
@@ -1794,7 +1814,7 @@ export async function createController(options: ControllerOptions) {
     const ids = await ownership.refresh();
     for (const id of ids) await ownership.resolve(id);
     const discovered = await options.backend.list(AbortSignal.timeout(30000));
-    const candidates: { worker: ManagedWorker; record?: ExecutionRecord }[] = [];
+    const candidates = new Set<string>();
     try {
       for (const id of ids) if (ownership.owns(id)) await loadOwned(id, discovered);
       for (const worker of discovered) {
@@ -1805,32 +1825,18 @@ export async function createController(options: ControllerOptions) {
           continue;
         }
         await ownership.resolve(worker.executionId, true);
-        if (!ownership.owns(worker.executionId)) continue;
-        const record = await journal.read(worker.executionId);
-        candidates.push({ worker, record });
+        if (ownership.owns(worker.executionId)) candidates.add(worker.executionId);
       }
-      if (candidates.length) {
+      if (candidates.size) {
         // Resolve every orphan first; all revalidation must follow its ownership handoff.
         const current = await options.backend.list(AbortSignal.timeout(30000));
         try {
-          const workers = new Map(current.map((worker) => [worker.id, worker]));
-          for (const { worker, record } of candidates) {
-            const remaining = workers.get(worker.id);
-            if (record?.data.phase === "finished") {
-              if (remaining) await restoreOrphan(remaining, record.revision);
-              else await ownership.complete(worker.executionId);
-              continue;
-            }
-            await loadOwned(worker.executionId, current);
-            if (!ownership.owns(worker.executionId) || bindings.has(worker.executionId))
-              continue;
-            if (remaining) await restoreOrphan(remaining, record?.revision ?? 0);
-            else if (!record) {
-              await journal.create(worker.executionId, { phase: "finished" });
-              await ownership.complete(worker.executionId);
-              rememberFinished(worker.executionId);
-            }
-          }
+          const byExecution = new Map(
+            current.map((worker) => [worker.executionId, worker]),
+          );
+          for (const id of candidates)
+            if (ownership.owns(id))
+              await loadOwned(id, current, byExecution.get(id) ?? null);
         } finally {
           closeUnusedDiscovery(current);
         }

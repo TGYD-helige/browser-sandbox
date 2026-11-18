@@ -37,6 +37,75 @@ export function summarizeFailover(values) {
   };
 }
 
+export async function verifyAfterRollout(
+  wait,
+  readOwner,
+  replicaSetUid,
+  readStatus,
+  verify,
+) {
+  await wait(
+    "The new ReplicaSet did not establish a recovered execution owner",
+    async () => {
+      const { pod, lease } = await readOwner();
+      if (
+        !pod?.metadata.ownerReferences?.some(
+          (ref) =>
+            ref.kind === "ReplicaSet" && ref.controller && ref.uid === replicaSetUid,
+        )
+      )
+        return false;
+      const status = await readStatus(pod).catch(() => undefined);
+      if (status?.execution?.phase !== "active") return false;
+      const current = await readOwner();
+      return (
+        current.pod?.metadata.uid === pod.metadata.uid &&
+        current.lease.metadata.uid === lease.metadata.uid &&
+        current.lease.metadata.annotations?.["browser-sandbox.io/epoch"] ===
+          lease.metadata.annotations?.["browser-sandbox.io/epoch"]
+      );
+    },
+    Boolean,
+    45000,
+  );
+  return verify();
+}
+
+export function observeCdpHandshake(socket) {
+  const diagnostic = {};
+  socket.once("error", ({ code }) => {
+    if (/^[A-Z0-9_]{1,48}$/.test(code ?? "")) diagnostic.code = code;
+  });
+  socket.once("unexpected-response", (_request, response) => {
+    diagnostic.status = response.statusCode;
+    // Keep only a bounded controller error body. Proxies may echo credentials or URLs.
+    const bytes = Buffer.alloc(512);
+    let length = 0;
+    const finish = () => {
+      if ("body" in diagnostic) return;
+      clearTimeout(deadline);
+      let error;
+      try {
+        error = JSON.parse(bytes.toString("utf8", 0, length))?.error;
+      } catch {}
+      diagnostic.body =
+        typeof error === "string" && /^browser_[a-z_]{1,100}$/.test(error)
+          ? { error }
+          : null;
+      socket.terminate();
+    };
+    const deadline = setTimeout(finish, 1000).unref();
+    response.on("data", (chunk) => {
+      length += chunk.copy(bytes, length, 0, bytes.length - length);
+      if (length === bytes.length) finish();
+    });
+    response.once("end", finish);
+    response.once("error", finish);
+    response.once("close", finish);
+  });
+  return diagnostic;
+}
+
 // Rollout can close a Service-selected replica after CDP checks but before status.
 export async function readVerifiedStatus(action, read, signal) {
   if (action !== "verify-rollout") return read(signal);

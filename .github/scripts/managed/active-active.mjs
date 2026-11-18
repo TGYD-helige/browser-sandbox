@@ -7,6 +7,7 @@ import {
   assertFencedOwner,
   observeSingleRemoval,
   summarizeFailover,
+  verifyAfterRollout,
 } from "./active-active-checks.mjs";
 
 /** Runs inside the existing native-architecture k3d job and uses its isolated kubeconfig. */
@@ -243,7 +244,10 @@ export async function activeActive({
     );
     return { closed: live };
   }
-  const report = { architecture: process.arch };
+  const report = {
+    architecture: process.arch,
+    githubSha: process.env.GITHUB_SHA ?? null,
+  };
   const controllerProcess = async (pod) => {
     const id = pod.status.containerStatuses[0].containerID.replace(
       /^containerd:\/\//,
@@ -664,7 +668,48 @@ export async function activeActive({
     };
     await rolling;
     await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=180s");
-    await client("verify", id);
+    stage = "post-rollout CDP verification";
+    const rolled = JSON.parse(
+      await kubectl("get", "deployment", deployment, "-o", "json"),
+    );
+    const revision = "deployment.kubernetes.io/revision";
+    const replicaSet = JSON.parse(
+      await kubectl(
+        "get",
+        "replicasets",
+        "-l",
+        `app.kubernetes.io/instance=${release},app.kubernetes.io/component=controller`,
+        "-o",
+        "json",
+      ),
+    ).items.find(
+      (item) =>
+        item.metadata.annotations?.[revision] ===
+          rolled.metadata.annotations[revision] &&
+        item.metadata.ownerReferences?.some(
+          (ref) => ref.controller && ref.uid === rolled.metadata.uid,
+        ),
+    );
+    assert(replicaSet?.metadata.uid, "Rolled Deployment ReplicaSet not found");
+    await verifyAfterRollout(
+      wait,
+      () => owner(id),
+      replicaSet.metadata.uid,
+      async (pod) =>
+        JSON.parse(
+          await kubectl(
+            "exec",
+            pod.metadata.name,
+            "--",
+            "node",
+            "--input-type=module",
+            "-e",
+            `import{createControllerRuntime,sessionRequest}from'/opt/browser-sandbox/dist/index.js';const runtime=createControllerRuntime('http://127.0.0.1:8084');const signal=AbortSignal.timeout(5000);try{const status=await runtime.request({op:'controller_status',executionId:'${id}'},{signal});if(status.execution?.phase==='active')await sessionRequest('ws://127.0.0.1:8084${prepared.path}','status',undefined,signal);console.log(JSON.stringify(status))}finally{runtime.close()}`,
+          ),
+        ),
+      () => client("verify", id),
+    );
+    report.postRolloutVerifiedReadyOwner = true;
     assert.equal(
       (await list("worker")).find(
         (pod) => pod.metadata.labels[prefix + "execution"] === id,
@@ -944,7 +989,7 @@ export async function activeActive({
     );
     return report;
   } catch (error) {
-    const diagnostic = { stage, controllers: [] };
+    const diagnostic = { stage, githubSha: report.githubSha, controllers: [] };
     for (const pod of await list("controller").catch(() => [])) {
       const logs = await kubectl("logs", pod.metadata.name, "--tail=50").catch(
         () => "",

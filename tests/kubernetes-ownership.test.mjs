@@ -2499,6 +2499,200 @@ test("compaction preserves a reopened execution after its owner releases the Lea
   assert.equal(await b.journal.read(other), undefined);
 });
 
+for (const lateWrite of [false, true])
+  test(`compaction preserves an orphan with a ${lateWrite ? "pending" : "committed"} reopen during stale completion`, async (t) => {
+    const { a, b, objects, state, ports, cleanups } = await fixture(t, {
+      maxFinished: 1,
+    });
+    const listing = Promise.withResolvers();
+    const resumeListing = Promise.withResolvers();
+    const contender = Promise.withResolvers();
+    const resumeComplete = Promise.withResolvers();
+    const reopening = Promise.withResolvers();
+    const resumeReopen = Promise.withResolvers();
+    const signal = AbortSignal.timeout(5000);
+    const worker = {
+      id: "orphan/pod-uid",
+      executionId: id,
+      incarnation: other,
+      runtime: {
+        request: async () => {
+          throw Error("browser_worker_protocol_unsupported");
+        },
+        close() {},
+      },
+    };
+    let lists = 0;
+    const controller = await createController({
+      ownership: a,
+      peerPort: ports[0],
+      port: 0,
+      reconciliationMs: 60000,
+      backend: {
+        async list() {
+          if (++lists === 1) return [];
+          if (lists === 3) {
+            listing.resolve();
+            await resumeListing.promise;
+          }
+          return [worker];
+        },
+        remove: async () => assert.fail("orphan worker must be retained"),
+      },
+    });
+    let recovery, status;
+    cleanups.unshift(async () => {
+      resumeListing.resolve();
+      resumeComplete.resolve();
+      resumeReopen.resolve();
+      await Promise.allSettled([recovery, status]);
+      await controller.stop({ finalize: false });
+    });
+    await a.resolve(id, true);
+    await a.journal.create(id, { phase: "finished" });
+    await a.complete(id);
+    const [leasePath, lease] = [...objects].find(
+      ([path]) => path.includes("/leases/") && path.endsWith(id),
+    );
+    const podPath = "/api/v1/namespaces/test/pods/orphan";
+    objects.set(podPath, {
+      kind: "Pod",
+      metadata: {
+        uid: "pod-uid",
+        ownerReferences: [
+          { kind: "Lease", name: lease.metadata.name, uid: lease.metadata.uid },
+        ],
+      },
+    });
+    let completing = false;
+    state.beforeWrite = async (path, body) => {
+      if (path === leasePath && body.spec?.holderIdentity === "") {
+        completing = true;
+        contender.resolve();
+        await resumeComplete.promise;
+      }
+      if (!path.includes("/secrets/") || !path.endsWith(id)) return;
+      const data = JSON.parse(
+        Buffer.from(body.data.record, "base64").toString(),
+      ).record;
+      if (data?.revision !== 2 || data.data.phase !== "recovery-required") return;
+      contender.resolve();
+      reopening.resolve();
+      await resumeReopen.promise;
+    };
+    recovery = controller.reconcile();
+    recovery.catch(() => {});
+    await waitForControl(listing.promise, signal);
+    status = controller.command({ op: "controller_status", executionId: id });
+    status.catch(() => {});
+    await waitForControl(contender.promise, signal);
+    resumeListing.resolve();
+    await waitForControl(reopening.promise, signal);
+    if (!lateWrite) {
+      resumeReopen.resolve();
+      await waitForControl(recovery, signal);
+      assert.equal((await a.journal.read(id)).data.phase, "recovery-required");
+    }
+    resumeComplete.resolve();
+    if (completing) await waitForControl(status, signal);
+
+    await b.resolve(other, true);
+    await b.journal.create(other, { phase: "finished" });
+    await b.complete(other);
+    await b.refresh();
+    assert.equal(objects.get(leasePath)?.metadata.uid, lease.metadata.uid);
+    assert.equal(objects.get(podPath)?.metadata.uid, "pod-uid");
+    resumeReopen.resolve();
+    await waitForControl(Promise.all([recovery, status]), signal);
+    assert.equal((await b.journal.read(id))?.data.phase, "recovery-required");
+  });
+
+test("a vanished discovery candidate cannot release the Lease of a surviving orphan", async (t) => {
+  const { a, ports, cleanups } = await fixture(t);
+  const worker = {
+    id: "survivor/pod-uid",
+    executionId: id,
+    incarnation: other,
+    runtime: {
+      request: async () => {
+        throw Error("browser_worker_protocol_unsupported");
+      },
+      close() {},
+    },
+  };
+  let lists = 0;
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      async list() {
+        if (++lists === 1) return [];
+        return lists === 2 ? [{ ...worker, id: "gone/old-pod-uid" }, worker] : [worker];
+      },
+      remove: async () => assert.fail("surviving orphan must be retained"),
+    },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "finished" });
+  await a.complete(id);
+  await controller.reconcile();
+  assert.equal(a.owns(id), true);
+  assert.equal(controller.bindings.get(id)?.worker?.id, worker.id);
+  assert.equal((await a.journal.read(id))?.data.phase, "recovery-required");
+});
+
+test("concurrent status requests can observe the same completed Lease", async (t) => {
+  const { a, state, ports, cleanups } = await fixture(t);
+  const contender = Promise.withResolvers();
+  let requests = 0;
+  const controller = await createController({
+    ownership: {
+      ...a,
+      async resolve(executionId, create) {
+        const owner = await a.resolve(executionId, create);
+        if (++requests === 2) contender.resolve();
+        return owner;
+      },
+    },
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: { list: async () => [], remove: async () => {} },
+  });
+  const started = Promise.withResolvers(),
+    resume = Promise.withResolvers();
+  let first, second;
+  cleanups.unshift(async () => {
+    resume.resolve();
+    await Promise.allSettled([first, second]);
+    await controller.stop({ finalize: false });
+  });
+  await a.resolve(id, true);
+  await a.journal.create(id, { phase: "finished" });
+  state.beforeWrite = async (path, body) => {
+    if (!path.includes("/leases/") || body.spec?.holderIdentity !== "") return;
+    started.resolve();
+    await resume.promise;
+  };
+  const request = { op: "controller_status", executionId: id };
+  const signal = AbortSignal.timeout(5000);
+  first = controller.command(request);
+  first.catch(() => {});
+  await waitForControl(started.promise, signal);
+  second = controller.command(request);
+  second.catch(() => {});
+  await waitForControl(contender.promise, signal);
+  resume.resolve();
+  const statuses = await waitForControl(Promise.all([first, second]), signal);
+  assert.deepEqual(
+    statuses.map((status) => status.execution.phase),
+    ["finished", "finished"],
+  );
+});
+
 test("a local Profile collision preserves the current binding and allows later recovery", async (t) => {
   const { a, ports, cleanups } = await fixture(t);
   const controller = await createController({

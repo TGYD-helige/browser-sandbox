@@ -232,6 +232,7 @@ async function fixture(
       response.writeHead(404).end("{}");
     } else {
       state.podReads++;
+      await state.beforePodRead?.();
       response.end(
         JSON.stringify({
           ...state.pod,
@@ -686,4 +687,45 @@ test("shared discovery lists execution Leases once for multiple Pods", async (t)
   await backend.fence(worker, 1, signal, true);
   await backend.remove(worker, signal);
   assert.equal(state.leaseLists, 1);
+});
+
+test("a fenced controller cannot successfully fence a missing Pod", async (t) => {
+  const { backend, state } = await fixture(t, {
+    ownership: {
+      assertOwned: async () => {
+        throw Error("browser_controller_fenced");
+      },
+    },
+  });
+  await assert.rejects(
+    backend.fence(
+      { id: "missing/old-pod-uid", executionId, incarnation },
+      1,
+      AbortSignal.timeout(5000),
+    ),
+    /browser_controller_fenced/,
+  );
+  assert.equal(state.podReads, 0);
+});
+
+test("fencing rechecks ownership after a delayed Pod read", async (t) => {
+  let moved = false;
+  const { backend, state } = await fixture(t, {
+    ownership: {
+      async assertOwned() {
+        if (moved) throw Error("browser_controller_fenced");
+        return { epoch: 1, uid: "execution-uid", name: "execution-lease" };
+      },
+    },
+  });
+  const signal = AbortSignal.timeout(5000);
+  const worker = await backend.create({ executionId, incarnation }, signal);
+  t.after(() => worker.runtime.close());
+  state.beforePodRead = () => {
+    moved = true;
+  };
+  await assert.rejects(
+    backend.fence(worker, 1, signal, true),
+    /browser_controller_fenced/,
+  );
 });

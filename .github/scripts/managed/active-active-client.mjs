@@ -9,7 +9,7 @@ const { createControllerRuntime, sessionRequest } = await import(
   `${root}/dist/index.js`
 );
 const { connectCdp } = await import(`${root}/dist/cdp.js`);
-const { readVerifiedStatus } = await import(
+const { observeCdpHandshake, readVerifiedStatus } = await import(
   `${root}/.github/scripts/managed/active-active-checks.mjs`
 );
 const require = createRequire(`${root}/package.json`);
@@ -65,6 +65,13 @@ const adapter = {
 };
 let cdp;
 let storage;
+let handshake;
+class DiagnosticWebSocket extends WebSocket {
+  constructor(...args) {
+    super(...args);
+    handshake = observeCdpHandshake(this);
+  }
+}
 try {
   if (action === "register" || action === "profile-contend") {
     const request = {
@@ -115,7 +122,7 @@ try {
     const destination = new URL(process.env.TEST_AGENT_ORIGIN);
     url.host = destination.host;
     url.protocol = destination.protocol === "https:" ? "wss:" : "ws:";
-    cdp = await connectCdp(url.href);
+    cdp = await connectCdp(url.href, undefined, DiagnosticWebSocket);
     await cdp.call("Browser.getVersion");
     if (action === "prepare" || action === "restore") {
       if (action === "restore") {
@@ -279,6 +286,7 @@ try {
   console.error(
     JSON.stringify({
       action,
+      handshake,
       codes: String(error).match(/browser_[a-z_]+/g) ?? [],
       message: String(error.message)
         .replace(/(?:https?|wss?):\/\/[^\s]+/g, "<url>")

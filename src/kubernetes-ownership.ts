@@ -92,7 +92,6 @@ export async function createKubernetesOwnership(
   >();
   const legacyCapabilities = new Map<string, string>();
   let listing: Set<string> | undefined;
-  const changed = (id: string) => listing?.add(id);
   const ownerOf = (lease: any): ExecutionOwner => ({
     replica: lease.spec.holderIdentity,
     origin: lease.metadata.annotations[prefix + "peer"],
@@ -132,7 +131,7 @@ export async function createKubernetesOwnership(
   };
   const evict = (id: string, uid?: string) => {
     if (uid && observed.has(id) && observed.get(id).lease.metadata.uid !== uid) return;
-    changed(id);
+    listing?.add(id);
     clearLegacy(id);
     observed.delete(id);
     forget(id);
@@ -185,7 +184,7 @@ export async function createKubernetesOwnership(
       throw Error("browser_execution_capacity_exceeded");
     clearLegacy(id);
     for (const hash of next) legacyCapabilities.set(hash, id);
-    changed(id);
+    listing?.add(id);
     observed.set(id, { lease, changedAt: now(), hashes: next });
     if (
       owned.has(id) &&
@@ -196,14 +195,10 @@ export async function createKubernetesOwnership(
       forget(id);
     return ownerOf(lease);
   };
-  const get = async (path: string) => {
-    try {
-      return await api(path, "GET", undefined, signal());
-    } catch (error) {
-      if (absent(error)) return;
-      throw error;
-    }
-  };
+  const get = (path: string) =>
+    api(path, "GET", undefined, signal()).catch((error) => {
+      if (!absent(error)) throw error;
+    });
   const readOwnedLease = async (id: string) => {
     const local = owned.get(id);
     const lease =
@@ -544,10 +539,7 @@ export async function createKubernetesOwnership(
           Number(a[1].lease.metadata.annotations[prefix + "finished-at"]) -
           Number(b[1].lease.metadata.annotations[prefix + "finished-at"]),
       );
-    for (const [id, { lease }] of finished.slice(
-      0,
-      Math.max(0, finished.length - maxFinished),
-    )) {
+    for (const [id, { lease }] of finished.slice(0, -maxFinished)) {
       if (lease.spec.holderIdentity) continue;
       try {
         // Recovery must change this Lease before changing its record.

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   createKubernetesClient,
+  listKubernetesPages,
   readKubernetesAccess,
 } from "../dist/kubernetes-api.js";
 
@@ -24,4 +25,20 @@ test("missing in-cluster API host fails clearly before reading credentials or co
     }),
     "function",
   );
+});
+
+test("empty Kubernetes pages with continuations count towards the page limit", async () => {
+  let requests = 0;
+  await assert.rejects(async () => {
+    for await (const _page of listKubernetesPages(
+      async () => ({ items: [], metadata: { continue: String(++requests) } }),
+      "/leases",
+      "execution",
+      AbortSignal.timeout(5000),
+      300,
+      "too_many_pages",
+    )) {
+    }
+  }, /too_many_pages/);
+  assert.equal(requests, 4);
 });

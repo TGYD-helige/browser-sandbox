@@ -214,6 +214,7 @@ export async function* listKubernetesPages(
   let cursor = "",
     count = 0;
   do {
+    if (cursors.size > Math.ceil(maxItems / 100)) throw Error(error);
     const page = await api(
       `${path}?labelSelector=${selector}&limit=100&continue=${encodeURIComponent(cursor)}`,
       "GET",
@@ -227,7 +228,6 @@ export async function* listKubernetesPages(
       (count += page.items.length) > maxItems ||
       typeof cursor !== "string" ||
       cursor.length > 8192 ||
-      cursors.size >= maxItems ||
       cursors.has(cursor)
     )
       throw Error(error);
@@ -254,7 +254,10 @@ export function workerOwnerCheck(
       131072,
       "browser_worker_discovery_failed",
     )) {
-      for (const { metadata } of items) index.set(metadata.name, metadata);
+      for (const { metadata } of items) {
+        const { name, uid, labels, ownerReferences } = metadata;
+        index.set(name, { uid, labels, ownerReferences });
+      }
     }
     return index;
   }
@@ -271,7 +274,6 @@ export function workerOwnerCheck(
     if (lease?.uid !== ref.uid) return false;
     if (
       !hasKubernetesOwner({ metadata: lease }, parent) ||
-      lease.labels?.["browser-sandbox.io/installation"] !== options.installation ||
       lease.labels?.["browser-sandbox.io/state"] !== "execution" ||
       lease.labels?.["browser-sandbox.io/execution"] !==
         pod.metadata.labels?.["browser-sandbox.io/execution"]
