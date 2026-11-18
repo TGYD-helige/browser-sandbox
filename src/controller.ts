@@ -8,6 +8,7 @@ import WebSocket, { createWebSocketStream, WebSocketServer } from "ws";
 import { waitForControl } from "./automation-control.js";
 import {
   createHostForwarding,
+  executionRequestTimeout,
   forwardControllerRequest,
   forwardControllerViewer,
 } from "./controller-forwarding.js";
@@ -381,7 +382,7 @@ export async function createController(options: ControllerOptions) {
       const signal = AbortSignal.any([
         life.signal,
         grant.life.signal,
-        AbortSignal.timeout(match[2] === "/auth" ? 620000 : 180000),
+        AbortSignal.timeout(executionRequestTimeout(match[2] === "/auth")),
       ]);
       if (match[2] === "/session") {
         if (!["GET", "POST"].includes(req.method)) {
@@ -1821,16 +1822,27 @@ export async function createController(options: ControllerOptions) {
       if (!held && ownership.owns(id)) takenOver.add(id);
     }
     for (const id of takenOver) if (!ownership.owns(id)) takenOver.delete(id);
-    if (!relist && !takenOver.size) return;
+    if (!relist && !takenOver.size) return undefined;
+    // One unrecoverable execution must not stall the others; it fails closed until a later retry.
+    let failure: unknown;
+    const load = async (
+      id: string,
+      workers: ManagedWorker[],
+      orphan?: ManagedWorker | null,
+    ) => {
+      try {
+        await loadOwned(id, workers, orphan);
+        takenOver.delete(id);
+      } catch (error) {
+        failure ??= error;
+      }
+    };
     const discovered = await options.backend.list(AbortSignal.timeout(30000));
     const candidates = new Set<string>();
     try {
       for (const id of relist ? ids : [...takenOver])
-        if (ownership.owns(id)) {
-          await loadOwned(id, discovered);
-          takenOver.delete(id);
-        }
-      if (!relist) return;
+        if (ownership.owns(id)) await load(id, discovered);
+      if (!relist) return failure;
       for (const worker of discovered) {
         const binding = bindings.get(worker.executionId);
         if (binding) {
@@ -1850,7 +1862,7 @@ export async function createController(options: ControllerOptions) {
           );
           for (const id of candidates)
             if (ownership.owns(id))
-              await loadOwned(id, current, byExecution.get(id) ?? null);
+              await load(id, current, byExecution.get(id) ?? null);
         } finally {
           closeUnusedDiscovery(current);
         }
@@ -1858,6 +1870,7 @@ export async function createController(options: ControllerOptions) {
     } finally {
       closeUnusedDiscovery(discovered);
     }
+    return failure;
   }
   function assertAgentReady(id: string) {
     if (restoring.has(id) || (!bindings.has(id) && !finished.has(id)))
@@ -1944,7 +1957,8 @@ export async function createController(options: ControllerOptions) {
     if (ownership) {
       journal = ownership.journal;
       ownership.onLost(dropOwned);
-      await refreshOwnership();
+      const failure = await refreshOwnership();
+      if (failure) throw failure;
       void ownership.watch();
     } else if (options.stateDirectory) {
       if (!options.backend.list) throw Error("browser_worker_discovery_unavailable");
@@ -1975,7 +1989,7 @@ export async function createController(options: ControllerOptions) {
   function reconcile(): Promise<void> {
     const run = async () => {
       if (closing) return;
-      if (ownership) await refreshOwnership();
+      const ownershipFailure = ownership ? await refreshOwnership() : undefined;
       const currentBindings = [...bindings.values()];
       const recoveryIncarnations = new Map<ExecutionBinding, string>();
       for (const binding of currentBindings)
@@ -2180,6 +2194,7 @@ export async function createController(options: ControllerOptions) {
       } finally {
         if (discovered) closeUnusedDiscovery(discovered);
       }
+      if (ownershipFailure) throw ownershipFailure;
     };
     reconciliation = reconciliation.then(run, run);
     return reconciliation;

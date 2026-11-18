@@ -109,6 +109,7 @@ export async function createKubernetesOwnership(
   const life = new AbortController();
   let watching: Promise<void>;
   let leaseVersion = "";
+  let expired = false;
   let lost: (id: string) => void = () => {};
   const signal = () => AbortSignal.any([life.signal, AbortSignal.timeout(15000)]);
   const verify = (object: any, expectedName: string, state = "execution") => {
@@ -527,6 +528,8 @@ export async function createKubernetesOwnership(
       lease,
       {
         [prefix + "phase"]: "finished",
+        // Finished executions keep their fence, not routes; retained hashes would exhaust the index.
+        [prefix + "legacy-capabilities"]: "[]",
         [prefix + "finished-at"]:
           lease.metadata.annotations[prefix + "finished-at"] ?? String(Date.now()),
       },
@@ -688,6 +691,7 @@ export async function createKubernetesOwnership(
         }
         for (const id of missing) if (!listing.has(id)) evict(id);
         if (leaseVersion === version) leaseVersion = listedVersion;
+        expired = false;
       } catch (error) {
         gap = true;
         throw error;
@@ -702,6 +706,8 @@ export async function createKubernetesOwnership(
       return (watching ??= (async () => {
         while (!life.signal.aborted) {
           try {
+            // After expiry the relist supplies the new version; an unversioned watch would replay every Lease again.
+            if (expired) throw Error("browser_kubernetes_watch_expired");
             await api(
               `${leases}?watch=true&allowWatchBookmarks=true&timeoutSeconds=10&labelSelector=${selector}&resourceVersion=${encodeURIComponent(leaseVersion)}`,
               "GET",
@@ -709,12 +715,17 @@ export async function createKubernetesOwnership(
               signal(),
               (event) => {
                 if (event.type === "ERROR") {
-                  leaseVersion = "";
-                  gap = true;
+                  expired = gap = true;
                   throw Error("browser_kubernetes_watch_expired");
                 }
                 leaseVersion = event.object?.metadata?.resourceVersion ?? leaseVersion;
-                if (["ADDED", "MODIFIED"].includes(event.type)) observe(event.object);
+                try {
+                  if (["ADDED", "MODIFIED"].includes(event.type)) observe(event.object);
+                } catch (error) {
+                  // The cache missed this event; the next reconciliation relists and reports it.
+                  gap = true;
+                  throw error;
+                }
                 if (event.type === "DELETED") {
                   const id = event.object?.metadata?.labels?.[prefix + "execution"];
                   const uid = event.object?.metadata?.uid;
@@ -723,10 +734,8 @@ export async function createKubernetesOwnership(
               },
             );
           } catch (error) {
-            if (error instanceof KubernetesError && error.status === 410) {
-              leaseVersion = "";
-              gap = true;
-            }
+            if (error instanceof KubernetesError && error.status === 410)
+              expired = gap = true;
             if (!life.signal.aborted)
               await delay(250, undefined, { signal: life.signal }).catch(() => {});
           }

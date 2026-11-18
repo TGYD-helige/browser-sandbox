@@ -4,6 +4,9 @@ import { pipeline } from "node:stream";
 import WebSocket, { createWebSocketStream } from "ws";
 import { type ControlPeer, connectPeer } from "./network-control.js";
 
+/** Direct and forwarded execution requests share one deadline; /auth waits for a human. */
+export const executionRequestTimeout = (auth: boolean) => (auth ? 620000 : 180000);
+
 /** A separate listener, rather than a caller-controlled header, is the one-hop marker. */
 export function forwardControllerRequest(
   req: IncomingMessage,
@@ -20,7 +23,7 @@ export function forwardControllerRequest(
   );
   let responseStarted = false;
   const life = new AbortController();
-  const deadline = setTimeout(() => life.abort(), auth ? 620000 : 180000);
+  const deadline = setTimeout(() => life.abort(), executionRequestTimeout(auth));
   deadline.unref();
   const upstream = request(target, {
     method: req.method,

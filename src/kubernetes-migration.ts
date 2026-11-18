@@ -51,8 +51,6 @@ export async function importExecutionJournal(options: {
       )
         throw Error("browser_execution_migration_conflict");
       options.validate(previous.data);
-      if (options.ownership.owns(record.executionId))
-        await options.ownership.indexLegacy(previous);
       continue;
     }
     const owner = await options.ownership.resolve(record.executionId, true);

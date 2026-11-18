@@ -388,7 +388,8 @@ export async function activeActive({
     await kubectl("rollout", "restart", `deployment/${deployment}`);
     await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
     report.journalMigration = {
-      sourceFormat: "v0.2.0 journal, synthetic record seeded by the current image",
+      sourceFormat:
+        "v0.2.0 journal fixture (v0.2.0 writer output), seeded by the current image",
       idempotent: true,
       corruptSourcePreserved: true,
     };

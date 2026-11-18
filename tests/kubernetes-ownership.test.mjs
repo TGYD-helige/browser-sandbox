@@ -54,6 +54,10 @@ async function fixture(t, { relist = false, ...extra } = {}) {
   let version = 0;
   const server = createServer(async (req, res) => {
     if (!req.url.includes("watch=true")) state.requests++;
+    else
+      state.watches?.push(
+        new URL(req.url, "http://k").searchParams.get("resourceVersion"),
+      );
     let input = "";
     for await (const chunk of req) input += chunk;
     const body = input ? JSON.parse(input) : undefined;
@@ -292,6 +296,7 @@ test("the previous release's journal imports idempotently without rewriting the 
   const { a } = await fixture(t);
   const directory = await mkdtemp(join(tmpdir(), "journal-import-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
+  // Byte-identical to the v0.2.0 createExecutionJournal output for a v0.2.0 register record.
   await cp(new URL("./fixtures/journal-v0.2.0/", import.meta.url), directory, {
     recursive: true,
   });
@@ -3026,10 +3031,89 @@ test("a local Profile collision preserves the current binding and allows later r
     lastActivityAt: Date.now(),
     grants: [],
   });
+  // One unrecoverable execution must not stop the replica from loading the others.
+  const healthy = "33333333-3333-4333-8333-333333333333";
+  await a.resolve(healthy, true);
+  await a.journal.create(healthy, {
+    phase: "registered",
+    incarnation: healthy,
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+  });
   await assert.rejects(controller.reconcile(), /browser_profile_lease_recovery_failed/);
   assert.equal(controller.bindings.get(id)?.profileId, profileId);
   assert.equal(controller.bindings.has(other), false);
+  assert.equal(controller.bindings.has(healthy), true);
   await controller.command({ op: "finalize", executionId: id });
   await controller.reconcile();
   assert.equal(controller.bindings.get(other)?.profileId, profileId);
+});
+
+test("completed executions drop their legacy capability routes from every replica's index", async (t) => {
+  const { a, b } = await fixture(t);
+  await a.resolve(id, true);
+  const token = "e".repeat(64);
+  const record = await a.journal.create(id, {
+    phase: "registered",
+    grants: [{ token }],
+  });
+  await a.indexLegacy(record);
+  await b.refresh();
+  assert.equal(b.findCapability(token), id);
+  await a.journal.update(id, record.revision, { phase: "finished" });
+  await a.complete(id);
+  assert.equal(a.findCapability(token), undefined);
+  await b.refresh();
+  assert.equal(b.findCapability(token), undefined);
+});
+
+test("a watch event the cache cannot apply forces the next reconciliation to relist", async (t) => {
+  const { a, objects, state } = await fixture(t);
+  await a.resolve(id, true);
+  await a.refresh();
+  assert.equal(a.needsRelist(), false);
+  const lease = structuredClone(
+    [...objects.values()].find(
+      (value) =>
+        value.kind === "Lease" &&
+        value.metadata.labels["browser-sandbox.io/execution"] === id,
+    ),
+  );
+  lease.metadata.annotations["browser-sandbox.io/legacy-capabilities"] = "{";
+  lease.metadata.resourceVersion += "-corrupt";
+  state.watchEvents = [{ type: "MODIFIED", object: lease }];
+  void a.watch();
+  const deadline = AbortSignal.timeout(5000);
+  while (!a.needsRelist()) {
+    deadline.throwIfAborted();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+});
+
+test("an expired watch waits for the relist instead of replaying every Lease", async (t) => {
+  const { a, state } = await fixture(t);
+  await a.resolve(id, true);
+  await a.refresh();
+  state.watches = [];
+  state.watchEvents = [{ type: "ERROR", object: { code: 410 } }];
+  void a.watch();
+  const deadline = AbortSignal.timeout(5000);
+  while (!a.needsRelist()) {
+    deadline.throwIfAborted();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  // Bounded absence check: an unversioned retry follows the 250 ms backoff.
+  const window = AbortSignal.timeout(1000);
+  while (!window.aborted && !state.watches.includes(""))
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(state.watches.includes(""), false);
+  const before = state.watches.length;
+  await a.refresh();
+  while (state.watches.length === before) {
+    deadline.throwIfAborted();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.notEqual(state.watches.at(-1), "");
 });
