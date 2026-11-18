@@ -7,7 +7,7 @@ import {
   assertFencedOwner,
   observeSingleRemoval,
   summarizeFailover,
-  verifyAfterRollout,
+  verifyWithRolloutOwner,
 } from "./active-active-checks.mjs";
 
 /** Runs inside the existing native-architecture k3d job and uses its isolated kubeconfig. */
@@ -648,67 +648,78 @@ export async function activeActive({
     current = await peers(id);
     const live = await startLive(id, current.pod);
     const rollingEpoch = Number(current.lease.metadata.annotations[prefix + "epoch"]);
+    const oldReplicaSet = current.pod.metadata.ownerReferences.find(
+      (ref) => ref.kind === "ReplicaSet" && ref.controller,
+    ).uid;
     const rollingStarted = performance.now();
     const rolling = kubectl("rollout", "restart", `deployment/${deployment}`);
     rolling.catch(() => {});
     await live.closed;
-    await wait(
-      "Graceful rollout did not hand off execution ownership",
-      () => owner(id),
-      (value) =>
-        value.pod &&
-        Number(value.lease.metadata.annotations[prefix + "epoch"]) > rollingEpoch,
+    await rolling;
+    const revision = "deployment.kubernetes.io/revision";
+    const replicaSet = await wait(
+      "Deployment did not create its new ReplicaSet",
+      async () => {
+        const rolled = JSON.parse(
+          await kubectl("get", "deployment", deployment, "-o", "json"),
+        );
+        return JSON.parse(
+          await kubectl(
+            "get",
+            "replicasets",
+            "-l",
+            `app.kubernetes.io/instance=${release},app.kubernetes.io/component=controller`,
+            "-o",
+            "json",
+          ),
+        ).items.find(
+          (item) =>
+            item.metadata.annotations?.[revision] ===
+              rolled.metadata.annotations[revision] &&
+            item.metadata.ownerReferences?.some(
+              (ref) => ref.controller && ref.uid === rolled.metadata.uid,
+            ),
+        );
+      },
+      (item) => item?.metadata.uid && item.metadata.uid !== oldReplicaSet,
       45000,
     );
-    await client("verify-rollout", id);
+    const verifyRollout = (verify) =>
+      verifyWithRolloutOwner(
+        wait,
+        async () => {
+          const candidate = await owner(id);
+          return Number(candidate.lease?.metadata.annotations[prefix + "epoch"]) >
+            rollingEpoch
+            ? candidate
+            : {};
+        },
+        replicaSet.metadata.uid,
+        async (pod) =>
+          JSON.parse(
+            await kubectl(
+              "exec",
+              pod.metadata.name,
+              "--",
+              "node",
+              "--input-type=module",
+              "-e",
+              `import{createControllerRuntime,sessionRequest}from'/opt/browser-sandbox/dist/index.js';const runtime=createControllerRuntime('http://127.0.0.1:8084');const signal=AbortSignal.timeout(5000);try{const status=await runtime.request({op:'controller_status',executionId:'${id}'},{signal});if(status.execution?.phase==='active')await sessionRequest('ws://127.0.0.1:8084${prepared.path}','status',undefined,signal);console.log(JSON.stringify(status))}finally{runtime.close()}`,
+            ),
+          ),
+        verify,
+      );
+    stage = "during-rollout CDP verification";
+    await verifyRollout((pod) => client("verify-rollout", id, pod));
+    report.duringRolloutVerifiedReadyOwner = true;
     report.gracefulRollout = {
       takeoverMs: performance.now() - rollingStarted,
       samples: 1,
       liveCdpBeforeShutdown: true,
     };
-    await rolling;
     await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=180s");
     stage = "post-rollout CDP verification";
-    const rolled = JSON.parse(
-      await kubectl("get", "deployment", deployment, "-o", "json"),
-    );
-    const revision = "deployment.kubernetes.io/revision";
-    const replicaSet = JSON.parse(
-      await kubectl(
-        "get",
-        "replicasets",
-        "-l",
-        `app.kubernetes.io/instance=${release},app.kubernetes.io/component=controller`,
-        "-o",
-        "json",
-      ),
-    ).items.find(
-      (item) =>
-        item.metadata.annotations?.[revision] ===
-          rolled.metadata.annotations[revision] &&
-        item.metadata.ownerReferences?.some(
-          (ref) => ref.controller && ref.uid === rolled.metadata.uid,
-        ),
-    );
-    assert(replicaSet?.metadata.uid, "Rolled Deployment ReplicaSet not found");
-    await verifyAfterRollout(
-      wait,
-      () => owner(id),
-      replicaSet.metadata.uid,
-      async (pod) =>
-        JSON.parse(
-          await kubectl(
-            "exec",
-            pod.metadata.name,
-            "--",
-            "node",
-            "--input-type=module",
-            "-e",
-            `import{createControllerRuntime,sessionRequest}from'/opt/browser-sandbox/dist/index.js';const runtime=createControllerRuntime('http://127.0.0.1:8084');const signal=AbortSignal.timeout(5000);try{const status=await runtime.request({op:'controller_status',executionId:'${id}'},{signal});if(status.execution?.phase==='active')await sessionRequest('ws://127.0.0.1:8084${prepared.path}','status',undefined,signal);console.log(JSON.stringify(status))}finally{runtime.close()}`,
-          ),
-        ),
-      () => client("verify", id),
-    );
+    await verifyRollout(() => client("verify", id));
     report.postRolloutVerifiedReadyOwner = true;
     assert.equal(
       (await list("worker")).find(

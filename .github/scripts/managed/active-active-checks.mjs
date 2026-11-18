@@ -37,14 +37,14 @@ export function summarizeFailover(values) {
   };
 }
 
-export async function verifyAfterRollout(
+export async function verifyWithRolloutOwner(
   wait,
   readOwner,
   replicaSetUid,
   readStatus,
   verify,
 ) {
-  await wait(
+  const owner = await wait(
     "The new ReplicaSet did not establish a recovered execution owner",
     async () => {
       const { pod, lease } = await readOwner();
@@ -58,23 +58,34 @@ export async function verifyAfterRollout(
       const status = await readStatus(pod).catch(() => undefined);
       if (status?.execution?.phase !== "active") return false;
       const current = await readOwner();
-      return (
+      if (
         current.pod?.metadata.uid === pod.metadata.uid &&
         current.lease.metadata.uid === lease.metadata.uid &&
         current.lease.metadata.annotations?.["browser-sandbox.io/epoch"] ===
           lease.metadata.annotations?.["browser-sandbox.io/epoch"]
-      );
+      )
+        return current;
     },
     Boolean,
     45000,
   );
-  return verify();
+  return verify(owner.pod);
 }
 
 export function observeCdpHandshake(socket) {
   const diagnostic = {};
-  socket.once("error", ({ code }) => {
+  socket.once("error", ({ code, message }) => {
+    if ("status" in diagnostic) return;
     if (/^[A-Z0-9_]{1,48}$/.test(code ?? "")) diagnostic.code = code;
+    else
+      diagnostic.reason = [
+        "Opening handshake has timed out",
+        "WebSocket was closed before the connection was established",
+        "Invalid Upgrade header",
+        "Invalid Sec-WebSocket-Accept header",
+      ].includes(message)
+        ? message
+        : "unclassified";
   });
   socket.once("unexpected-response", (_request, response) => {
     diagnostic.status = response.statusCode;

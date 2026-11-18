@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import { test } from "node:test";
 import WebSocket from "ws";
@@ -10,7 +11,7 @@ import {
   observeSingleRemoval,
   readVerifiedStatus,
   summarizeFailover,
-  verifyAfterRollout,
+  verifyWithRolloutOwner,
 } from "./active-active-checks.mjs";
 
 test("resumed controller evidence requires its own fencing report and excludes worker removal events", () => {
@@ -208,9 +209,12 @@ test("post-rollout CDP verification waits for recovered ownership on the new Rep
   };
   const probed = [];
   let verified = 0;
-  await verifyAfterRollout(
+  await verifyWithRolloutOwner(
     async (_description, read, ready) => {
-      while (!ready(await read())) {}
+      let candidate;
+      do candidate = await read();
+      while (!ready(candidate));
+      return candidate;
     },
     readOwner,
     "new",
@@ -218,7 +222,8 @@ test("post-rollout CDP verification waits for recovered ownership on the new Rep
       probed.push(pod.metadata.uid);
       return { execution: { phase: probed.length === 1 ? "absent" : "active" } };
     },
-    async () => {
+    async (pod) => {
+      assert.equal(pod?.metadata.uid, "next-owner");
       assert.deepEqual(probed, ["owner", "owner", "next-owner"]);
       assert.equal(snapshots.length, 0);
       verified++;
@@ -272,4 +277,8 @@ test("CDP handshake diagnostics retain sanitized HTTP responses and transport er
     /browser_cdp_connect_failed/,
   );
   assert.deepEqual(diagnostic, { code: "ECONNREFUSED" });
+  const socket = new EventEmitter();
+  diagnostic = observeCdpHandshake(socket);
+  socket.emit("error", Error("Opening handshake has timed out"));
+  assert.deepEqual(diagnostic, { reason: "Opening handshake has timed out" });
 });
