@@ -143,6 +143,6 @@ The code in this repository is licensed under [MIT](./LICENSE). Browserless, Clo
 
 ## Kubernetes controller
 
-See [Kubernetes installation and operation](./docs/kubernetes.md) for the controller-only Helm chart, worker template, NetworkPolicy, drain and uninstall behavior. This backend supports temporary Profiles and an optional retained controller Profile-store PVC. Controller-wide Profile leases recover from worker metadata; multi-controller operation remains unsupported.
+See [Kubernetes installation and operation](./docs/kubernetes.md) for the controller-only Helm chart, worker template, NetworkPolicy, drain and uninstall behavior. This backend supports temporary Profiles and an optional retained controller Profile-store PVC. Default single-controller recovery uses a retained journal. Kubernetes also supports active-active controller replicas with fenced execution/Profile ownership in Leases and Secrets; multiple replicas require host remote Profile storage.
 
 Managed controller recovery, durable state, capacity limits and backend deadline guarantees are documented in [controller recovery](docs/controller-recovery.md).

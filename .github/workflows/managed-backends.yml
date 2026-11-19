@@ -38,7 +38,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: managed-docker-${{ matrix.runner }}
+          name: managed-docker-${{ matrix.runner }}-attempt-${{ github.run_attempt }}
           path: managed-results/
           if-no-files-found: ignore
 
@@ -49,7 +49,7 @@ jobs:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -69,14 +69,15 @@ jobs:
       - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: pnpm install --frozen-lockfile && pnpm build
       - run: python -m pip install -r .github/scripts/managed/requirements.txt
-      - run: python .github/scripts/managed/test-chart.py && python .github/scripts/managed/test-k3d-cluster.py
+      - run: python .github/scripts/managed/test-chart.py && python .github/scripts/managed/test-k3d-cluster.py && node --test .github/scripts/managed/test-active-active.mjs
       - run: docker build -t browser-sandbox:managed .
       - run: docker build -f .github/scripts/managed/Dockerfile.client -t browser-sandbox-client:managed .
       - run: bash .github/scripts/verify-image.sh browser-sandbox:managed
-      - run: node .github/scripts/managed/kubernetes.mjs
+      - name: Single controller and three-replica active-active matrix
+        run: node .github/scripts/managed/kubernetes.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: managed-kubernetes-${{ matrix.runner }}
+          name: managed-kubernetes-${{ matrix.runner }}-attempt-${{ github.run_attempt }}
           path: managed-results/
           if-no-files-found: ignore

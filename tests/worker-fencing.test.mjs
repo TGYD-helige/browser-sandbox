@@ -1,0 +1,104 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { createWorkerFence } from "../dist/worker-protocol.js";
+
+test("a higher controller epoch cancels old work and fences requests and callbacks", async () => {
+  let entered;
+  const started = new Promise((resolve) => {
+    entered = resolve;
+  });
+  let oldSignal;
+  let oldPeer;
+  const executionId = "execution";
+  const fence = createWorkerFence(async (request, peer, signal) => {
+    if (request.op === "hold") {
+      oldSignal = signal;
+      oldPeer = peer;
+      entered();
+      await new Promise((resolve) =>
+        signal.addEventListener("abort", resolve, { once: true }),
+      );
+    }
+    return { accepted: true };
+  }, executionId);
+  const peer = {
+    signal: new AbortController().signal,
+    callback: async () => ({ saved: true }),
+  };
+  const pending = fence({ executionId, epoch: 1, op: "hold" }, peer, peer.signal);
+  const rejection = assert.rejects(pending, /browser_controller_fenced/);
+  await started;
+  await assert.rejects(
+    fence(
+      { executionId: "another-execution", epoch: 100, op: "worker_status" },
+      peer,
+      peer.signal,
+    ),
+    /browser_identity_mismatch/,
+  );
+  assert.equal(oldSignal.aborted, false);
+  await fence({ executionId, epoch: 2, op: "worker_status" }, peer, peer.signal);
+  assert.equal(oldSignal.aborted, true);
+  assert.equal(oldPeer.signal.aborted, true);
+  await rejection;
+  await assert.rejects(oldPeer.callback("commit", {}), /browser_controller_fenced/);
+  for (const epoch of [0, 1, undefined])
+    await assert.rejects(
+      fence({ executionId, epoch, op: "finalize" }, peer, peer.signal),
+      /browser_controller_fenced/,
+    );
+  for (const epoch of [-1, 1.5, "3"])
+    await assert.rejects(
+      fence({ executionId, epoch, op: "finalize" }, peer, peer.signal),
+      /browser_controller_epoch_invalid/,
+    );
+});
+
+test("a recreated execution's epoch-one worker rejects controls from an older Lease UID", async () => {
+  let calls = 0;
+  const fence = createWorkerFence(
+    async () => {
+      calls++;
+      return { accepted: true };
+    },
+    "execution",
+    "new-lease",
+  );
+  const peer = { signal: new AbortController().signal, callback: async () => ({}) };
+  await assert.rejects(
+    fence(
+      { executionId: "execution", epoch: 99, ownerUid: "old-lease" },
+      peer,
+      peer.signal,
+    ),
+    /browser_controller_fenced/,
+  );
+  assert.equal(calls, 0);
+  await fence(
+    { executionId: "execution", epoch: 1, ownerUid: "new-lease" },
+    peer,
+    peer.signal,
+  );
+  assert.equal(calls, 1);
+});
+
+test("a rejected first UID request cannot poison a legacy worker's ownership scope", async () => {
+  const fence = createWorkerFence(async () => ({ accepted: true }), "execution");
+  const peer = { signal: new AbortController().signal, callback: async () => ({}) };
+  await assert.rejects(
+    fence(
+      { executionId: "execution", epoch: -1, ownerUid: "invalid" },
+      peer,
+      peer.signal,
+    ),
+    /browser_controller_epoch_invalid/,
+  );
+  assert.deepEqual(
+    await fence(
+      { executionId: "execution", epoch: 1, ownerUid: "valid" },
+      peer,
+      peer.signal,
+    ),
+    { accepted: true },
+  );
+});

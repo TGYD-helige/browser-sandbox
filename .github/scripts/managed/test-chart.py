@@ -1,6 +1,8 @@
 """Validate the operator-facing chart with Helm's actual renderer."""
+import json
 import pathlib
 import subprocess
+import tempfile
 import unittest
 
 import yaml
@@ -18,6 +20,27 @@ def render(*arguments, release="trial"):
 
 
 class ChartTest(unittest.TestCase):
+    def test_active_active_matrix_uses_an_independent_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            values = pathlib.Path(directory) / "values.json"
+            values.write_text(json.dumps({"controllerData": {"existingClaim": "trial-browser-data"}}))
+            # Stop at the first Helm call, before the helper acquires cluster resources.
+            subprocess.check_call([
+                "node", "--input-type=module", "-e", """
+                import { activeActive } from './.github/scripts/managed/active-active.mjs';
+                await activeActive({
+                    directory: process.argv[1], values: process.argv[2],
+                    run: async () => { process.exit(0); },
+                });
+                """, directory, str(values),
+            ], cwd=ROOT)
+            resources = render("-f", str(pathlib.Path(directory) / "active-active-values.json"), release="ha")
+            deployment = next(item for item in resources if item["kind"] == "Deployment")
+            volumes = deployment["spec"]["template"]["spec"]["volumes"]
+            journal = next(item for item in volumes if item["name"] == "controller-data")
+            self.assertEqual(journal["persistentVolumeClaim"]["claimName"], "ha-browser-data")
+            self.assertTrue(any(item["kind"] == "PersistentVolumeClaim" and item["metadata"]["name"] == "ha-browser-data" for item in resources))
+
     def test_invalid_release_names_fail_at_render_time(self):
         for release in ["1abc", "a.b", "a" * 49 + "--aa"]:
             with self.subTest(release=release):
@@ -176,6 +199,43 @@ class ChartTest(unittest.TestCase):
         host = next(rule for rule in policy["ingress"] if rule["ports"][0]["port"] == 8082)
         self.assertNotIn("from", access)
         self.assertEqual(host["from"], [{"podSelector": {"matchLabels": {"browser-sandbox.io/host-control": "true"}}}])
+
+    def test_active_active_has_shared_state_peer_isolation_and_no_rwo_mount(self):
+        resources = render("--set", "controller.replicas=3")
+        deployment = next(item for item in resources if item["kind"] == "Deployment")
+        self.assertEqual(deployment["spec"]["replicas"], 3)
+        self.assertEqual(deployment["spec"]["strategy"]["type"], "RollingUpdate")
+        pod = deployment["spec"]["template"]["spec"]
+        self.assertIn("podAntiAffinity", pod["affinity"])
+        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in resources))
+        self.assertFalse(any(volume.get("persistentVolumeClaim") for volume in pod["volumes"]))
+        env = {item["name"]: item.get("value") for item in pod["containers"][0]["env"]}
+        self.assertEqual(env["BROWSER_SHARED_STATE"], "true")
+        self.assertEqual(env["BROWSER_CONTROLLER_REPLICAS"], "3")
+        readiness = pod["containers"][0]["readinessProbe"]
+        self.assertEqual(readiness["httpGet"], {"path": "/health", "port": "access"})
+        self.assertLessEqual(readiness["periodSeconds"] * readiness["failureThreshold"], 10)
+        self.assertNotIn("BROWSER_CONTROLLER_STATE", env)
+        self.assertTrue(any(item["kind"] == "PodDisruptionBudget" and item["metadata"]["name"].endswith("-controller") for item in resources))
+        policy = next(item["spec"] for item in resources if item["kind"] == "NetworkPolicy" and item["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] == "controller")
+        peer = next(rule for rule in policy["ingress"] if rule["ports"][0]["port"] == 8084)
+        self.assertEqual(peer["from"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"], "controller")
+        self.assertFalse(any(8084 in [port["port"] for port in item["spec"]["ports"]] for item in resources if item["kind"] == "Service"))
+        rules = next(item["rules"] for item in resources if item["kind"] == "Role" and not item["metadata"]["name"].endswith("-drain"))
+        self.assertEqual(set(next(rule["verbs"] for rule in rules if "leases" in rule["resources"])), {"get", "list", "watch", "create", "update", "delete"})
+        self.assertEqual(set(next(rule["verbs"] for rule in rules if "secrets" in rule["resources"])), {"get", "create", "update", "delete"})
+        drain_rules = next(item["rules"] for item in resources if item["kind"] == "Role" and item["metadata"]["name"].endswith("-drain"))
+        self.assertEqual(next(rule for rule in drain_rules if "leases" in rule["resources"]), {"apiGroups": ["coordination.k8s.io"], "resources": ["leases"], "verbs": ["list"]})
+        self.assertFalse(any("leases" in rule["resources"] for item in render() if item["kind"] == "Role" and item["metadata"]["name"].endswith("-drain") for rule in item["rules"]))
+        with self.assertRaises(subprocess.CalledProcessError):
+            render("--set", "controller.replicas=3", "--set", "profileStore.enabled=true")
+
+    def test_single_replica_migration_keeps_source_read_only(self):
+        resources = render("--set", "controller.sharedState=true")
+        deployment = next(item for item in resources if item["kind"] == "Deployment")
+        self.assertEqual(deployment["spec"]["strategy"]["type"], "Recreate")
+        mounts = deployment["spec"]["template"]["spec"]["containers"][0]["volumeMounts"]
+        self.assertTrue(next(mount for mount in mounts if mount["name"] == "controller-data")["readOnly"])
 
 
 if __name__ == "__main__":

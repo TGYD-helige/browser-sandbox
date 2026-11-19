@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { WORKER_PROTOCOL, workerIdle } from "../dist/worker-protocol.js";
 
 const status = (session = {}, extra = {}) => ({
-  protocol: "browser-sandbox.worker/v1",
+  protocol: "browser-sandbox.worker/v2",
   session: {
     state: "live",
     generation: "generation-1",
@@ -17,7 +17,7 @@ const status = (session = {}, extra = {}) => ({
 });
 
 test("idle reclamation keeps clients, retained pages, takeover and pending sign-in", () => {
-  assert.equal(WORKER_PROTOCOL, "browser-sandbox.worker/v1");
+  assert.equal(WORKER_PROTOCOL, "browser-sandbox.worker/v2");
   assert.equal(workerIdle(status(), 1000), true);
   assert.equal(workerIdle(status({ connectedClients: 1 }), 1000), false);
   assert.equal(workerIdle(status({ state: "retained", expiresAt: 2000 }), 1000), false);
@@ -34,7 +34,7 @@ test("failed, incomplete and incompatible status never authorizes idle deletion"
     undefined,
     null,
     {},
-    status({}, { protocol: "browser-sandbox.worker/v2" }),
+    status({}, { protocol: "browser-sandbox.worker/v3" }),
     status({}, { pendingAuth: undefined }),
     status({}, { takeover: undefined }),
     status({ connectedClients: -1 }),

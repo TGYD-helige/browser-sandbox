@@ -3,9 +3,15 @@ import { isIP } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import {
   createKubernetesClient,
+  hasKubernetesOwner,
   type KubernetesAccess,
   KubernetesError,
+  kubernetesOwnerReference,
+  listKubernetesPages,
+  readKubernetesOwner,
+  workerOwnerCheck,
 } from "./kubernetes-api.js";
+import type { KubernetesOwnership } from "./kubernetes-ownership.js";
 import { WorkerCleanupFailure } from "./lifecycle-errors.js";
 import { validProfileId } from "./local-profiles.js";
 import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
@@ -39,15 +45,17 @@ export interface KubernetesBackendOptions extends KubernetesAccess {
   template: KubernetesWorkerTemplate;
   creationTimeoutMs?: number;
   maxExecutionMs?: number;
+  ownership?: KubernetesOwnership;
 }
 
+type WorkerLease = { name: string; uid: string; epoch: number };
 const identity = (value: string) => /^[a-f0-9-]{36}$/.test(value);
 const dnsName = (value: string) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(value);
 const prefix = "browser-sandbox.io/";
 /** Optional adapter: no Kubernetes dependency or credentials enter the local runtime. */
-export function createKubernetesBackend(
+export async function createKubernetesBackend(
   options: KubernetesBackendOptions,
-): ManagedBackend {
+): Promise<ManagedBackend> {
   const template = options.template;
   const grace = template.terminationGracePeriodSeconds ?? 60;
   const creationTimeoutMs = options.creationTimeoutMs ?? 120000;
@@ -79,6 +87,7 @@ export function createKubernetesBackend(
   )
     throw Error("browser_kubernetes_configuration_invalid");
   const api = createKubernetesClient(options);
+  const parent = await readKubernetesOwner(api, options, AbortSignal.timeout(15000));
   const base = `/api/v1/namespaces/${options.namespace}`;
   const profileLabel = (profileId?: string) =>
     profileId
@@ -93,51 +102,40 @@ export function createKubernetesBackend(
     [prefix + "incarnation"]: incarnation,
     [prefix + "profile"]: profileLabel(profileId),
   });
-  const owned = (
-    pod: any,
-    expected: Record<string, string>,
-    ownerUid: string,
-    uid?: string,
-  ) => {
+  const owned = (pod: any, expected: Record<string, string>, uid?: string) => {
     if (
       (uid && pod.metadata.uid !== uid) ||
       !Object.entries(expected).every(
         ([key, value]) => pod.metadata.labels?.[key] === value,
-      ) ||
-      !pod.metadata.ownerReferences?.some(
-        (owner) =>
-          owner.apiVersion === "v1" &&
-          owner.kind === "ConfigMap" &&
-          owner.name === options.ownerName &&
-          owner.uid === ownerUid &&
-          owner.controller === true,
       )
     )
       throw Error("browser_worker_ownership_mismatch");
   };
-  async function readOwner(signal: AbortSignal): Promise<string> {
-    const owner = await api(
-      `${base}/configmaps/${options.ownerName}`,
-      "GET",
-      undefined,
-      signal,
-    );
+  const leaseOwner = ({ name, uid }: WorkerLease) =>
+    kubernetesOwnerReference("Lease", name, uid);
+  const podEpoch = (pod: any) =>
+    Number(pod.metadata.annotations?.[prefix + "epoch"] ?? 0);
+  const workerOrigin = (ip: string, error: string) => {
+    const family = isIP(ip);
+    if (!family) throw Error(error);
+    return `http://${family === 6 ? `[${ip}]` : ip}:8081`;
+  };
+  const needsFence = (pod: any, current: WorkerLease) => {
+    const releaseOwned = hasKubernetesOwner(pod, parent);
+    const epoch = podEpoch(pod);
     if (
-      owner.metadata?.labels?.["app.kubernetes.io/instance"] !== options.installation ||
-      owner.metadata.labels["app.kubernetes.io/name"] !== "browser-sandbox" ||
-      !owner.metadata.uid
+      (!releaseOwned && !hasKubernetesOwner(pod, leaseOwner(current))) ||
+      !Number.isSafeInteger(epoch) ||
+      epoch < 0 ||
+      epoch > current.epoch
     )
-      throw Error("browser_worker_ownership_mismatch");
-    return owner.metadata.uid;
-  }
-  async function getPod(name: string, signal: AbortSignal) {
-    try {
-      return await api(`${base}/pods/${name}`, "GET", undefined, signal);
-    } catch (error) {
-      if (error instanceof KubernetesError && error.status === 404) return undefined;
-      throw error;
-    }
-  }
+      throw Error("browser_controller_fenced");
+    return releaseOwned || epoch < current.epoch;
+  };
+  const getPod = (name: string, signal: AbortSignal) =>
+    api(`${base}/pods/${name}`, "GET", undefined, signal).catch((error) => {
+      if (!(error instanceof KubernetesError && error.status === 404)) throw error;
+    });
   async function removeOwned(
     name: string,
     expected: Record<string, string>,
@@ -150,14 +148,25 @@ export function createKubernetesBackend(
       if (requirePresent) throw Error("browser_worker_cleanup_unconfirmed");
       return;
     }
-    owned(pod, expected, await readOwner(signal), uid);
+    owned(pod, expected, uid);
+    const current = await options.ownership?.assertOwned(
+      expected[prefix + "execution"],
+    );
+    if (current) needsFence(pod, current);
+    else if (!hasKubernetesOwner(pod, parent))
+      throw Error("browser_worker_ownership_mismatch");
     await api(
       `${base}/pods/${name}`,
       "DELETE",
       {
         apiVersion: "v1",
         kind: "DeleteOptions",
-        preconditions: { uid: pod.metadata.uid },
+        preconditions: {
+          uid: pod.metadata.uid,
+          ...(options.ownership
+            ? { resourceVersion: pod.metadata.resourceVersion }
+            : {}),
+        },
         propagationPolicy: "Background",
       },
       signal,
@@ -173,19 +182,24 @@ export function createKubernetesBackend(
   return {
     preserveWorkersOnShutdown: true,
     async create(placement, callerSignal) {
-      if (!identity(placement.executionId) || !identity(placement.incarnation))
+      const { executionId, incarnation, profileId } = placement;
+      if (!identity(executionId) || !identity(incarnation))
         throw Error("browser_identity_invalid");
+      const fence = await options.ownership?.assertOwned(executionId);
+      const ownerRef = fence ? leaseOwner(fence) : parent;
+      const assertSameOwner = async () => {
+        if (!fence) return;
+        const current = await options.ownership.assertOwned(executionId);
+        if (current.uid !== fence.uid || current.epoch !== fence.epoch)
+          throw Error("browser_controller_fenced");
+      };
+      const epoch = fence?.epoch;
       const signal = AbortSignal.any([
         callerSignal,
         AbortSignal.timeout(creationTimeoutMs),
       ]);
-      const expected = labels(
-        placement.executionId,
-        placement.incarnation,
-        placement.profileId,
-      );
-      const name = `bs-${options.installation.slice(0, 30)}-${createHash("sha256").update(placement.incarnation).digest("hex").slice(0, 20)}`;
-      const ownerUid = await readOwner(signal);
+      const expected = labels(executionId, incarnation, profileId);
+      const name = `bs-${options.installation.slice(0, 30)}-${createHash("sha256").update(incarnation).digest("hex").slice(0, 20)}`;
       let attempted = false;
       let uid: string;
       try {
@@ -196,7 +210,8 @@ export function createKubernetesBackend(
         environment.push(
           { name: "CONCURRENT", value: "1" },
           { name: "QUEUED", value: "0" },
-          { name: "BROWSER_EXECUTION_ID", value: placement.executionId },
+          { name: "BROWSER_EXECUTION_ID", value: executionId },
+          ...(fence ? [{ name: "BROWSER_OWNER_UID", value: fence.uid }] : []),
           { name: "BROWSER_WORKER_ORIGIN", value: "http://$(BROWSER_POD_IP):8081" },
         );
         if (template.extensions)
@@ -214,17 +229,15 @@ export function createKubernetesBackend(
             metadata: {
               name,
               labels: expected,
-              annotations: { [prefix + "profile-id"]: placement.profileId ?? "" },
-              ownerReferences: [
-                {
-                  apiVersion: "v1",
-                  kind: "ConfigMap",
-                  name: options.ownerName,
-                  uid: ownerUid,
-                  controller: true,
-                  blockOwnerDeletion: false,
-                },
-              ],
+              annotations: {
+                [prefix + "profile-id"]: profileId ?? "",
+                ...(epoch
+                  ? {
+                      [prefix + "epoch"]: String(epoch),
+                    }
+                  : {}),
+              },
+              ownerReferences: [ownerRef],
             },
             spec: {
               restartPolicy: "Never",
@@ -309,10 +322,13 @@ export function createKubernetesBackend(
         );
         uid = pod.metadata.uid;
         if (!uid) throw Error("browser_kubernetes_response_invalid");
+        await assertSameOwner();
         while (true) {
           const state = await getPod(name, signal);
           if (!state) throw Error("browser_worker_lost");
-          owned(state, expected, ownerUid, uid);
+          owned(state, expected, uid);
+          if (!hasKubernetesOwner(state, ownerRef))
+            throw Error("browser_controller_fenced");
           if (
             state.metadata.deletionTimestamp ||
             ["Failed", "Succeeded"].includes(state.status?.phase)
@@ -327,48 +343,48 @@ export function createKubernetesBackend(
             )
           )
             throw Error("browser_worker_unschedulable");
+          const waiting =
+            state.status?.containerStatuses?.map(
+              (container) => container.state?.waiting?.reason,
+            ) ?? [];
           if (
-            state.status?.containerStatuses?.some((container) =>
+            waiting.some((reason) =>
+              ["ErrImagePull", "ImagePullBackOff", "InvalidImageName"].includes(reason),
+            )
+          )
+            throw Error("browser_worker_image_unavailable");
+          if (
+            waiting.some((reason) =>
               [
-                "ErrImagePull",
-                "ImagePullBackOff",
-                "InvalidImageName",
                 "CreateContainerConfigError",
                 "CreateContainerError",
                 "RunContainerError",
-              ].includes(container.state?.waiting?.reason),
+              ].includes(reason),
             )
           )
-            throw Error(
-              state.status.containerStatuses.some((container) =>
-                ["ErrImagePull", "ImagePullBackOff", "InvalidImageName"].includes(
-                  container.state?.waiting?.reason,
-                ),
-              )
-                ? "browser_worker_image_unavailable"
-                : "browser_worker_configuration_invalid",
-            );
+            throw Error("browser_worker_configuration_invalid");
           if (
             state.status?.phase === "Running" &&
             state.status.conditions?.some(
               (condition) => condition.type === "Ready" && condition.status === "True",
             )
           ) {
-            if (!isIP(state.status.podIP))
-              throw Error("browser_kubernetes_response_invalid");
-            const host =
-              isIP(state.status.podIP) === 6
-                ? `[${state.status.podIP}]`
-                : state.status.podIP;
-            const origin = `http://${host}:8081`;
+            const origin = workerOrigin(
+              state.status.podIP,
+              "browser_kubernetes_response_invalid",
+            );
+            await assertSameOwner();
             return {
               id: `${name}/${uid}`,
-              executionId: placement.executionId,
-              incarnation: placement.incarnation,
+              epoch,
+              executionId,
+              incarnation,
               origin,
-              profileId: placement.profileId,
+              profileId,
               runtime: createControllerRuntime(origin, {
                 automation: placement.automation,
+                epoch,
+                ownerUid: fence?.uid,
               }),
             };
           }
@@ -406,50 +422,55 @@ export function createKubernetesBackend(
         throw error;
       }
     },
-    async list(signal) {
-      const ownerUid = await readOwner(signal);
+    async list(signal, target) {
+      if (target !== undefined && !identity(target))
+        throw Error("browser_identity_invalid");
+      const scope = target ? await options.ownership?.assertOwned(target) : undefined;
       const selector = encodeURIComponent(
-        `browser-sandbox.io/installation=${options.installation},app.kubernetes.io/component=worker`,
+        `browser-sandbox.io/installation=${options.installation},app.kubernetes.io/component=worker${target ? `,${prefix}execution=${target}` : ""}`,
       );
       const workers: ManagedWorker[] = [];
-      const cursors = new Set<string>();
-      let cursor = "";
-      do {
-        const page = await api(
-          `${base}/pods?labelSelector=${selector}&limit=100&continue=${encodeURIComponent(cursor)}`,
-          "GET",
-          undefined,
-          signal,
-        );
-        if (
-          !Array.isArray(page.items) ||
-          page.items.length > 100 ||
-          workers.length + page.items.length > 10000
-        )
-          throw Error("browser_worker_discovery_failed");
+      const liveOwner = workerOwnerCheck(
+        api,
+        options,
+        parent,
+        signal,
+        scope,
+        options.ownership?.leaseMetadata,
+      );
+      for await (const page of listKubernetesPages(
+        api,
+        `${base}/pods`,
+        selector,
+        signal,
+        10000,
+        "browser_worker_discovery_failed",
+      )) {
         for (const pod of page.items) {
           const executionId = pod.metadata?.labels?.[prefix + "execution"],
             incarnation = pod.metadata?.labels?.[prefix + "incarnation"];
           const profileId = pod.metadata?.annotations?.[prefix + "profile-id"];
           if (
             !identity(executionId) ||
+            (target !== undefined && executionId !== target) ||
             !identity(incarnation) ||
             typeof profileId !== "string" ||
             (profileId && !validProfileId(profileId)) ||
             !dnsName(pod.metadata.name) ||
-            !pod.metadata.uid ||
-            !pod.metadata.ownerReferences?.some((item) => item.uid === ownerUid)
+            !pod.metadata.uid
           )
             throw Error("browser_worker_discovery_failed");
-          owned(pod, labels(executionId, incarnation, profileId), ownerUid);
-          const ip = pod.status?.podIP;
-          const origin = () => {
-            if (!isIP(ip)) throw Error("browser_worker_not_ready");
-            return `http://${isIP(ip) === 6 ? `[${ip}]` : ip}:8081`;
-          };
+          owned(pod, labels(executionId, incarnation, profileId));
+          if (!(await liveOwner(pod))) continue;
+          const origin = () =>
+            workerOrigin(pod.status?.podIP, "browser_worker_not_ready");
+          const epoch = podEpoch(pod);
+          if (options.ownership && (!Number.isSafeInteger(epoch) || epoch < 0))
+            throw Error("browser_worker_discovery_failed");
           let runtime: ReturnType<typeof createControllerRuntime>;
           workers.push({
             id: `${pod.metadata.name}/${pod.metadata.uid}`,
+            epoch: options.ownership ? epoch : undefined,
             executionId,
             incarnation,
             profileId: profileId || undefined,
@@ -461,16 +482,42 @@ export function createKubernetesBackend(
             },
           });
         }
-        cursor = page.metadata?.continue ?? "";
-        if (
-          typeof cursor !== "string" ||
-          cursor.length > 8192 ||
-          (cursor && cursors.has(cursor))
-        )
-          throw Error("browser_worker_discovery_failed");
-        cursors.add(cursor);
-      } while (cursor);
+      }
       return workers;
+    },
+    async fence(worker, epoch, signal, stopped = false) {
+      if (!options.ownership) return;
+      const before = await options.ownership.assertOwned(worker.executionId);
+      if (before.epoch !== epoch) throw Error("browser_controller_fenced");
+      const [name, uid] = worker.id.split("/");
+      const pod = await getPod(name, signal);
+      const current = await options.ownership.assertOwned(worker.executionId);
+      if (before.uid !== current.uid || current.epoch !== epoch)
+        throw Error("browser_controller_fenced");
+      if (!pod) return;
+      owned(pod, labels(worker.executionId, worker.incarnation, worker.profileId), uid);
+      if (needsFence(pod, current))
+        await api(
+          `${base}/pods/${name}`,
+          "PATCH",
+          {
+            metadata: {
+              resourceVersion: pod.metadata.resourceVersion,
+              ownerReferences: [leaseOwner(current)],
+              annotations: {
+                [prefix + "epoch"]: String(epoch),
+              },
+            },
+          },
+          signal,
+        );
+      worker.epoch = epoch;
+      worker.runtime.setEpoch?.(epoch, current.uid);
+      if (stopped) return;
+      await worker.runtime.request(
+        { op: "worker_status", executionId: worker.executionId },
+        { signal, timeoutMs: 10000 },
+      );
     },
     async remove(worker: ManagedWorker, callerSignal) {
       const [name, uid, extra] = worker.id.split("/");

@@ -56,7 +56,7 @@ export async function requestAuth(endpoint, request, signal) {
   }
   if (
     !["ws:", "wss:"].includes(url.protocol) ||
-    !/^\/execution\/[a-f0-9]{64}$/.test(url.pathname) ||
+    !/^\/execution\/(?:[a-f0-9-]{36}\/)?[a-f0-9]{64}$/.test(url.pathname) ||
     url.search ||
     url.hash ||
     url.username ||

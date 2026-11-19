@@ -12,6 +12,7 @@ import {
 } from "./network-policy.js";
 import { BROWSER_PRIVACY_ARGS } from "./privacy.js";
 import { verifyTarget } from "./probe.js";
+import { createWorkerFence } from "./worker-protocol.js";
 import { createWorkerStorage } from "./worker-storage.js";
 
 if (process.env.PORT !== "3001") throw Error("browser_internal_port_invalid");
@@ -133,17 +134,19 @@ const workerStorage = createWorkerStorage(
 const networkControl = workerExecutionId
   ? createNetworkHostControl({
       server: gateway.workerServer,
-      dispatch: async (request, peer, signal) => {
-        if (request.executionId !== workerExecutionId)
-          throw Error("browser_identity_mismatch");
-        if (!controllerPeer || controllerPeer.signal.aborted || request.automation)
-          controllerPeer = peer;
-        if (request.op === "register")
-          controllerAutomation = request.automation === true;
-        const storageResult = await workerStorage(request, peer, signal);
-        if (storageResult) return storageResult;
-        return gateway.workerCommand(request, signal);
-      },
+      dispatch: createWorkerFence(
+        async (request, peer, signal) => {
+          if (!controllerPeer || controllerPeer.signal.aborted || request.automation)
+            controllerPeer = peer;
+          if (request.op === "register")
+            controllerAutomation = request.automation === true;
+          const storageResult = await workerStorage(request, peer, signal);
+          if (storageResult) return storageResult;
+          return gateway.workerCommand(request, signal);
+        },
+        workerExecutionId,
+        process.env.BROWSER_OWNER_UID,
+      ),
     })
   : undefined;
 for (const signal of ["SIGINT", "SIGTERM"])

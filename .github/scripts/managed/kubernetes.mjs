@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
+import { activeActive } from "./active-active.mjs";
 
 const directory = await mkdtemp(join(tmpdir(), "browser-kubernetes-"));
 const suffix = randomUUID().slice(0, 8);
@@ -223,6 +224,45 @@ try {
     await run("k3d", ["image", "import", candidate, "-c", cluster], {
       timeout: 300000,
     });
+    // Docker's containerd image store can export only the config digest as a reference.
+    const candidateName = candidate.includes("/")
+      ? candidate
+      : `docker.io/library/${candidate}`;
+    const imported = await run("docker", [
+      "exec",
+      server,
+      "ctr",
+      "-n",
+      "k8s.io",
+      "images",
+      "ls",
+    ]);
+    if (!imported.split("\n").some((line) => line.split(/\s+/)[0] === candidateName)) {
+      const configDigest = await run("docker", [
+        "image",
+        "inspect",
+        "--format",
+        "{{.Id}}",
+        candidate,
+      ]);
+      assert(
+        imported.split("\n").some((line) => line.split(/\s+/)[0] === configDigest),
+        "Imported image lost its name and config digest",
+      );
+      for (const node of nodes)
+        await run("docker", [
+          "exec",
+          node.metadata.name,
+          "ctr",
+          "-n",
+          "k8s.io",
+          "images",
+          "tag",
+          "--force",
+          configDigest,
+          candidateName,
+        ]);
+    }
   }
   stage = "image digest lookup";
   const images = await run("docker", [
@@ -889,7 +929,17 @@ try {
     "Helm uninstall left worker Pods",
     async () => (await pods()).length === 0,
   );
+  stage = "three-replica active-active";
+  const activeActiveReport = await activeActive({
+    run,
+    kubectl,
+    namespace,
+    directory,
+    values,
+    clientImage,
+  });
   const report = {
+    activeActive: activeActiveReport,
     controllerStartupMs,
     ...functional,
     rolloutPreservedWorker: true,

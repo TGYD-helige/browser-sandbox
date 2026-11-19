@@ -373,7 +373,7 @@ test("reconciliation cannot replace a worker channel while host finalization is 
         };
       if (request.op === "worker_status")
         return {
-          protocol: "browser-sandbox.worker/v1",
+          protocol: "browser-sandbox.worker/v2",
           session: { state: "unused", connectedClients: 0 },
           takeover: "automation",
           pendingAuth: 0,

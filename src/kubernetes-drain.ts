@@ -3,6 +3,8 @@ import {
   createKubernetesClient,
   type KubernetesAccess,
   KubernetesError,
+  readKubernetesOwner,
+  workerOwnerCheck,
 } from "./kubernetes-api.js";
 
 export interface KubernetesDrainOptions extends KubernetesAccess {
@@ -49,19 +51,7 @@ export async function drainKubernetesWorkers(
     return result.items;
   }
   try {
-    const owner = await api(
-      `${base}/configmaps/${options.ownerName}`,
-      "GET",
-      undefined,
-      signal,
-    );
-    if (
-      !owner.metadata?.uid ||
-      !Object.entries(labels).every(
-        ([name, value]) => owner.metadata.labels?.[name] === value,
-      )
-    )
-      throw Error("browser_worker_ownership_mismatch");
+    const owner = await readKubernetesOwner(api, options, signal);
     const persistent = (pod) =>
       pod.metadata?.labels?.["browser-sandbox.io/profile"] !== "temporary";
     if ((await list("worker")).some(persistent)) throw Error("browser_profile_busy");
@@ -82,6 +72,7 @@ export async function drainKubernetesWorkers(
       signal,
     );
     while ((await list("controller")).length) await delay(100, undefined, { signal });
+    const liveOwner = workerOwnerCheck(api, options, owner, signal);
     while (true) {
       const workers = await list("worker");
       if (!workers.length) return;
@@ -91,17 +82,10 @@ export async function drainKubernetesWorkers(
           !/^[a-z0-9][a-z0-9-]*$/.test(pod.metadata.name) ||
           !Object.entries({ ...labels, "app.kubernetes.io/component": "worker" }).every(
             ([name, value]) => pod.metadata.labels?.[name] === value,
-          ) ||
-          !pod.metadata.ownerReferences?.some(
-            (reference) =>
-              reference.apiVersion === "v1" &&
-              reference.kind === "ConfigMap" &&
-              reference.name === options.ownerName &&
-              reference.uid === owner.metadata.uid &&
-              reference.controller === true,
           )
         )
           throw Error("browser_worker_ownership_mismatch");
+        if (!(await liveOwner(pod))) continue;
         // A Profile admitted between preflight and controller exit still keeps its recovery copy.
         if (persistent(pod)) throw Error("browser_profile_busy");
         if (!pod.metadata.deletionTimestamp) {

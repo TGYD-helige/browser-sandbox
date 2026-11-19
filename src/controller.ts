@@ -1,17 +1,27 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { createServer, request as httpRequest } from "node:http";
+import { createServer, request as httpRequest, STATUS_CODES } from "node:http";
 import type { AddressInfo } from "node:net";
 import { pipeline, Transform } from "node:stream";
 import { isDeepStrictEqual } from "node:util";
 import WebSocket, { createWebSocketStream, WebSocketServer } from "ws";
 import { waitForControl } from "./automation-control.js";
+import {
+  createHostForwarding,
+  executionRequestTimeout,
+  forwardControllerRequest,
+  forwardControllerViewer,
+} from "./controller-forwarding.js";
 import { createExecutionJournal } from "./execution-journal.js";
 import { MAX_FILE_BYTES } from "./files.js";
 import type { StorageAdapter } from "./host-client.js";
 import { WorkerCleanupFailure } from "./lifecycle-errors.js";
 import { validProfileId } from "./local-profiles.js";
-import type { ManagedBackend, ManagedWorker } from "./managed-backend.js";
+import type {
+  ExecutionOwnership,
+  ManagedBackend,
+  ManagedWorker,
+} from "./managed-backend.js";
 import {
   CONTROL_TIMEOUT_MS,
   type ControlPeer,
@@ -20,15 +30,21 @@ import {
 import { normalizeAllowedDomains } from "./network-policy.js";
 import type { createProfileStore } from "./profile-store.js";
 import { MAX_ARCHIVE_BYTES } from "./profiles.js";
+import { createSerialWork } from "./serial-work.js";
 import type { SessionStatus } from "./session.js";
 import { createWorkerAdmission, type WorkerSlot } from "./worker-admission.js";
-import { WORKER_PROTOCOL, workerIdleProtection } from "./worker-protocol.js";
+import {
+  LEGACY_WORKER_PROTOCOL,
+  WORKER_PROTOCOL,
+  workerIdleProtection,
+} from "./worker-protocol.js";
 
 export interface ExecutionBinding {
   executionId: string;
   incarnation: string;
   allowedDomains: string[];
   profileId?: string;
+  profileAcquired?: boolean;
   storageMode?: "host" | "volume";
   storage?: StorageAdapter;
   storagePeer?: ControlPeer;
@@ -82,6 +98,10 @@ export interface ControllerOptions {
   /** Retained, private storage; exactly one controller may own this directory. */
   profileStore?: Awaited<ReturnType<typeof createProfileStore>>;
   stateDirectory?: string;
+  ownership?: ExecutionOwnership;
+  replicas?: number;
+  peerPort?: number;
+  peerHost?: string;
   installationId?: string;
   port?: number;
   host?: string;
@@ -97,7 +117,7 @@ export interface ControllerOptions {
   idleRegistrationMs?: number;
   reconciliationMs?: number;
   onWorkerEvent?: (event: {
-    type: "creating" | "ready" | "failed" | "removed" | "recovery-blocked";
+    type: "creating" | "ready" | "failed" | "removed" | "recovery-blocked" | "fenced";
     executionId: string;
     incarnation: string;
     elapsedMs?: number;
@@ -121,7 +141,15 @@ export async function createController(options: ControllerOptions) {
     finished.add(id);
     if (finished.size > 65536) finished.delete(finished.values().next().value);
   };
-  let journal: Awaited<ReturnType<typeof createExecutionJournal>> | undefined;
+  let journal: ExecutionOwnership["journal"] | undefined;
+  const ownership = options.ownership;
+  const scopedCapability = (id: string, token: string, separator: "/" | ".") =>
+    ownership ? `${id}${separator}${token}` : token;
+  const supportedProtocol = (protocol: unknown) =>
+    protocol === WORKER_PROTOCOL || (!ownership && protocol === LEGACY_WORKER_PROTOCOL);
+  const forwarding = createHostForwarding();
+  if ((options.replicas ?? 1) > 1 && options.profileStore)
+    throw Error("browser_profile_store_replicas_unsupported");
   const capacityLimits = {
     maxWorkers: options.maxWorkers ?? 8,
     maxPending: options.maxPending ?? 2,
@@ -146,6 +174,7 @@ export async function createController(options: ControllerOptions) {
     );
   };
   const recoverProfiles = async (profileId?: string, owningExecutionId?: string) => {
+    if (ownership) return;
     const leases = profileId
       ? [profileLeases.get(profileId)].filter(Boolean)
       : [...profileLeases.values()];
@@ -227,6 +256,7 @@ export async function createController(options: ControllerOptions) {
     if (!journal) return Promise.resolve();
     const data = {
       profileId: binding.profileId,
+      profileAcquired: binding.profileAcquired,
       storageMode: binding.storageMode,
       infrastructureOnly: binding.infrastructureOnly,
       incarnation: binding.incarnation,
@@ -311,7 +341,7 @@ export async function createController(options: ControllerOptions) {
     ["/viewer.js", ["browser-viewer.js", "text/javascript"]],
     ["/viewer.css", ["viewer.css", "text/css"]],
   ]);
-  const server = createServer(async (req, res) => {
+  const handleAgent = async (req, res, forwarded = false) => {
     const life = new AbortController();
     res.once("close", () => {
       if (!res.writableEnded) life.abort();
@@ -329,6 +359,7 @@ export async function createController(options: ControllerOptions) {
         res.writeHead(closing ? 503 : 204).end();
         return;
       }
+      if (await routeAgent(req, res, undefined, forwarded)) return;
       if (!allowedOrigin(req)) {
         res.writeHead(403).end();
         return;
@@ -351,7 +382,7 @@ export async function createController(options: ControllerOptions) {
       const signal = AbortSignal.any([
         life.signal,
         grant.life.signal,
-        AbortSignal.timeout(match[2] === "/auth" ? 620000 : 180000),
+        AbortSignal.timeout(executionRequestTimeout(match[2] === "/auth")),
       ]);
       if (match[2] === "/session") {
         if (!["GET", "POST"].includes(req.method)) {
@@ -461,7 +492,8 @@ export async function createController(options: ControllerOptions) {
           .end(JSON.stringify({ error: errorCode(error, grant) }));
       else res.destroy();
     }
-  });
+  };
+  const server = createServer(handleAgent);
   const allowedOrigin = (req) =>
     !req.headers.origin ||
     req.headers.origin === origin ||
@@ -520,6 +552,7 @@ export async function createController(options: ControllerOptions) {
       !grant ||
       closing ||
       grant.kind !== kind ||
+      (request.executionId && request.executionId !== grant.binding.executionId) ||
       grant.binding.revoked ||
       grant.life.signal.aborted ||
       (grant.expiresAt && grant.expiresAt <= Date.now()) ||
@@ -540,11 +573,11 @@ export async function createController(options: ControllerOptions) {
     grant ??= issue(binding, "cdp");
     return {
       protocol: "browser-sandbox.host/v1",
-      wsEndpoint: `${origin.replace(/^http/, "ws")}/execution/${grant.token}`,
+      wsEndpoint: `${origin.replace(/^http/, "ws")}/execution/${scopedCapability(binding.executionId, grant.token, "/")}`,
     };
   };
   const event = (
-    binding: ExecutionBinding,
+    binding: Pick<ExecutionBinding, "executionId" | "incarnation">,
     type: Parameters<NonNullable<ControllerOptions["onWorkerEvent"]>>[0]["type"],
     extra = {},
   ) => {
@@ -566,6 +599,7 @@ export async function createController(options: ControllerOptions) {
       load: (signal) => adapter.load(signal),
       save: (signal) => adapter.save(signal),
       async commit(result, signal) {
+        await ownership?.assertOwned(binding.executionId);
         const confirmation = await adapter.commit(result, signal);
         const archive = result.archive as { sha256?: unknown } | undefined;
         if (
@@ -608,6 +642,7 @@ export async function createController(options: ControllerOptions) {
     ) => {
       if (!binding.host || binding.host.signal.aborted)
         throw Error("browser_automation_unavailable");
+      await ownership?.assertOwned(binding.executionId);
       await binding.host.callback(operation, { executionId }, signal);
     };
     return {
@@ -618,34 +653,19 @@ export async function createController(options: ControllerOptions) {
   function bindStorage(binding: ExecutionBinding) {
     if (!binding.profileId && binding.storageMode !== "host") return;
     if (binding.storageMode === "host") {
+      const call = (op: string, payload: unknown, signal?: AbortSignal) => {
+        if (!binding.storagePeer || binding.storagePeer.signal.aborted)
+          throw Error("browser_storage_disconnected");
+        return binding.storagePeer.callback(
+          op,
+          { executionId: binding.executionId, payload },
+          signal,
+        );
+      };
       binding.storage = {
-        load: (signal) => {
-          if (!binding.storagePeer || binding.storagePeer.signal.aborted)
-            throw Error("browser_storage_disconnected");
-          return binding.storagePeer.callback(
-            "load",
-            { executionId: binding.executionId },
-            signal,
-          );
-        },
-        save: (signal) => {
-          if (!binding.storagePeer || binding.storagePeer.signal.aborted)
-            throw Error("browser_storage_disconnected");
-          return binding.storagePeer.callback(
-            "save",
-            { executionId: binding.executionId },
-            signal,
-          );
-        },
-        commit: (payload, signal) => {
-          if (!binding.storagePeer || binding.storagePeer.signal.aborted)
-            throw Error("browser_storage_disconnected");
-          return binding.storagePeer.callback(
-            "commit",
-            { executionId: binding.executionId, payload },
-            signal,
-          );
-        },
+        load: (signal) => call("load", undefined, signal),
+        save: (signal) => call("save", undefined, signal),
+        commit: (payload, signal) => call("commit", payload, signal),
       };
     } else {
       if (!options.profileStore) throw Error("browser_profile_storage_unavailable");
@@ -708,6 +728,11 @@ export async function createController(options: ControllerOptions) {
     runtime?.close?.();
   }
   function adoptRecoveredWorker(binding: ExecutionBinding, worker?: ManagedWorker) {
+    if (worker && ownership)
+      worker.runtime.setEpoch?.(
+        ownership.epoch(binding.executionId),
+        ownership.lookup(binding.executionId)?.uid,
+      );
     if (
       worker &&
       (worker.profileId !== binding.profileId ||
@@ -725,12 +750,14 @@ export async function createController(options: ControllerOptions) {
     const live = new Set([...bindings.values()].map((binding) => binding.worker?.id));
     for (const worker of workers) if (!live.has(worker.id)) closeWorkerChannel(worker);
   }
-  async function checkGeneration(binding: ExecutionBinding, signal?: AbortSignal) {
-    const status = await binding.worker.runtime.request<any>(
-      { op: "worker_status", executionId: binding.executionId },
+  const readWorkerStatus = (worker: ManagedWorker, signal?: AbortSignal) =>
+    worker.runtime.request<any>(
+      { op: "worker_status", executionId: worker.executionId },
       { signal, timeoutMs: 10000 },
     );
-    if (status?.protocol !== WORKER_PROTOCOL)
+  async function checkGeneration(binding: ExecutionBinding, signal?: AbortSignal) {
+    const status = await readWorkerStatus(binding.worker, signal);
+    if (!supportedProtocol(status?.protocol))
       throw Error("browser_worker_protocol_unsupported");
     if (!status.session || typeof status.session.state !== "string")
       throw Error("browser_worker_status_invalid");
@@ -771,7 +798,10 @@ export async function createController(options: ControllerOptions) {
   }
   async function ensureWorker(binding: ExecutionBinding, signal: AbortSignal) {
     signal.throwIfAborted();
+    if (ownership && !ownership.owns(binding.executionId))
+      throw Error("browser_controller_fenced");
     if (binding.revoked || closing) throw Error("browser_execution_revoked");
+    if (binding.profileAcquired === false) throw Error("browser_profile_busy");
     if (binding.creation?.abort.signal.aborted) {
       await waitForControl(
         binding.starting.catch(() => {}),
@@ -819,6 +849,10 @@ export async function createController(options: ControllerOptions) {
             creationSignal,
           );
           binding.worker = worker;
+          worker.runtime.setEpoch?.(
+            ownership?.epoch(binding.executionId),
+            ownership?.lookup(binding.executionId)?.uid,
+          );
           creationSignal.throwIfAborted();
           const result = await worker.runtime.request<{
             cdpUrl: string;
@@ -909,7 +943,7 @@ export async function createController(options: ControllerOptions) {
         throw Error("browser_request_invalid");
       const binding = bindings.get(id);
       const record =
-        !binding && journal?.has(id) && finished.has(id)
+        !binding && journal && finished.has(id)
           ? await journal.read(id).catch((error) => {
               if (error.code !== "ENOENT") throw error;
               return undefined;
@@ -1008,6 +1042,7 @@ export async function createController(options: ControllerOptions) {
           incarnation: randomUUID(),
           allowedDomains: domains,
           profileId: request.profileId,
+          profileAcquired: ownership && request.profileId ? false : undefined,
           storageMode: hostStorage ? "host" : request.profileId ? "volume" : undefined,
           life: new AbortController(),
           revoked: false,
@@ -1018,8 +1053,16 @@ export async function createController(options: ControllerOptions) {
           revision: 0,
         };
         bindStorage(binding);
-        if (request.profileId) profileLeases.set(request.profileId, binding);
+        if (request.profileId && !ownership)
+          profileLeases.set(request.profileId, binding);
         bindings.set(id, binding);
+      }
+      if (ownership && binding.profileId && !binding.profileAcquired) {
+        await persist(binding);
+        await ownership.acquireProfile(id, binding.profileId);
+        if (bindings.get(id) !== binding) throw Error("browser_controller_fenced");
+        binding.profileAcquired = true;
+        profileLeases.set(binding.profileId, binding);
       }
       if (
         hostStorage &&
@@ -1181,6 +1224,7 @@ export async function createController(options: ControllerOptions) {
       }
       binding.phase = "finished";
       await persist(binding);
+      if (ownership) await ownership.complete(id);
       binding.storageDisconnect?.();
       binding.storageConnection?.close();
       await binding.volumeAdapter?.close();
@@ -1226,8 +1270,8 @@ export async function createController(options: ControllerOptions) {
       await persist(binding);
       return {
         executionId: id,
-        cdpUrl: `${origin.replace(/^http/, "ws")}/execution/${agent.token}`,
-        viewerUrl: `${origin}/view#${viewer.token}`,
+        cdpUrl: `${origin.replace(/^http/, "ws")}/execution/${scopedCapability(id, agent.token, "/")}`,
+        viewerUrl: `${origin}/view#${scopedCapability(id, viewer.token, ".")}`,
         expiresAt: agent.expiresAt,
       };
     }
@@ -1258,18 +1302,29 @@ export async function createController(options: ControllerOptions) {
     }
     return result;
   }
-  const mutations = new Map<string, Promise<unknown>>();
-  function serializeExecution<T>(id: string, action: () => Promise<T>): Promise<T> {
-    const work = (mutations.get(id) ?? Promise.resolve()).then(action);
-    const settled = work
-      .catch(() => {})
-      .finally(() => {
-        if (mutations.get(id) === settled) mutations.delete(id);
-      });
-    mutations.set(id, settled);
-    return work;
-  }
-  function command(request: any, peer?: ControlPeer, signal?: AbortSignal) {
+  const serializeExecution = createSerialWork();
+  async function command(
+    request: any,
+    peer?: ControlPeer,
+    signal?: AbortSignal,
+    forwarded = false,
+  ) {
+    if (ownership && request?.executionId) {
+      const cached = ownership.lookup(request.executionId);
+      // A released finished Lease is final; answering locally avoids a takeover per poll.
+      if (cached?.finished && !cached.replica) rememberFinished(request.executionId);
+      else {
+        const owner = await ownership.resolve(
+          request.executionId,
+          ["register", "storage_attach", "finish", "finalize"].includes(request.op),
+        );
+        if (owner && !ownership.owns(request.executionId)) {
+          if (forwarded) throw Error("browser_controller_owner_moved");
+          return forwarding.request(owner.origin, request, peer, signal);
+        }
+        if (owner) await loadOwned(request.executionId);
+      }
+    }
     if (request?.op === "controller_status") return dispatch(request, peer, signal);
     return serializeExecution(request?.executionId, () =>
       dispatch(request, peer, signal),
@@ -1364,11 +1419,12 @@ export async function createController(options: ControllerOptions) {
     upstream.on("error", close);
   }
   const cdp = new WebSocketServer({ noServer: true, maxPayload: 32 * 1024 * 1024 });
-  server.on("upgrade", async (req, socket, head) => {
+  const handleUpgrade = async (req, socket, head, forwarded = false) => {
     const life = new AbortController();
     socket.once("close", () => life.abort());
     let grant: Access;
     try {
+      if (await routeAgent(req, socket, head, forwarded)) return;
       if (req.url === "/view/socket" && allowedOrigin(req)) {
         if (closing) throw Error("browser_execution_revoked");
         if (waiting >= 64 || viewers.clients.size >= 64)
@@ -1395,6 +1451,17 @@ export async function createController(options: ControllerOptions) {
                 auth = JSON.parse(String(raw));
               } catch {
                 throw Error("browser_access_denied");
+              }
+              if (ownership && !req.executionId && auth?.type === "authenticate") {
+                const id = ownership.findCapability(auth.token);
+                if (id) {
+                  const peer = agentPeer(id, forwarded);
+                  if (peer) {
+                    forwardControllerViewer(client, peer, id, auth.token);
+                    return;
+                  }
+                  req.executionId = id;
+                }
               }
               grant =
                 auth?.type === "authenticate" &&
@@ -1451,256 +1518,469 @@ export async function createController(options: ControllerOptions) {
     } catch (error) {
       const status = errorStatus(error, grant);
       const body = JSON.stringify({ error: errorCode(error, grant) });
-      const reason =
-        status === 403
-          ? "Forbidden"
-          : status === 503
-            ? "Service Unavailable"
-            : "Bad Gateway";
       socket.end(
-        `HTTP/1.1 ${status} ${reason}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
+        `HTTP/1.1 ${status} ${STATUS_CODES[status]}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`,
       );
     }
+  };
+  server.on("upgrade", handleUpgrade);
+  async function restoreRecord(
+    record,
+    discovered: ManagedWorker[],
+    owned?: Map<string, ManagedWorker>,
+    finishedRevisions?: Map<string, number>,
+  ) {
+    const id = record.executionId;
+    const data = record.data as any;
+    validateControllerRecord(data);
+    if (data.phase === "finished")
+      return void finishedRevisions?.set(id, record.revision);
+    let worker = owned?.get(data.workerId);
+    if (!owned) worker = discovered.find((item) => item.id === data.workerId);
+    worker ??= discovered.find(
+      (item) => item.executionId === id && item.incarnation === data.incarnation,
+    );
+    if (
+      worker &&
+      (worker.executionId !== id ||
+        worker.incarnation !== data.incarnation ||
+        worker.profileId !== data.profileId)
+    )
+      throw Error("browser_worker_ownership_mismatch");
+    if (worker && worker.id !== data.workerId && staleCreation(worker)) {
+      await discardStaleCreation(worker);
+      owned?.delete(worker.id);
+      worker = undefined;
+    }
+    const binding: ExecutionBinding = {
+      executionId: id,
+      incarnation: data.incarnation,
+      profileId: data.profileId,
+      profileAcquired: data.profileAcquired,
+      storageMode: data.storageMode,
+      infrastructureOnly: data.infrastructureOnly,
+      allowedDomains: data.allowedDomains,
+      registeredAt: data.registeredAt,
+      lastActivityAt: data.lastActivityAt,
+      phase: data.phase,
+      revision: record.revision,
+      recovered: true,
+      endpoint: data.endpoint,
+      life: new AbortController(),
+      revoked: false,
+      stopConfirmed: data.stopConfirmed,
+      finalResult: data.finalResult,
+      confirmedCommit: data.confirmedCommit,
+      generation: data.generation,
+      // Journal v1 originally described worker protocol v1.
+      workerProtocol: data.workerProtocol ?? LEGACY_WORKER_PROTOCOL,
+      cleanupUnconfirmed: data.cleanupUnconfirmed,
+      recoveryAttempts: data.recoveryAttempts,
+      recoveryError: data.recoveryError,
+      statusError: data.recoveryError,
+      reclaimReason: data.reclaimReason,
+    };
+    if (worker?.infrastructureOnly && data.cleanupUnconfirmed) {
+      // Creation never published an endpoint; discovery proves only its network remains.
+      binding.infrastructureOnly = true;
+      binding.stopConfirmed = true;
+      binding.finalResult = { stopped: true, used: false };
+      binding.phase = "cleanup-pending";
+      binding.revoked = true;
+    }
+    bindings.set(id, binding);
+    if (
+      binding.profileId &&
+      !binding.infrastructureOnly &&
+      binding.profileAcquired !== false
+    ) {
+      try {
+        if (profileLeases.has(binding.profileId))
+          throw Error("browser_profile_lease_recovery_failed");
+        profileLeases.set(binding.profileId, binding);
+        if (ownership) await ownership.acquireProfile(id, binding.profileId);
+        if (binding.revoked) return;
+        bindStorage(binding);
+      } catch (error) {
+        if (ownership && bindings.get(id) === binding) dropOwned(id, false);
+        throw error;
+      }
+    }
+    if (worker) {
+      owned?.delete(worker.id);
+      binding.worker = worker;
+      binding.starting = Promise.resolve(worker);
+      binding.slot = admission.restore();
+      try {
+        if (!binding.stopConfirmed && !supportedProtocol(binding.workerProtocol))
+          throw Error("browser_worker_protocol_unsupported");
+        if (ownership)
+          await options.backend.fence?.(
+            worker,
+            ownership.epoch(id),
+            AbortSignal.timeout(15000),
+            binding.stopConfirmed,
+          );
+        worker.runtime.setAutomation?.(automationCallbacks(binding));
+        if (!binding.stopConfirmed && data.phase !== "recovery-blocked")
+          await attachWorkerStorage(binding, AbortSignal.timeout(10000));
+        if (
+          !binding.stopConfirmed &&
+          !["finalizing", "recovery-blocked"].includes(data.phase)
+        ) {
+          const status = await readWorkerStatus(worker);
+          if (!supportedProtocol(status.protocol))
+            throw Error("browser_worker_protocol_unsupported");
+          if (
+            !status.session ||
+            (binding.generation &&
+              (status.session.generation !== binding.generation ||
+                ["lost", "stopped", "expired"].includes(status.session.state)))
+          )
+            throw Error("browser_session_lost");
+          binding.generation ??= status.session.generation;
+        }
+      } catch (error) {
+        binding.revoked = true;
+        binding.phase = "recovery-required";
+        binding.recoveryError = errorCode(error);
+        binding.statusError = binding.recoveryError;
+      }
+    } else if (data.phase !== "registered") {
+      binding.revoked = true;
+      binding.phase = "recovery-required";
+    }
+    if (
+      [
+        "finalizing",
+        "cleanup-pending",
+        "recovery-required",
+        "recovery-blocked",
+      ].includes(data.phase)
+    )
+      binding.revoked = true;
+    if (binding.revoked) return;
+    for (const grant of data.grants) {
+      if (!grant.expiresAt || grant.expiresAt > Date.now())
+        issue(
+          binding,
+          grant.kind,
+          grant.expiresAt ? grant.expiresAt - Date.now() : undefined,
+          grant.control,
+          grant.resize,
+          grant,
+        );
+    }
+  }
+  async function restoreOrphan(worker: ManagedWorker, revision: number) {
+    if (bindings.has(worker.executionId))
+      throw Error("browser_worker_ownership_mismatch");
+    const binding: ExecutionBinding = {
+      executionId: worker.executionId,
+      incarnation: worker.incarnation,
+      profileId: worker.profileId,
+      storageMode: worker.profileId ? "volume" : undefined,
+      infrastructureOnly: worker.infrastructureOnly,
+      allowedDomains: [],
+      worker,
+      starting: Promise.resolve(worker),
+      slot: admission.restore(),
+      registeredAt: Date.now(),
+      lastActivityAt: Date.now(),
+      phase: worker.infrastructureOnly ? "cleanup-pending" : "recovery-required",
+      stopConfirmed: worker.infrastructureOnly ? true : undefined,
+      finalResult: worker.infrastructureOnly
+        ? { stopped: true, used: false }
+        : undefined,
+      reclaimReason: "orphan",
+      revision,
+      life: new AbortController(),
+      revoked: true,
+    };
+    bindings.set(binding.executionId, binding);
+    if (binding.profileId && !binding.infrastructureOnly) {
+      if (profileLeases.has(binding.profileId))
+        throw Error("browser_profile_lease_recovery_failed");
+      profileLeases.set(binding.profileId, binding);
+      try {
+        bindStorage(binding);
+      } catch (error) {
+        binding.recoveryError = errorCode(error);
+      }
+    }
+    try {
+      if (ownership && !worker.infrastructureOnly)
+        await options.backend.fence?.(
+          worker,
+          ownership.epoch(worker.executionId),
+          AbortSignal.timeout(15000),
+        );
+      if (worker.infrastructureOnly) {
+        await persist(binding);
+        return;
+      }
+      await attachWorkerStorage(binding);
+      const status = await readWorkerStatus(worker);
+      if (typeof status.protocol === "string") binding.workerProtocol = status.protocol;
+      if (!supportedProtocol(status.protocol))
+        throw Error("browser_worker_protocol_unsupported");
+      binding.phase = "finalizing";
+    } catch (error) {
+      binding.recoveryError = errorCode(error);
+    }
+    await persist(binding);
+  }
+  function dropOwned(id: string, fenced = true) {
+    const binding = bindings.get(id);
+    if (!binding) return;
+    if (fenced && !closing && binding.phase !== "finished")
+      event(binding, "fenced", { error: "browser_controller_fenced" });
+    revokeExecution(binding);
+    binding.storageDisconnect?.();
+    binding.storageConnection?.close();
+    closeWorkerChannel(binding.worker);
+    binding.slot?.release();
+    bindings.delete(id);
+    if (profileLeases.get(binding.profileId) === binding)
+      profileLeases.delete(binding.profileId);
+  }
+  const restoring = new Set<string>();
+  function loadOwned(
+    id: string,
+    workers?: ManagedWorker[],
+    orphan?: ManagedWorker | null,
+  ) {
+    if (bindings.has(id)) return Promise.resolve();
+    const requested = ownership.lookup(id);
+    return serializeExecution(id, async () => {
+      if (bindings.has(id)) return;
+      const current = ownership.lookup(id);
+      if (
+        finished.has(id) &&
+        current &&
+        !current.replica &&
+        current.uid === requested?.uid &&
+        current.epoch === requested.epoch
+      )
+        return;
+      await ownership.assertOwned(id);
+      const record = await journal.read(id);
+      const terminal = record?.data.phase === "finished";
+      if (!terminal) finished.delete(id);
+      if (!record && orphan === undefined) return;
+      const target = terminal ? id : undefined;
+      const discovered =
+        workers ?? (await options.backend.list(AbortSignal.timeout(30000), target));
+      try {
+        if (record && !terminal) {
+          restoring.add(id);
+          if (Array.isArray(record.data.grants) && record.data.grants.length)
+            await ownership.indexLegacy(record);
+          await restoreRecord(record, discovered);
+          return;
+        }
+        // A finished record can still have a live orphan. Recover it before releasing the Lease.
+        const liveOrphan =
+          orphan === undefined
+            ? discovered.find((worker) => worker.executionId === id)
+            : orphan;
+        if (liveOrphan) {
+          finished.delete(id);
+          await restoreOrphan(liveOrphan, record?.revision ?? 0);
+        } else {
+          if (!record) await journal.create(id, { phase: "finished" });
+          await ownership.complete(id);
+          rememberFinished(id);
+        }
+      } finally {
+        restoring.delete(id);
+        if (!workers) closeUnusedDiscovery(discovered);
+      }
+    });
+  }
+  const staleCreation = (worker: ManagedWorker) =>
+    ownership &&
+    worker.epoch !== undefined &&
+    worker.epoch < ownership.epoch(worker.executionId);
+  async function discardStaleCreation(worker: ManagedWorker) {
+    const signal = AbortSignal.timeout(30000);
+    // Only unpublished old-epoch resources are discarded; exact recorded workers are reattached.
+    await removeWorker(worker, signal);
+    event(worker, "removed", { reason: "stale-creation" });
+  }
+  // The watch keeps ownership current; full relists and orphan scans run on this slower cadence.
+  const relistMs = Math.max(60000, reconciliationMs);
+  let relistAt = 0;
+  const takenOver = new Set<string>();
+  async function refreshOwnership() {
+    const relist = ownership.needsRelist() || performance.now() >= relistAt;
+    const ids = relist ? await ownership.refresh() : ownership.active();
+    if (relist) relistAt = performance.now() + relistMs;
+    for (const id of ids) {
+      const held = ownership.owns(id);
+      await ownership.resolve(id);
+      if (!held && ownership.owns(id)) takenOver.add(id);
+    }
+    for (const id of takenOver) if (!ownership.owns(id)) takenOver.delete(id);
+    if (!relist && !takenOver.size) return undefined;
+    // One unrecoverable execution must not stall the others; it fails closed until a later retry.
+    let failure: unknown;
+    const load = async (
+      id: string,
+      workers: ManagedWorker[],
+      orphan?: ManagedWorker | null,
+    ) => {
+      try {
+        await loadOwned(id, workers, orphan);
+        takenOver.delete(id);
+      } catch (error) {
+        failure ??= error;
+      }
+    };
+    const discovered = await options.backend.list(AbortSignal.timeout(30000));
+    const candidates = new Set<string>();
+    try {
+      for (const id of relist ? ids : [...takenOver])
+        if (ownership.owns(id)) await load(id, discovered);
+      if (!relist) return failure;
+      for (const worker of discovered) {
+        const binding = bindings.get(worker.executionId);
+        if (binding) {
+          if (binding.worker?.id !== worker.id && staleCreation(worker))
+            await discardStaleCreation(worker);
+          continue;
+        }
+        await ownership.resolve(worker.executionId, true);
+        if (ownership.owns(worker.executionId)) candidates.add(worker.executionId);
+      }
+      if (candidates.size) {
+        // Resolve every orphan first; all revalidation must follow its ownership handoff.
+        const current = await options.backend.list(AbortSignal.timeout(30000));
+        try {
+          const byExecution = new Map(
+            current.map((worker) => [worker.executionId, worker]),
+          );
+          for (const id of candidates)
+            if (ownership.owns(id))
+              await load(id, current, byExecution.get(id) ?? null);
+        } finally {
+          closeUnusedDiscovery(current);
+        }
+      }
+    } finally {
+      closeUnusedDiscovery(discovered);
+    }
+    return failure;
+  }
+  function assertAgentReady(id: string) {
+    if (restoring.has(id) || (!bindings.has(id) && !finished.has(id)))
+      throw Error("browser_controller_owner_moved");
+  }
+  /** Returns the live peer origin, or undefined when this replica serves the request. */
+  function agentPeer(id: string, forwarded: boolean) {
+    if (ownership.owns(id)) {
+      assertAgentReady(id);
+      return undefined;
+    }
+    const owner = ownership.lookup(id);
+    // An unseen or released Lease is retryable; only a finished one is final.
+    if (!owner?.replica)
+      throw Error(
+        owner?.finished ? "browser_access_denied" : "browser_controller_owner_moved",
+      );
+    if (forwarded) throw Error("browser_controller_owner_moved");
+    return owner.origin;
+  }
+  async function routeAgent(req, destination, head?: Buffer, forwarded = false) {
+    if (!ownership) return false;
+    const match = /^\/execution\/([a-f0-9-]{36})\/(.+)$/.exec(req.url ?? "");
+    const legacy = /^\/execution\/([a-f0-9]{64})(?:\/|$)/.exec(req.url ?? "");
+    const id = match?.[1] ?? (legacy ? ownership.findCapability(legacy[1]) : undefined);
+    if (!id) return false;
+    const peer = agentPeer(id, forwarded);
+    if (peer) {
+      forwardControllerRequest(req, destination, peer, head);
+      return true;
+    }
+    req.executionId = id;
+    if (match)
+      req.url = match[2] === "view/socket" ? "/view/socket" : `/execution/${match[2]}`;
+    return false;
+  }
+  const peerServer = ownership
+    ? createServer((req, res) => handleAgent(req, res, true))
+    : undefined;
+  const peerControl = peerServer
+    ? createNetworkHostControl({
+        server: peerServer,
+        dispatch: (request, peer, signal) => command(request, peer, signal, true),
+      })
+    : undefined;
+  peerServer?.on("upgrade", (req, socket, head) => {
+    if (req.url !== "/host") void handleUpgrade(req, socket, head, true);
   });
-  let discoveredWorkers: ManagedWorker[] = [];
-  async function constructionFailed(error: unknown): Promise<never> {
-    closing = true;
+  async function closeListeners() {
+    forwarding.close();
+    peerControl?.close();
     control.close();
     for (const grant of [...grants.values()]) revoke(grant);
+    for (const client of [...viewers.clients, ...cdp.clients]) client.terminate();
     viewers.close();
     cdp.close();
     for (const socket of rawConnections) socket.destroy();
-    for (const worker of discoveredWorkers) closeWorkerChannel(worker);
-    await Promise.allSettled(
-      [...bindings.values()].map((binding) => binding.volumeAdapter?.close()),
-    );
+    controlServer.closeAllConnections();
+    peerServer?.closeAllConnections();
     await Promise.all(
-      [server, controlServer]
-        .filter((listener) => listener.listening)
+      [server, controlServer, peerServer]
+        .filter((listener) => listener?.listening)
         .map(
           (listener) => new Promise<void>((resolve) => listener.close(() => resolve())),
         ),
     );
+  }
+  let discoveredWorkers: ManagedWorker[] = [];
+  async function constructionFailed(error: unknown): Promise<never> {
+    closing = true;
+    await ownership?.close();
+    await closeListeners();
+    const workers = new Set([
+      ...discoveredWorkers,
+      ...[...bindings.values()].map((binding) => binding.worker),
+    ]);
+    for (const worker of workers) closeWorkerChannel(worker);
+    await Promise.allSettled(
+      [...bindings.values()].map((binding) => binding.volumeAdapter?.close()),
+    );
     throw error;
   }
   try {
-    if (options.stateDirectory) {
+    if (ownership) {
+      journal = ownership.journal;
+      ownership.onLost(dropOwned);
+      const failure = await refreshOwnership();
+      if (failure) throw failure;
+      void ownership.watch();
+    } else if (options.stateDirectory) {
       if (!options.backend.list) throw Error("browser_worker_discovery_unavailable");
       const discovered = await options.backend.list(AbortSignal.timeout(30000));
       discoveredWorkers = discovered;
       const owned = new Map(discovered.map((worker) => [worker.id, worker]));
       const finishedRevisions = new Map<string, number>();
-      journal = await createExecutionJournal({
+      const localJournal = await createExecutionJournal({
         directory: options.stateDirectory,
         installationId: options.installationId,
-        onRecord: async (record) => {
-          const id = record.executionId;
-          const data = record.data as any;
-          validateControllerRecord(data);
-          if (data.phase === "finished") {
-            finishedRevisions.set(id, record.revision);
-            return;
-          }
-          if (
-            typeof data.incarnation !== "string" ||
-            !Array.isArray(data.allowedDomains) ||
-            !Number.isSafeInteger(data.registeredAt) ||
-            !Number.isSafeInteger(data.lastActivityAt) ||
-            !Array.isArray(data.grants)
-          )
-            throw Error("browser_execution_journal_corrupt");
-          const worker =
-            owned.get(data.workerId) ??
-            discovered.find(
-              (item) =>
-                item.executionId === id && item.incarnation === data.incarnation,
-            );
-          if (
-            worker &&
-            (worker.executionId !== id ||
-              worker.incarnation !== data.incarnation ||
-              worker.profileId !== data.profileId)
-          )
-            throw Error("browser_worker_ownership_mismatch");
-          const binding: ExecutionBinding = {
-            executionId: id,
-            incarnation: data.incarnation,
-            profileId: data.profileId,
-            storageMode: data.storageMode,
-            infrastructureOnly: data.infrastructureOnly,
-            allowedDomains: data.allowedDomains,
-            registeredAt: data.registeredAt,
-            lastActivityAt: data.lastActivityAt,
-            phase: data.phase,
-            revision: record.revision,
-            recovered: true,
-            endpoint: data.endpoint,
-            life: new AbortController(),
-            revoked: false,
-            worker,
-            stopConfirmed: data.stopConfirmed,
-            finalResult: data.finalResult,
-            confirmedCommit: data.confirmedCommit,
-            generation: data.generation,
-            // Journal v1 originally described worker protocol v1.
-            workerProtocol: data.workerProtocol ?? "browser-sandbox.worker/v1",
-            cleanupUnconfirmed: data.cleanupUnconfirmed,
-            recoveryAttempts: data.recoveryAttempts,
-            recoveryError: data.recoveryError,
-            statusError: data.recoveryError,
-            reclaimReason: data.reclaimReason,
-          };
-          if (worker?.infrastructureOnly && data.cleanupUnconfirmed) {
-            // Creation never published an endpoint; discovery proves only its network remains.
-            binding.infrastructureOnly = true;
-            binding.stopConfirmed = true;
-            binding.finalResult = { stopped: true, used: false };
-            binding.phase = "cleanup-pending";
-            binding.revoked = true;
-          }
-          bindings.set(id, binding);
-          if (binding.profileId && !binding.infrastructureOnly) {
-            if (
-              !validProfileId(binding.profileId) ||
-              profileLeases.has(binding.profileId)
-            )
-              throw Error("browser_profile_lease_recovery_failed");
-            profileLeases.set(binding.profileId, binding);
-            bindStorage(binding);
-          }
-          if (worker) {
-            owned.delete(worker.id);
-            binding.starting = Promise.resolve(worker);
-            binding.slot = admission.restore();
-            try {
-              if (!binding.stopConfirmed && binding.workerProtocol !== WORKER_PROTOCOL)
-                throw Error("browser_worker_protocol_unsupported");
-              worker.runtime.setAutomation?.(automationCallbacks(binding));
-              if (!binding.stopConfirmed && data.phase !== "recovery-blocked")
-                await attachWorkerStorage(binding, AbortSignal.timeout(10000));
-              const status =
-                binding.stopConfirmed ||
-                ["finalizing", "recovery-blocked"].includes(data.phase)
-                  ? { protocol: WORKER_PROTOCOL }
-                  : await worker.runtime.request<any>(
-                      { op: "worker_status", executionId: id },
-                      { timeoutMs: 10000 },
-                    );
-              if (status.protocol !== WORKER_PROTOCOL)
-                throw Error("browser_worker_protocol_unsupported");
-              if (
-                !binding.stopConfirmed &&
-                !["finalizing", "recovery-blocked"].includes(data.phase)
-              ) {
-                if (
-                  !status.session ||
-                  (binding.generation &&
-                    (status.session.generation !== binding.generation ||
-                      ["lost", "stopped", "expired"].includes(status.session.state)))
-                )
-                  throw Error("browser_session_lost");
-                binding.generation ??= status.session.generation;
-              }
-            } catch (error) {
-              binding.revoked = true;
-              binding.phase = "recovery-required";
-              binding.recoveryError = errorCode(error);
-              binding.statusError = binding.recoveryError;
-            }
-          } else if (data.phase !== "registered") {
-            binding.revoked = true;
-            binding.phase = "recovery-required";
-          }
-          if (
-            [
-              "finalizing",
-              "cleanup-pending",
-              "recovery-required",
-              "recovery-blocked",
-            ].includes(data.phase)
-          )
-            binding.revoked = true;
-          bindings.set(id, binding);
-          if (binding.revoked) return;
-          for (const grant of data.grants) {
-            if (
-              !/^[a-f0-9]{64}$/.test(grant.token) ||
-              !["cdp", "view"].includes(grant.kind)
-            )
-              throw Error("browser_execution_journal_corrupt");
-            if (!grant.expiresAt || grant.expiresAt > Date.now())
-              issue(
-                binding,
-                grant.kind,
-                grant.expiresAt ? grant.expiresAt - Date.now() : undefined,
-                grant.control,
-                grant.resize,
-                grant,
-              );
-          }
-        },
+        onRecord: (record) =>
+          restoreRecord(record, discovered, owned, finishedRevisions),
       });
-      for (const id of journal.finishedIds()) rememberFinished(id);
-      for (const worker of owned.values()) {
-        if (bindings.has(worker.executionId))
-          throw Error("browser_worker_ownership_mismatch");
-        const revision = journal.has(worker.executionId)
-          ? (finishedRevisions.get(worker.executionId) ?? 0)
-          : 0;
-        const binding: ExecutionBinding = {
-          executionId: worker.executionId,
-          incarnation: worker.incarnation,
-          profileId: worker.profileId,
-          storageMode: worker.profileId ? "volume" : undefined,
-          infrastructureOnly: worker.infrastructureOnly,
-          allowedDomains: [],
+      journal = localJournal;
+      for (const id of localJournal.finishedIds()) rememberFinished(id);
+      for (const worker of owned.values())
+        await restoreOrphan(
           worker,
-          starting: Promise.resolve(worker),
-          slot: admission.restore(),
-          registeredAt: Date.now(),
-          lastActivityAt: Date.now(),
-          phase: worker.infrastructureOnly ? "cleanup-pending" : "recovery-required",
-          stopConfirmed: worker.infrastructureOnly ? true : undefined,
-          finalResult: worker.infrastructureOnly
-            ? { stopped: true, used: false }
-            : undefined,
-          reclaimReason: "orphan",
-          revision,
-          life: new AbortController(),
-          revoked: true,
-        };
-        if (binding.profileId && !binding.infrastructureOnly) {
-          if (profileLeases.has(binding.profileId))
-            throw Error("browser_profile_lease_recovery_failed");
-          profileLeases.set(binding.profileId, binding);
-          try {
-            bindStorage(binding);
-          } catch (error) {
-            binding.recoveryError = errorCode(error);
-          }
-        }
-        try {
-          if (worker.infrastructureOnly) {
-            bindings.set(binding.executionId, binding);
-            await persist(binding);
-            continue;
-          }
-          await attachWorkerStorage(binding);
-          const status = await worker.runtime.request<any>(
-            { op: "worker_status", executionId: worker.executionId },
-            { timeoutMs: 10000 },
-          );
-          if (typeof status.protocol === "string")
-            binding.workerProtocol = status.protocol;
-          if (status.protocol !== WORKER_PROTOCOL)
-            throw Error("browser_worker_protocol_unsupported");
-          binding.phase = "finalizing";
-        } catch (error) {
-          binding.recoveryError = errorCode(error);
-        }
-        bindings.set(binding.executionId, binding);
-        await persist(binding);
-      }
+          localJournal.has(worker.executionId)
+            ? (finishedRevisions.get(worker.executionId) ?? 0)
+            : 0,
+        );
     }
   } catch (error) {
     await constructionFailed(error);
@@ -1709,6 +1989,7 @@ export async function createController(options: ControllerOptions) {
   function reconcile(): Promise<void> {
     const run = async () => {
       if (closing) return;
+      const ownershipFailure = ownership ? await refreshOwnership() : undefined;
       const currentBindings = [...bindings.values()];
       const recoveryIncarnations = new Map<ExecutionBinding, string>();
       for (const binding of currentBindings)
@@ -1720,7 +2001,12 @@ export async function createController(options: ControllerOptions) {
         for (const binding of currentBindings) {
           if (closing) break;
           await serializeExecution(binding.executionId, async () => {
-            if (closing || bindings.get(binding.executionId) !== binding) return;
+            if (
+              closing ||
+              bindings.get(binding.executionId) !== binding ||
+              (ownership && !ownership.owns(binding.executionId))
+            )
+              return;
             try {
               if (binding.revoked || binding.cleanupUnconfirmed) {
                 // A shared snapshot cannot prove absence for a newer recovery incarnation.
@@ -1789,11 +2075,8 @@ export async function createController(options: ControllerOptions) {
                       );
                       // A failed save has already revoked the worker's live session.
                       if (!retryingSave) {
-                        const status = await currentWorker.runtime.request<any>(
-                          { op: "worker_status", executionId: binding.executionId },
-                          { timeoutMs: 10000 },
-                        );
-                        if (status.protocol !== WORKER_PROTOCOL)
+                        const status = await readWorkerStatus(currentWorker);
+                        if (!supportedProtocol(status.protocol))
                           throw Error("browser_worker_protocol_unsupported");
                       }
                       if (!binding.storageConnection)
@@ -1858,13 +2141,10 @@ export async function createController(options: ControllerOptions) {
                 await dispatch({ op: "finalize", executionId: binding.executionId });
                 return;
               }
-              const status = await binding.worker.runtime.request<any>(
-                { op: "worker_status", executionId: binding.executionId },
-                { timeoutMs: 10000 },
-              );
+              const status = await readWorkerStatus(binding.worker);
               binding.checkedAt = Date.now();
               binding.statusError = undefined;
-              binding.idleProtection = workerIdleProtection(status, now);
+              binding.idleProtection = workerIdleProtection(status, now, !ownership);
               if (binding.idleProtection) return;
               binding.reclaimReason = "idle";
               await dispatch({
@@ -1914,6 +2194,7 @@ export async function createController(options: ControllerOptions) {
       } finally {
         if (discovered) closeUnusedDiscovery(discovered);
       }
+      if (ownershipFailure) throw ownershipFailure;
     };
     reconciliation = reconciliation.then(run, run);
     return reconciliation;
@@ -1941,6 +2222,15 @@ export async function createController(options: ControllerOptions) {
       resolve,
     );
   }).catch(constructionFailed);
+  if (peerServer)
+    await new Promise<void>((resolve, reject) => {
+      peerServer.once("error", reject);
+      peerServer.listen(
+        options.peerPort ?? 8084,
+        options.peerHost ?? "0.0.0.0",
+        resolve,
+      );
+    }).catch(constructionFailed);
   schedule();
   origin ??= `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   return {
@@ -2020,18 +2310,16 @@ export async function createController(options: ControllerOptions) {
           }
         }
       }
-      control.close();
-      for (const grant of [...grants.values()]) revoke(grant);
-      for (const client of [...viewers.clients, ...cdp.clients]) client.terminate();
-      viewers.close();
-      cdp.close();
-      for (const socket of rawConnections) socket.destroy();
-      controlServer.closeAllConnections();
-      await Promise.all(
-        [server, controlServer].map(
-          (listener) => new Promise<void>((resolve) => listener.close(() => resolve())),
-        ),
-      );
+      if (ownership) {
+        try {
+          await ownership.release();
+        } catch (error) {
+          failure ??= error;
+        } finally {
+          await ownership.close();
+        }
+      }
+      await closeListeners();
       if (failure) throw failure;
     },
   };
@@ -2052,6 +2340,8 @@ function errorCode(error: any, grant?: Access) {
 
 function errorStatus(error: unknown, grant?: Access) {
   const code = errorCode(error, grant);
+  if (["browser_controller_owner_moved", "browser_controller_fenced"].includes(code))
+    return 503;
   if (["browser_access_denied", "browser_execution_revoked"].includes(code)) return 403;
   return /_(capacity_exceeded|overloaded)$/.test(code) ? 503 : 502;
 }
@@ -2095,7 +2385,7 @@ function validConfirmedCommit(commit: any, incarnation: string) {
     archive.byteSize <= MAX_ARCHIVE_BYTES
   );
 }
-function validateControllerRecord(data: any) {
+export function validateControllerRecord(data: any) {
   const invalid = () => {
     throw Error("browser_execution_journal_corrupt");
   };
@@ -2132,7 +2422,12 @@ function validateControllerRecord(data: any) {
     ].includes(data.phase)
   )
     invalid();
-  for (const key of ["stopConfirmed", "cleanupUnconfirmed", "infrastructureOnly"])
+  for (const key of [
+    "stopConfirmed",
+    "cleanupUnconfirmed",
+    "infrastructureOnly",
+    "profileAcquired",
+  ])
     if (data[key] !== undefined && typeof data[key] !== "boolean") invalid();
   if (
     data.stopConfirmed &&
@@ -2194,18 +2489,17 @@ function validateControllerRecord(data: any) {
   } catch {
     invalid();
   }
-  if (
-    data.generation !== undefined &&
-    (typeof data.generation !== "string" ||
-      !data.generation ||
-      data.generation.length > 128)
-  )
-    invalid();
-  if (
-    data.workerId !== undefined &&
-    (typeof data.workerId !== "string" || !data.workerId || data.workerId.length > 256)
-  )
-    invalid();
+  for (const [key, limit] of [
+    ["generation", 128],
+    ["workerId", 256],
+  ] as const) {
+    const value = data[key];
+    if (
+      value !== undefined &&
+      (typeof value !== "string" || !value || value.length > limit)
+    )
+      invalid();
+  }
   if (data.endpoint !== undefined) {
     if (
       !data.endpoint ||

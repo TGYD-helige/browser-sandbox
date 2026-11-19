@@ -3,7 +3,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (
-      !/^\/(view(?:\/socket)?|viewer\.(?:js|css)|execution\/[a-f0-9]{64}(?:\/(?:session|auth)|\/files\/[A-Za-z0-9._-]+)?)$/.test(
+      !/^\/(view(?:\/socket)?|viewer\.(?:js|css)|execution\/[a-f0-9-]{36}\/view\/socket|execution\/(?:[a-f0-9-]{36}\/)?[a-f0-9]{64}(?:\/(?:session|auth)|\/files\/[A-Za-z0-9._-]+)?)$/.test(
         url.pathname,
       )
     )
