@@ -1,4 +1,4 @@
-{{- if and (eq (int .Values.controller.replicas) 1) (not .Values.controllerData.existingClaim) }}
+{{- if not (or .Values.controllerData.existingClaim .Values.controllerData.skipCreation) }}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

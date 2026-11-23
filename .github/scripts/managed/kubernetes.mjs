@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { activeActive } from "./active-active.mjs";
+import { verifyJournalRollback } from "./journal-rollback.mjs";
 
 const directory = await mkdtemp(join(tmpdir(), "browser-kubernetes-"));
 const suffix = randomUUID().slice(0, 8);
@@ -929,6 +930,8 @@ try {
     "Helm uninstall left worker Pods",
     async () => (await pods()).length === 0,
   );
+  stage = "Helm journal claim upgrade and rollback";
+  await verifyJournalRollback({ run, kubectl, namespace, directory, values });
   stage = "three-replica active-active";
   const activeActiveReport = await activeActive({
     run,
@@ -940,6 +943,7 @@ try {
   });
   const report = {
     activeActive: activeActiveReport,
+    helmJournalUpgradeAndRollbackPreservedPvc: true,
     controllerStartupMs,
     ...functional,
     rolloutPreservedWorker: true,

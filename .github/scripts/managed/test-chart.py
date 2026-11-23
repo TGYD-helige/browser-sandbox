@@ -1,6 +1,7 @@
 """Validate the operator-facing chart with Helm's actual renderer."""
 import json
 import pathlib
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -10,9 +11,9 @@ import yaml
 ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 
-def render(*arguments, release="trial"):
+def render(*arguments, release="trial", chart=ROOT / "charts/browser-sandbox"):
     output = subprocess.check_output([
-        "helm", "template", release, str(ROOT / "charts/browser-sandbox"),
+        "helm", "template", release, str(chart),
         "--namespace", "browser-test", "--set", "networkPolicy.apiServerCidrs[0]=10.43.0.1/32", "--set", "image.digest=sha256:" + "a" * 64,
         *arguments,
     ], text=True)
@@ -68,6 +69,19 @@ class ChartTest(unittest.TestCase):
                   item["metadata"]["name"].endswith("-workers")]
         self.assertEqual(len(owners), 1)
         self.assertNotIn("ownerReferences", owners[0]["metadata"])
+
+    def test_v020_reused_values_default_to_a_single_replica(self):
+        with tempfile.TemporaryDirectory() as directory:
+            chart = pathlib.Path(directory) / "browser-sandbox"
+            shutil.copytree(ROOT / "charts/browser-sandbox", chart)
+            # Helm --reuse-values uses the previous chart's coalesced defaults.
+            (chart / "values.yaml").write_bytes(subprocess.check_output([
+                "git", "show", "v0.2.0:charts/browser-sandbox/values.yaml",
+            ], cwd=ROOT))
+            deployment = next(item for item in render(chart=chart) if item["kind"] == "Deployment")
+            self.assertEqual(deployment["spec"]["replicas"], 1)
+            with self.assertRaises(subprocess.CalledProcessError):
+                render("--set", "controller.replicas=0", chart=chart)
 
     def test_controller_journal_has_its_own_retained_private_volume(self):
         resources = render()
@@ -200,6 +214,32 @@ class ChartTest(unittest.TestCase):
         self.assertNotIn("from", access)
         self.assertEqual(host["from"], [{"podSelector": {"matchLabels": {"browser-sandbox.io/host-control": "true"}}}])
 
+    def test_scaling_keeps_the_same_chart_managed_journal_claim(self):
+        for retain in ("false", "true"):
+            with self.subTest(retain=retain):
+                settings = ("--set", "controller.sharedState=true", "--set", f"controllerData.retain={retain}")
+                before = render(*settings)
+                after = render(*settings, "--set", "controller.replicas=3")
+                self.assertEqual(
+                    [item for item in after if item["kind"] == "PersistentVolumeClaim"],
+                    [item for item in before if item["kind"] == "PersistentVolumeClaim"],
+                )
+        for replicas in (1, 3):
+            with self.subTest(replicas=replicas):
+                resources = render("--set", f"controller.replicas={replicas}", "--set", "controllerData.existingClaim=retained")
+                self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in resources))
+
+    def test_active_active_can_install_without_provisioning_a_journal_claim(self):
+        skip_creation = ("--set", "controllerData.skipCreation=true")
+        resources = render(*skip_creation, "--set", "controller.replicas=3")
+        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in resources))
+        with self.assertRaises(subprocess.CalledProcessError):
+            render(*skip_creation)
+        resources = render(*skip_creation, "--set", "controllerData.existingClaim=retained")
+        deployment = next(item for item in resources if item["kind"] == "Deployment")
+        volumes = deployment["spec"]["template"]["spec"]["volumes"]
+        self.assertIn({"name": "controller-data", "persistentVolumeClaim": {"claimName": "retained"}}, volumes)
+
     def test_active_active_has_shared_state_peer_isolation_and_no_rwo_mount(self):
         resources = render("--set", "controller.replicas=3")
         deployment = next(item for item in resources if item["kind"] == "Deployment")
@@ -207,7 +247,6 @@ class ChartTest(unittest.TestCase):
         self.assertEqual(deployment["spec"]["strategy"]["type"], "RollingUpdate")
         pod = deployment["spec"]["template"]["spec"]
         self.assertIn("podAntiAffinity", pod["affinity"])
-        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in resources))
         self.assertFalse(any(volume.get("persistentVolumeClaim") for volume in pod["volumes"]))
         env = {item["name"]: item.get("value") for item in pod["containers"][0]["env"]}
         self.assertEqual(env["BROWSER_SHARED_STATE"], "true")

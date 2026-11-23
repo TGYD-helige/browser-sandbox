@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, request } from "node:http";
 import { tmpdir } from "node:os";
@@ -14,6 +15,7 @@ import { createKubernetesBackend } from "../dist/kubernetes-backend.js";
 import { importExecutionJournal } from "../dist/kubernetes-migration.js";
 import { createKubernetesOwnership } from "../dist/kubernetes-ownership.js";
 import { createControllerRuntime } from "../dist/network-control.js";
+import { createProfileStore } from "../dist/profile-store.js";
 
 async function fixture(t, { relist = false, ...extra } = {}) {
   const objects = new Map();
@@ -136,11 +138,13 @@ async function fixture(t, { relist = false, ...extra } = {}) {
         };
       }
       objects.set(key, body);
+      if (state.losePostResponse?.(key, body)) return res.destroy();
       return reply(201, body);
     }
     if (!previous) return reply(404);
     if (req.method === "PUT") {
-      await state.beforeWrite?.(path, body);
+      const failure = await state.beforeWrite?.(path, body);
+      if (failure) return reply(failure);
       previous = objects.get(path);
       if (!previous) return reply(404);
       if (body.metadata.resourceVersion !== previous.metadata.resourceVersion)
@@ -150,6 +154,7 @@ async function fixture(t, { relist = false, ...extra } = {}) {
       if (isDeepStrictEqual(body, previous)) return reply(200, previous);
       body.metadata.resourceVersion = String(++version);
       objects.set(path, body);
+      if (state.loseWriteResponse?.(path, body)) return reply(503);
       return reply(200, body);
     }
     if (req.method === "PATCH") {
@@ -189,6 +194,7 @@ async function fixture(t, { relist = false, ...extra } = {}) {
         return reply(409);
       objects.delete(path);
       if (!state.pauseGc) gc();
+      if (state.loseDeleteResponse?.(path)) return res.destroy();
       return reply(200);
     }
     reply(400);
@@ -418,6 +424,297 @@ test("host and HTTP requests forward once, and the same capability URL survives 
   await runtimes[peerIndex].request({ op: "finalize", executionId: id });
   assert.equal(a.owns(id), false);
   assert.equal(b.owns(id), false);
+});
+
+test("rejected registration leaves no shared ownership and can retry with storage", async (t) => {
+  const { a, objects, cleanups } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: 0,
+    port: 0,
+    backend: { list: async () => [] },
+  });
+  const runtime = createControllerRuntime(controller.controlOrigin);
+  cleanups.unshift(async () => {
+    runtime.close();
+    await controller.stop({ finalize: false });
+  });
+  const registration = { op: "register", executionId: id, profileId: "account" };
+  await assert.rejects(
+    runtime.request(registration),
+    /browser_profile_storage_unavailable/,
+  );
+  assert(
+    ![...objects.values()].some(
+      (item) => item.metadata.labels?.["browser-sandbox.io/execution"] === id,
+    ),
+  );
+  assert((await runtime.request({ ...registration, storage: true })).wsEndpoint);
+});
+
+test("a same-ID registration queued behind rejected validation retries the deleted Lease", async (t) => {
+  const { a, cleanups, state } = await fixture(t);
+  const retryResolved = Promise.withResolvers();
+  const deleting = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  let resolves = 0;
+  const controller = await createController({
+    ownership: {
+      ...a,
+      async resolve(...args) {
+        const owner = await a.resolve(...args);
+        if (++resolves === 2) retryResolved.resolve();
+        return owner;
+      },
+    },
+    peerPort: 0,
+    port: 0,
+    backend: { list: async () => [] },
+    reconciliationMs: 60000,
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  state.beforeDelete = async (path) => {
+    if (!path.includes("/leases/") || !path.endsWith(id)) return;
+    deleting.resolve();
+    await resume.promise;
+  };
+  const registration = { op: "register", executionId: id };
+  const rejected = assert.rejects(
+    controller.command({ ...registration, profileId: "account" }),
+    /browser_profile_storage_unavailable/,
+  );
+  const signal = AbortSignal.timeout(5000);
+  let retry;
+  try {
+    await waitForControl(deleting.promise, signal);
+    retry = controller.command(registration);
+    retry.catch(() => {});
+    await waitForControl(retryResolved.promise, signal);
+  } finally {
+    resume.resolve();
+  }
+  await rejected;
+  assert((await retry).wsEndpoint);
+});
+
+test("a rejected fresh handoff does not leave a Lease for reconciliation to renew", async (t) => {
+  const { a, cleanups, state, objects } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: 0,
+    port: 0,
+    backend: { list: async () => [] },
+    reconciliationMs: 60000,
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  state.failSecretCreate = true;
+  const registration = { op: "register", executionId: id };
+  await assert.rejects(
+    controller.command(registration),
+    /browser_kubernetes_operation_failed/,
+  );
+  await controller.reconcile();
+  assert(![...objects.keys()].some((path) => path.endsWith(id)));
+  assert((await controller.command(registration)).wsEndpoint);
+});
+
+test("registration retry survives a committed cleanup whose Lease DELETE response was lost", async (t) => {
+  const { a, cleanups, state } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: 0,
+    port: 0,
+    backend: { list: async () => [] },
+    reconciliationMs: 60000,
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  state.loseDeleteResponse = (path) => path.includes("/leases/") && path.endsWith(id);
+  const registration = { op: "register", executionId: id };
+  await assert.rejects(
+    controller.command({ ...registration, profileId: "account" }),
+    /browser_profile_storage_unavailable/,
+  );
+  assert((await controller.command(registration)).wsEndpoint);
+});
+
+test("cancelling a registration during ownership lookup prevents the Lease write", async (t) => {
+  const { a, cleanups, state, objects } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: 0,
+    port: 0,
+    backend: { list: async () => [] },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  const started = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  const cancellation = new AbortController();
+  const registration = { op: "register", executionId: id };
+  state.beforeGet = async (path) => {
+    if (!path.includes("/leases/") || !path.endsWith(id)) return;
+    started.resolve();
+    await resume.promise;
+  };
+  const rejected = assert.rejects(
+    controller.command(registration, undefined, cancellation.signal),
+    /aborted|cancel/i,
+  );
+  let writes = 0;
+  state.beforePost = () => writes++;
+  try {
+    await waitForControl(started.promise, AbortSignal.timeout(2000));
+    cancellation.abort();
+  } finally {
+    resume.resolve();
+  }
+  await rejected;
+  assert.equal(writes, 0);
+  assert(![...objects.keys()].some((path) => path.endsWith(id)));
+});
+
+for (const cancelled of [false, true])
+  test(`registration recovers a committed Lease after response loss (${cancelled ? "cancelled" : "active"})`, async (t) => {
+    const { a, cleanups, state, objects } = await fixture(t);
+    const controller = await createController({
+      ownership: a,
+      peerPort: 0,
+      port: 0,
+      backend: { list: async () => [] },
+    });
+    cleanups.unshift(() => controller.stop({ finalize: false }));
+    const cancellation = new AbortController();
+    state.losePostResponse = (path) => {
+      if (!path.includes("/leases/") || !path.endsWith(id)) return false;
+      state.losePostResponse = undefined;
+      if (cancelled) cancellation.abort();
+      return true;
+    };
+    const registration = { op: "register", executionId: id };
+    const request = controller.command(registration, undefined, cancellation.signal);
+    if (cancelled) {
+      await assert.rejects(request, /aborted|timeout|cancel/i);
+      assert(![...objects.keys()].some((path) => path.endsWith(id)));
+      assert((await controller.command(registration)).wsEndpoint);
+    } else {
+      assert((await request).wsEndpoint);
+      await controller.command({ op: "finish", executionId: id });
+    }
+  });
+
+test("cancelling Profile acquisition rolls back registration and allows a same-id retry", async (t) => {
+  const { a, cleanups, state } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: 0,
+    port: 0,
+    backend: { list: async () => [] },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  const started = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  t.after(() => resume.resolve());
+  state.beforePost = async (_path, body) => {
+    if (body.metadata.labels["browser-sandbox.io/state"] !== "profile") return;
+    state.beforePost = undefined;
+    started.resolve();
+    await resume.promise;
+  };
+  const peer = { signal: new AbortController().signal, callback: async () => {} };
+  const cancellation = new AbortController();
+  const registration = {
+    op: "register",
+    executionId: id,
+    profileId: "account",
+    storage: true,
+  };
+  const rejected = assert.rejects(
+    controller.command(registration, peer, cancellation.signal),
+    /aborted|cancel/i,
+  );
+  await waitForControl(started.promise, AbortSignal.timeout(2000));
+  cancellation.abort();
+  const retry = controller.command({ op: "register", executionId: id }, peer);
+  resume.resolve();
+  await rejected;
+  assert((await retry).wsEndpoint);
+  assert(
+    (await controller.command({ ...registration, executionId: other }, peer))
+      .wsEndpoint,
+  );
+});
+
+test("an uncertain registration write releases its Profile without leaving a published endpoint", async (t) => {
+  const { a, cleanups, state } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: 0,
+    port: 0,
+    backend: { list: async () => [] },
+  });
+  const runtime = createControllerRuntime(controller.controlOrigin);
+  cleanups.unshift(async () => {
+    runtime.close();
+    await controller.stop({ finalize: false });
+  });
+  state.loseWriteResponse = (path, body) => {
+    if (!path.includes("/secrets/")) return false;
+    const { record } = JSON.parse(Buffer.from(body.data.record, "base64"));
+    return record?.data.grants?.length > 0;
+  };
+  const registration = {
+    op: "register",
+    executionId: id,
+    profileId: "account",
+    storage: true,
+  };
+  await assert.rejects(
+    runtime.request(registration),
+    /browser_kubernetes_operation_failed/,
+  );
+  state.loseWriteResponse = undefined;
+  await assert.rejects(
+    runtime.request({ op: "endpoint", executionId: id }),
+    /browser_execution_revoked/,
+  );
+  assert((await runtime.request({ ...registration, executionId: other })).wsEndpoint);
+});
+
+test("a rejected Profile contender leaves the current registration and its Lease intact", async (t) => {
+  const { a, b, ports, cleanups } = await fixture(t);
+  const controllers = [];
+  const runtimes = [];
+  cleanups.unshift(async () => {
+    for (const runtime of runtimes) runtime.close();
+    for (const controller of controllers) await controller.stop({ finalize: false });
+  });
+  for (const [index, ownership] of [a, b].entries()) {
+    const controller = await createController({
+      ownership,
+      peerPort: ports[index],
+      port: 0,
+      backend: { list: async () => [] },
+    });
+    controllers.push(controller);
+    runtimes.push(createControllerRuntime(controller.controlOrigin));
+  }
+  const registration = {
+    op: "register",
+    executionId: id,
+    profileId: "account",
+    storage: true,
+  };
+  const original = await runtimes[0].request(registration);
+  await assert.rejects(
+    runtimes[1].request({ ...registration, executionId: other }),
+    /browser_profile_busy/,
+  );
+  assert.deepEqual(
+    await runtimes[0].request({ op: "endpoint", executionId: id }),
+    original,
+  );
+  assert(
+    (await runtimes[1].request({ op: "register", executionId: other })).wsEndpoint,
+  );
 });
 
 test("an in-flight old-epoch Secret write loses its conditional update across takeover", async (t) => {
@@ -1038,6 +1335,488 @@ test("slow graceful shutdown keeps renewing until it conditionally releases owne
     await stopping;
   }
   assert.equal(a.owns(id), false);
+});
+
+test("shutdown drains worker finalization even when concurrent ownership discovery fails", async (t) => {
+  const { a, b, ports, cleanups } = await fixture(t, { relist: true });
+  const finalizing = Promise.withResolvers();
+  const finish = Promise.withResolvers();
+  const scanning = Promise.withResolvers();
+  const failScan = Promise.withResolvers();
+  const scanFailed = Promise.withResolvers();
+  const deadline = AbortSignal.timeout(5000);
+  let closed = false;
+  let failDiscovery = false;
+  const worker = {
+    id: "worker/uid",
+    executionId: id,
+    incarnation: other,
+    runtime: {
+      async request({ op }) {
+        if (op === "finalize") {
+          finalizing.resolve();
+          await finish.promise;
+          return { stopped: true, used: true };
+        }
+        return {
+          protocol: "browser-sandbox.worker/v2",
+          session: { state: "live", generation: "original" },
+        };
+      },
+      close() {
+        closed = true;
+      },
+    },
+  };
+  await a.resolve(id, true);
+  await a.journal.create(id, {
+    phase: "active",
+    workerId: worker.id,
+    incarnation: other,
+    allowedDomains: [],
+    registeredAt: Date.now() - 1000,
+    lastActivityAt: Date.now(),
+    grants: [],
+    workerProtocol: "browser-sandbox.worker/v2",
+    endpoint: {
+      cdpUrl: `ws://127.0.0.1:8081/execution/${"a".repeat(64)}`,
+      viewerToken: "b".repeat(64),
+    },
+  });
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    maxExecutionMs: 100,
+    backend: {
+      async list() {
+        if (!failDiscovery) return [worker];
+        scanning.resolve();
+        await failScan.promise;
+        scanFailed.resolve();
+        throw Error("browser_worker_discovery_failed");
+      },
+      async remove() {},
+    },
+  });
+  const pending = [];
+  cleanups.unshift(async () => {
+    finish.resolve();
+    failScan.resolve();
+    await Promise.allSettled(pending);
+    await controller.stop({ finalize: false });
+  });
+  pending.push(controller.reconcile(false));
+  await waitForControl(finalizing.promise, deadline);
+  failDiscovery = true;
+  pending.push(controller.reconcile());
+  await waitForControl(scanning.promise, deadline);
+  const stopping = controller.stop({ finalize: false });
+  pending.push(stopping.catch(() => {}));
+  failScan.resolve();
+  await waitForControl(scanFailed.promise, deadline);
+  await new Promise(setImmediate);
+  assert.equal(
+    closed,
+    false,
+    "worker control must remain open until finalization drains",
+  );
+  assert.equal(a.owns(id), true);
+  finish.resolve();
+  await assert.rejects(stopping, /browser_worker_discovery_failed/);
+  assert.equal((await b.journal.read(id)).data.phase, "finished");
+});
+
+test("shutdown rejects new registration before claiming Kubernetes ownership", async (t) => {
+  const { a, ports, state, cleanups } = await fixture(t);
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: { list: async () => [] },
+  });
+  const resume = Promise.withResolvers();
+  let stopping;
+  cleanups.unshift(async () => {
+    resume.resolve();
+    await (stopping ?? controller.stop({ finalize: false }));
+  });
+  await controller.command({ op: "register", executionId: id });
+  controller.bindings.get(id).persisted = resume.promise;
+  stopping = controller.stop({ finalize: false });
+  let claimed = false;
+  state.beforePost = (_path, body) => {
+    if (body.metadata.labels?.["browser-sandbox.io/execution"] === other)
+      claimed = true;
+  };
+  await assert.rejects(
+    controller.command({ op: "register", executionId: other }),
+    /browser_execution_revoked/,
+  );
+  assert.equal(claimed, false);
+});
+
+test("automatic takeover continues while another execution is finalizing", async (t) => {
+  const { a, b, ports, advance, cleanups, state } = await fixture(t);
+  const finalizing = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  const takenOver = Promise.withResolvers();
+  const deadline = AbortSignal.timeout(3000);
+  await b.resolve(other, true);
+  await b.journal.create(other, {
+    phase: "registered",
+    incarnation: id,
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+  });
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 10,
+    idleRegistrationMs: 1,
+    backend: { list: async () => [] },
+  });
+  cleanups.unshift(async () => {
+    resume.resolve();
+    await controller.stop({ finalize: false });
+  });
+  state.beforeWrite = async (path, body) => {
+    if (!path.includes("/secrets/") || !path.endsWith(id)) return;
+    const record = JSON.parse(Buffer.from(body.data.record, "base64")).record;
+    if (record?.data.phase === "finished") {
+      finalizing.resolve();
+      await resume.promise;
+    }
+  };
+  state.beforeGet = (path) => {
+    if (a.owns(other) && path.includes("/secrets/") && path.endsWith(other))
+      takenOver.resolve();
+  };
+  await controller.command({ op: "register", executionId: id });
+  await waitForControl(finalizing.promise, deadline);
+  for (const step of [7000, 7000, 1001]) {
+    advance(step);
+    await a.renew();
+  }
+  try {
+    await waitForControl(takenOver.promise, deadline);
+    assert.equal(a.owns(id), true);
+  } finally {
+    resume.resolve();
+  }
+});
+
+for (const canceled of [true, false])
+  test(
+    canceled
+      ? "shutdown preserves a worker when its active record commits during cancellation"
+      : "retry uses the original worker after the active record response is lost",
+    async (t) => {
+      const { a, b, ports, state, cleanups } = await fixture(t);
+      const entered = Promise.withResolvers();
+      const resume = Promise.withResolvers();
+      const deadline = AbortSignal.timeout(5000);
+      const upstream = createServer((_req, res) => res.end("original"));
+      await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+      cleanups.push(() => {
+        upstream.closeAllConnections();
+        return new Promise((resolve) => upstream.close(resolve));
+      });
+      const origin = `http://127.0.0.1:${upstream.address().port}`;
+      let worker;
+      let creations = 0;
+      const backend = {
+        preserveWorkersOnShutdown: true,
+        list: async () => (worker ? [worker] : []),
+        create: async ({ executionId, incarnation }) =>
+          (worker = {
+            id: `original/pod-${++creations}`,
+            executionId,
+            incarnation,
+            epoch: 1,
+            origin,
+            runtime: {
+              request: async ({ op }) =>
+                op === "register"
+                  ? {
+                      cdpUrl: `${origin.replace("http:", "ws:")}/execution/${"a".repeat(64)}`,
+                      viewerToken: "b".repeat(64),
+                    }
+                  : {
+                      protocol: "browser-sandbox.worker/v2",
+                      session: { state: "live", generation: "original" },
+                    },
+            },
+          }),
+        remove: async () => {
+          worker = undefined;
+        },
+      };
+      const controller = await createController({
+        ownership: a,
+        backend,
+        peerPort: ports[0],
+        reconciliationMs: 60000,
+        port: 0,
+      });
+      cleanups.unshift(() => {
+        resume.resolve();
+        return controller.stop({ finalize: false });
+      });
+      const endpoint = await controller.command({ op: "register", executionId: id });
+      const isActiveRecord = (body) => {
+        const record =
+          body.data?.record &&
+          JSON.parse(Buffer.from(body.data.record, "base64").toString()).record;
+        return record?.data.phase === "active";
+      };
+      if (canceled) {
+        state.beforeWrite = async (_path, body) => {
+          if (isActiveRecord(body)) {
+            entered.resolve();
+            await resume.promise;
+          }
+        };
+      } else {
+        state.loseWriteResponse = (_path, body) => {
+          if (!isActiveRecord(body)) return false;
+          state.loseWriteResponse = undefined;
+          return true;
+        };
+      }
+      const files = new URL(endpoint.wsEndpoint);
+      files.protocol = "http:";
+      files.pathname += "/files/example.txt";
+      const connection = fetch(files, { signal: deadline });
+      connection.catch(() => {});
+      if (!canceled) {
+        assert.equal((await connection).ok, false);
+        assert.equal(
+          await (await fetch(files, { signal: deadline })).text(),
+          "original",
+        );
+        return;
+      }
+      await waitForControl(entered.promise, deadline);
+      const stopSignal = controller.bindings.get(id).life.signal;
+      const cancelled = new Promise((resolve) =>
+        stopSignal.addEventListener("abort", resolve, { once: true }),
+      );
+      const stopping = controller.stop({ finalize: false });
+      stopping.catch(() => {});
+      await waitForControl(cancelled, deadline);
+      resume.resolve();
+      await stopping;
+      await connection.catch(() => {});
+      await b.resolve(id);
+      const successor = await createController({
+        ownership: b,
+        backend,
+        peerPort: ports[1],
+        reconciliationMs: 60000,
+        port: 0,
+      });
+      cleanups.unshift(() => successor.stop({ finalize: false }));
+      assert.equal(
+        await (
+          await fetch(successor.origin + files.pathname, { signal: deadline })
+        ).text(),
+        "original",
+      );
+    },
+  );
+
+test("queued writes from a detached binding cannot publish under a reacquired Lease", async (t) => {
+  const { a, ports, state, advance, cleanups } = await fixture(t);
+  const activeWrite = Promise.withResolvers();
+  const continueWrite = Promise.withResolvers();
+  const deadline = AbortSignal.timeout(5000);
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => [],
+      create: async ({ executionId, incarnation }) => ({
+        id: "worker/uid",
+        executionId,
+        incarnation,
+        runtime: {
+          request: async () => ({
+            cdpUrl: `ws://127.0.0.1:8081/execution/${"a".repeat(64)}`,
+            viewerToken: "b".repeat(64),
+          }),
+        },
+      }),
+      async remove() {},
+    },
+  });
+  const requests = [];
+  cleanups.unshift(async () => {
+    continueWrite.resolve();
+    await Promise.allSettled(requests);
+    await controller.stop({ finalize: false });
+  });
+  const { wsEndpoint } = await controller.command({ op: "register", executionId: id });
+  state.beforeWrite = async (path, body) => {
+    if (!path.includes("/secrets/")) return;
+    const record = JSON.parse(Buffer.from(body.data.record, "base64")).record;
+    if (record?.data.phase !== "active") return;
+    state.beforeWrite = undefined;
+    activeWrite.resolve();
+    await continueWrite.promise;
+  };
+  const files = new URL(wsEndpoint);
+  files.protocol = "http:";
+  files.pathname += "/files/example.txt";
+  const fetching = fetch(files, { signal: deadline });
+  requests.push(fetching.catch(() => {}));
+  await waitForControl(activeWrite.promise, deadline);
+  const revoking = controller.command({ op: "access_revoke", executionId: id });
+  requests.push(revoking.catch(() => {}));
+  assert.equal((await fetching).status, 403);
+
+  advance(15001);
+  assert.equal((await a.resolve(id)).epoch, 2);
+  assert.equal((await a.journal.read(id)).data.phase, "starting");
+  continueWrite.resolve();
+  await Promise.allSettled(requests);
+
+  assert.equal((await a.journal.read(id)).data.phase, "starting");
+  await assert.rejects(revoking, /browser_controller_fenced/);
+});
+
+test("Pod cleanup cannot delete a published worker while a new controller claims its Lease", async (t) => {
+  const { a, b, state, apiServer, advance } = await fixture(t);
+  const deadline = AbortSignal.timeout(5000);
+  const backend = await createKubernetesBackend({
+    apiServer,
+    namespace: "test",
+    installation: "test",
+    ownerName: "workers",
+    image: `browser-sandbox@sha256:${"a".repeat(64)}`,
+    template: {
+      securityContext: {
+        seccompProfile: { type: "Localhost", localhostProfile: "browser-sandbox.json" },
+      },
+    },
+    ownership: a,
+  });
+  await a.resolve(id, true);
+  const worker = await backend.create(
+    { executionId: id, incarnation: other },
+    deadline,
+  );
+  t.after(() => worker.runtime.close());
+  await a.journal.create(id, { phase: "active", workerId: worker.id });
+  await b.resolve(id);
+  const entered = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  state.beforeDelete = async (path) => {
+    if (!path.includes("/pods/")) return;
+    entered.resolve();
+    await resume.promise;
+  };
+  const removing = backend.remove(worker, deadline);
+  removing.catch(() => {});
+  try {
+    await waitForControl(
+      Promise.race([entered.promise, removing.catch(() => {})]),
+      deadline,
+    );
+    advance(15001);
+    await b.resolve(id);
+  } finally {
+    resume.resolve();
+  }
+  await assert.rejects(removing, /browser_worker_still_active/);
+  assert.equal(b.owns(id), true);
+  assert.equal((await b.journal.read(id)).data.workerId, worker.id);
+});
+
+test("takeover persists cleanup intent before reclaiming an unreachable temporary worker", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const { a, b, state, apiServer, advance, ports, cleanups } = await fixture(t);
+  const deadline = AbortSignal.timeout(5000);
+  const connectBackend = (ownership) =>
+    createKubernetesBackend({
+      apiServer,
+      namespace: "test",
+      installation: "test",
+      ownerName: "workers",
+      image: `browser-sandbox@sha256:${"a".repeat(64)}`,
+      template: {
+        securityContext: {
+          seccompProfile: {
+            type: "Localhost",
+            localhostProfile: "browser-sandbox.json",
+          },
+        },
+      },
+      ownership,
+    });
+  const original = await connectBackend(a);
+  await a.resolve(id, true);
+  const worker = await original.create(
+    { executionId: id, incarnation: other },
+    deadline,
+  );
+  cleanups.unshift(() => worker.runtime.close());
+  await a.journal.create(id, {
+    phase: "active",
+    workerId: worker.id,
+    incarnation: other,
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+    workerProtocol: "browser-sandbox.worker/v2",
+    endpoint: {
+      cdpUrl: `ws://127.0.0.1:8081/execution/${"a".repeat(64)}`,
+      viewerToken: "b".repeat(64),
+    },
+  });
+  await b.resolve(id);
+  advance(15001);
+  const successor = await connectBackend(b);
+  const controller = await createController({
+    ownership: b,
+    peerPort: ports[1],
+    reconciliationMs: 60000,
+    port: 0,
+    backend: {
+      ...successor,
+      async list(...args) {
+        const workers = await successor.list(...args);
+        for (const worker of workers) {
+          worker.runtime.request = async () => {
+            throw Error("browser_control_unavailable");
+          };
+        }
+        return workers;
+      },
+    },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  const deletes = [];
+  state.beforeDelete = async (path) => {
+    if (path.includes("/pods/")) deletes.push((await b.journal.read(id)).data.phase);
+  };
+  await controller.reconcile();
+  t.mock.timers.tick(1001);
+  await controller.reconcile();
+  assert.deepEqual(deletes, []);
+  t.mock.timers.tick(2001);
+  await controller.reconcile();
+  assert.deepEqual(deletes, ["finalizing"]);
+  assert.equal(controller.capacity().workers, 0);
+  assert.equal((await b.journal.read(id)).data.phase, "finished");
 });
 
 for (const deletionFails of [false, true])
@@ -1859,6 +2638,97 @@ test("maintenance cleanup does not claim unready executions and API failures do 
   assert.equal(await a.journal.read(id), undefined);
 });
 
+for (const operation of ["Lease read", "Secret read", "Secret write", "renewal"])
+  test(`a stale ${operation} cannot act on a replacement local owner`, async (t) => {
+    const { a, state, advance } = await fixture(t);
+    await a.resolve(id, true);
+    await a.journal.create(id, { phase: "registered", marker: "original" });
+    const entered = Promise.withResolvers();
+    const resume = Promise.withResolvers();
+    const lease = operation === "Lease read" || operation === "renewal";
+    const hook = operation.endsWith("read") ? "beforeGet" : "beforeWrite";
+    state.readAfterGet = operation === "Secret read";
+    state[hook] = async (path) => {
+      if (!path.includes(lease ? "/leases/" : "/secrets/") || !path.endsWith(id))
+        return;
+      state[hook] = undefined;
+      entered.resolve();
+      await resume.promise;
+      if (operation === "renewal") return 503;
+    };
+    const start = {
+      "Lease read": () => a.assertOwned(id),
+      "Secret read": () =>
+        a.journal.update(id, 1, { phase: "registered", marker: "stale" }),
+      "Secret write": () =>
+        a.journal.update(id, 1, { phase: "registered", marker: "stale" }),
+      renewal: () => a.renew(),
+    }[operation];
+    const pending = start();
+    const result =
+      operation === "renewal"
+        ? pending
+        : assert.rejects(pending, /browser_controller_fenced/);
+    try {
+      await waitForControl(entered.promise, AbortSignal.timeout(5000));
+      advance(15001);
+      assert.equal((await a.resolve(id)).epoch, 2);
+    } finally {
+      resume.resolve();
+    }
+    await result;
+    assert.equal(a.owns(id), true);
+    assert.equal((await a.journal.read(id)).data.marker, "original");
+  });
+
+for (const queued of [false, true])
+  test(`a ${queued ? "queued" : "reading"} Profile acquisition cannot use a replacement local epoch`, async (t) => {
+    const { a, state, advance } = await fixture(t);
+    const profileId = "epoch-profile";
+    await a.resolve(id, true);
+    await a.journal.create(id, {
+      phase: "registered",
+      profileId,
+      profileAcquired: false,
+    });
+    const entered = Promise.withResolvers();
+    const resume = Promise.withResolvers();
+    const wait = async () => {
+      entered.resolve();
+      await resume.promise;
+    };
+    let maintenance;
+    if (queued) {
+      maintenance = a.withUnleasedProfile(profileId, wait);
+    } else {
+      state.readAfterGet = true;
+      state.beforeGet = async (path) => {
+        if (!path.includes("/leases/") || !path.includes("-p-")) return;
+        state.beforeGet = undefined;
+        await wait();
+      };
+    }
+    const signal = AbortSignal.timeout(5000);
+    let rejected;
+    try {
+      if (queued) await waitForControl(entered.promise, signal);
+      rejected = assert.rejects(
+        a.acquireProfile(id, profileId),
+        /browser_controller_fenced/,
+      );
+      if (!queued) await waitForControl(entered.promise, signal);
+      advance(15001);
+      assert.equal((await a.resolve(id)).epoch, 2);
+    } finally {
+      resume.resolve();
+    }
+    await maintenance;
+    await rejected;
+    assert.equal(await a.withUnleasedProfile(profileId, async () => true), true);
+    await a.acquireProfile(id, profileId);
+    assert.equal(await a.withUnleasedProfile(profileId, async () => true), undefined);
+  });
+
 test("Secret snapshot precedes fresh Lease check even when the response arrives after handoff", async (t) => {
   const { a, b, state, objects } = await fixture(t);
   await a.resolve(id, true);
@@ -2192,7 +3062,7 @@ for (const restoring of [false, true])
       port: 0,
       reconciliationMs: 60000,
       profileStore: {
-        open: () => ({}),
+        open: () => ({ close: async () => {} }),
         expire: async (_signal, isBusy) => {
           busy = isBusy("delayed");
           return 0;
@@ -2231,6 +3101,212 @@ for (const restoring of [false, true])
     await c.expireProfiles();
     assert.equal(busy, false);
   });
+
+test("resuming pending volume registration attaches the Profile before first browser use", async (t) => {
+  const { a, b, ports, advance, cleanups } = await fixture(t);
+  const profileId = "resumed-volume";
+  await a.resolve(id, true);
+  await a.journal.create(id, {
+    phase: "registered",
+    profileId,
+    profileAcquired: false,
+    storageMode: "volume",
+    incarnation: other,
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+  });
+  await b.resolve(id);
+  advance(15001);
+
+  let seed;
+  const worker = createServer((_req, res) => {
+    res.writeHead(seed === null ? 204 : 424).end();
+  });
+  await new Promise((resolve) => worker.listen(0, "127.0.0.1", resolve));
+  cleanups.unshift(
+    () =>
+      new Promise((resolve) => {
+        worker.closeAllConnections();
+        worker.close(resolve);
+      }),
+  );
+  const origin = `http://127.0.0.1:${worker.address().port}`;
+  const root = await mkdtemp(join(tmpdir(), "resumed-volume-profile-"));
+  cleanups.unshift(() => rm(root, { recursive: true, force: true }));
+  const store = await createProfileStore({ root, baseUrl: origin });
+  cleanups.unshift(() => store.close());
+  const controller = await createController({
+    ownership: b,
+    peerPort: ports[1],
+    port: 0,
+    profileStore: store,
+    reconciliationMs: 60000,
+    backend: {
+      list: async () => [],
+      create: async ({ executionId, incarnation, profileId }) => ({
+        id: "worker/uid",
+        executionId,
+        incarnation,
+        profileId,
+        origin,
+        runtime: {
+          request: async () => ({ cdpUrl: `ws://127.0.0.1:${worker.address().port}` }),
+          attachStorage: async (_, adapter, signal) => {
+            ({ seed } = await adapter.load(signal));
+            return { close() {} };
+          },
+        },
+      }),
+    },
+  });
+  cleanups.unshift(() => controller.stop({ finalize: false }));
+  const runtime = createControllerRuntime(controller.controlOrigin);
+  cleanups.unshift(() => runtime.close());
+  const { wsEndpoint } = await runtime.request({
+    op: "register",
+    executionId: id,
+    profileId,
+  });
+  const response = await fetch(wsEndpoint.replace("ws:", "http:") + "/files/profile", {
+    signal: AbortSignal.timeout(5000),
+  });
+  assert.equal(response.status, 204);
+});
+
+test("a controller waits for its old volume session before recovering the same Profile", async (t) => {
+  const { a, b, ports, advance, cleanups } = await fixture(t);
+  const root = await mkdtemp(join(tmpdir(), "reclaimed-volume-profile-"));
+  cleanups.push(() => rm(root, { recursive: true, force: true }));
+  const store = await createProfileStore({ root, baseUrl: "http://127.0.0.1:1" });
+  cleanups.unshift(() => store.close());
+  const entered = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  const controller = await createController({
+    ownership: a,
+    peerPort: ports[0],
+    port: 0,
+    reconciliationMs: 60000,
+    profileStore: {
+      ...store,
+      open(profileId) {
+        const adapter = store.open(profileId);
+        return {
+          ...adapter,
+          async close() {
+            entered.resolve();
+            await resume.promise;
+            return adapter.close();
+          },
+        };
+      },
+    },
+    backend: { list: async () => [] },
+  });
+  cleanups.unshift(async () => {
+    resume.resolve();
+    await controller.stop({ finalize: false });
+  });
+  const registration = { op: "register", executionId: id, profileId: "account" };
+  const original = await controller.command(registration);
+  await b.resolve(id);
+  advance(15001);
+  await b.resolve(id);
+  await a.refresh();
+  await b.release();
+  await a.refresh();
+  const recovering = controller.command(registration);
+  recovering.catch(() => {});
+  try {
+    await waitForControl(
+      Promise.race([entered.promise, recovering]),
+      AbortSignal.timeout(5000),
+    );
+  } finally {
+    resume.resolve();
+  }
+  assert.deepEqual(await recovering, original);
+});
+
+test("a replacement controller preserves volume archives while their durable Profile Lease is held", async (t) => {
+  const { a, b, objects, state, ports, cleanups } = await fixture(t);
+  const profileId = "account";
+  const root = await mkdtemp(join(tmpdir(), "leased-profile-"));
+  cleanups.push(() => rm(root, { recursive: true, force: true }));
+  const data = Buffer.from("archive");
+  const objectKey = "a".repeat(64);
+  const sha256 = (value) => createHash("sha256").update(value).digest("hex");
+  await writeFile(join(root, `${objectKey}.archive`), data, { mode: 0o600 });
+  await writeFile(
+    join(root, "index.json"),
+    JSON.stringify({
+      schema: "browser-sandbox.profile-store/v1",
+      profiles: {
+        [sha256(profileId)]: {
+          profileId,
+          key: "b".repeat(64),
+          lastUsed: 0,
+          archive: {
+            schema: "browser-sandbox.profile/v1",
+            browserVersion: "fixture",
+            iv: "1".repeat(24),
+            tag: "2".repeat(32),
+            sha256: sha256(data),
+            byteSize: data.length,
+            objectKey,
+          },
+        },
+      },
+    }),
+    { mode: 0o600 },
+  );
+  const store = await createProfileStore({
+    root,
+    baseUrl: "http://127.0.0.1",
+    idleTtlMs: 500,
+    now: () => 1000,
+  });
+  cleanups.unshift(() => store.close());
+
+  await a.resolve(id, true);
+  await a.journal.create(id, {
+    phase: "registered",
+    profileId,
+    profileAcquired: true,
+    storageMode: "volume",
+    incarnation: other,
+    allowedDomains: [],
+    registeredAt: Date.now(),
+    lastActivityAt: Date.now(),
+    grants: [],
+  });
+  await a.acquireProfile(id, profileId);
+  const c = await createController({
+    ownership: b,
+    peerPort: ports[1],
+    port: 0,
+    profileStore: store,
+    reconciliationMs: 60000,
+    backend: { list: async () => [] },
+  });
+  cleanups.unshift(() => c.stop({ finalize: false }));
+  const runtime = createControllerRuntime(c.controlOrigin);
+  cleanups.unshift(() => runtime.close());
+  const remove = () => runtime.request({ op: "profile_delete", profileId });
+  await assert.rejects(remove(), /browser_profile_busy/);
+  assert.equal(await c.expireProfiles(), 0);
+
+  await a.journal.update(id, 1, { phase: "finished", profileId });
+  await a.complete(id);
+  const profileLeasePath = [...objects.keys()].find((path) => path.includes("-p-"));
+  state.failGet = profileLeasePath;
+  await assert.rejects(remove(), /browser_kubernetes_operation_failed/);
+  await assert.rejects(c.expireProfiles(), /browser_kubernetes_operation_failed/);
+  assert.deepEqual(await readFile(join(root, `${objectKey}.archive`)), data);
+  state.failGet = undefined;
+  assert.deepEqual(await remove(), { deleted: true });
+});
 
 test("a controller can register a compacted finished id under its new Lease UID", async (t) => {
   const { a, ports, cleanups } = await fixture(t, { maxFinished: 1 });

@@ -539,6 +539,11 @@ export async function createProfileStore({
     async expire(
       signal?: AbortSignal,
       isLeased: (profileId: string) => boolean = () => false,
+      whenUnleased?: (
+        profileId: string,
+        work: () => Promise<void>,
+        signal?: AbortSignal,
+      ) => Promise<void>,
     ) {
       if (!idleTtlMs) return 0;
       let count = 0;
@@ -549,28 +554,31 @@ export async function createProfileStore({
           record.lastUsed + idleTtlMs <= now()
         ) {
           // Recheck activity under the same metadata queue as commit/delete.
-          await serial(async () => {
-            check(signal);
-            const id = profileKey(record.profileId),
-              current = profiles[id];
-            if (
-              !current ||
-              sessions.has(record.profileId) ||
-              isLeased(record.profileId) ||
-              current.lastUsed + idleTtlMs > now()
-            )
-              return;
-            deleting.add(record.profileId);
-            try {
-              const next = { ...profiles };
-              delete next[id];
-              await publish(next, signal);
-              await removeObject(current.archive.objectKey);
-              count++;
-            } finally {
-              deleting.delete(record.profileId);
-            }
-          });
+          const expire = () =>
+            serial(async () => {
+              check(signal);
+              const id = profileKey(record.profileId),
+                current = profiles[id];
+              if (
+                !current ||
+                sessions.has(record.profileId) ||
+                isLeased(record.profileId) ||
+                current.lastUsed + idleTtlMs > now()
+              )
+                return;
+              deleting.add(record.profileId);
+              try {
+                const next = { ...profiles };
+                delete next[id];
+                await publish(next, signal);
+                await removeObject(current.archive.objectKey);
+                count++;
+              } finally {
+                deleting.delete(record.profileId);
+              }
+            });
+          if (whenUnleased) await whenUnleased(record.profileId, expire, signal);
+          else await expire();
         }
       }
       return count;
