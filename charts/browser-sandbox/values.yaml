@@ -90,6 +90,8 @@ profileStore:
 
 # Retained controller-only execution journal, independent of Profile storage.
 controllerData:
+  # A fresh multi-replica installation without a journal can skip provisioning.
+  skipCreation: false
   existingClaim: ""
   storageClass: ""
   size: 1Gi

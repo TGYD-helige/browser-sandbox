@@ -59,6 +59,7 @@ export interface ExecutionOwner {
   epoch: number;
   uid: string;
   finished?: boolean;
+  created?: boolean;
 }
 
 /** Shared ownership contract; platform arbitration and persistence stay in its adapter. */
@@ -67,7 +68,11 @@ export interface ExecutionOwnership {
   /** Cached unfinished executions; refresh() relists them from the platform. */
   active(): string[];
   needsRelist(): boolean;
-  resolve(id: string, create?: boolean): Promise<ExecutionOwner | undefined>;
+  resolve(
+    id: string,
+    create?: boolean,
+    signal?: AbortSignal,
+  ): Promise<ExecutionOwner | undefined>;
   assertOwned(id: string): Promise<{ epoch: number; uid: string }>;
   epoch(id: string): number | undefined;
   owns(id: string): boolean;
@@ -75,7 +80,18 @@ export interface ExecutionOwnership {
   findCapability(token: string): string | undefined;
   indexLegacy(record: ExecutionRecord): Promise<void>;
   acquireProfile(id: string, profileId: string): Promise<void>;
-  complete(id: string): Promise<void>;
+  /** Run volume maintenance only while the durable Profile Lease is free. */
+  withUnleasedProfile<T>(
+    profileId: string,
+    work: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T | undefined>;
+  discardRegistration(
+    id: string,
+    owner: ExecutionOwner,
+    incarnation?: string,
+  ): Promise<void>;
+  complete(id: string): Promise<boolean>;
   refresh(): Promise<string[]>;
   watch(): Promise<void>;
   release(): Promise<void>;

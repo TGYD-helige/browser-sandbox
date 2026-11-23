@@ -1,9 +1,15 @@
-{{- $replicas := int .Values.controller.replicas }}
+{{- $replicas := 1 }}
+{{- if hasKey .Values.controller "replicas" }}
+{{- $replicas = int .Values.controller.replicas }}
+{{- end }}
 {{- if or (lt $replicas 1) (gt $replicas 100) }}
 {{- fail "controller.replicas must be between 1 and 100" }}
 {{- end }}
 {{- if and (gt $replicas 1) .Values.profileStore.enabled }}
 {{- fail "profileStore.enabled is incompatible with controller.replicas > 1; use host remote storage" }}
+{{- end }}
+{{- if and (eq $replicas 1) .Values.controllerData.skipCreation (not .Values.controllerData.existingClaim) }}
+{{- fail "controllerData.skipCreation requires controllerData.existingClaim when controller.replicas is 1" }}
 {{- end }}
 {{- range $name, $_ := .Values.runtime }}
 {{- if not (has $name (list "TIMEOUT" "TZ" "BROWSER_STARTUP_TIMEOUT" "LANG")) }}

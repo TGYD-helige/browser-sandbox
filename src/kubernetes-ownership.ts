@@ -25,6 +25,10 @@ const absent = (error: unknown) =>
   error instanceof KubernetesError && error.status === 404;
 const conflict = (error: unknown) =>
   error instanceof KubernetesError && error.status === 409;
+const uncertainMutation = (error: unknown) =>
+  !(error instanceof KubernetesError) ||
+  error.status >= 500 ||
+  [408, 499].includes(error.status);
 
 const validPeerOrigin = (value: string) => {
   try {
@@ -86,10 +90,8 @@ export async function createKubernetesOwnership(
     string,
     { lease: any; changedAt: number; hashes: Set<string> }
   >();
-  const owned = new Map<
-    string,
-    { epoch: number; uid: string; deadline: number; ready: boolean }
-  >();
+  type LocalOwner = { epoch: number; uid: string; deadline: number; ready: boolean };
+  const owned = new Map<string, LocalOwner>();
   const legacyCapabilities = new Map<string, string>();
   let listing: Set<string> | undefined;
   // A watch gap can hide DELETED events; the next reconciliation relists.
@@ -111,7 +113,12 @@ export async function createKubernetesOwnership(
   let leaseVersion = "";
   let expired = false;
   let lost: (id: string) => void = () => {};
-  const signal = () => AbortSignal.any([life.signal, AbortSignal.timeout(15000)]);
+  const signal = (caller?: AbortSignal) =>
+    AbortSignal.any([
+      life.signal,
+      AbortSignal.timeout(15000),
+      ...(caller ? [caller] : []),
+    ]);
   const verify = (object: any, expectedName: string, state = "execution") => {
     const expected =
       object?.kind === "Secret" && state === "execution"
@@ -132,8 +139,8 @@ export async function createKubernetesOwnership(
     )
       throw Error("browser_controller_state_corrupt");
   };
-  const forget = (id: string) => {
-    if (owned.delete(id)) lost(id);
+  const forget = (id: string, local = owned.get(id)) => {
+    if (owned.get(id) === local && owned.delete(id)) lost(id);
   };
   const evict = (id: string, uid?: string) => {
     if (uid && observed.has(id) && observed.get(id).lease.metadata.uid !== uid) return;
@@ -201,14 +208,17 @@ export async function createKubernetesOwnership(
       forget(id);
     return ownerOf(lease);
   };
-  const get = (path: string) =>
-    api(path, "GET", undefined, signal()).catch((error) => {
+  const get = (path: string, caller?: AbortSignal) =>
+    api(path, "GET", undefined, signal(caller)).catch((error) => {
+      caller?.throwIfAborted();
       if (!absent(error)) throw error;
     });
-  const readOwnedLease = async (id: string) => {
-    const local = owned.get(id);
+  const readOwnedLease = async (id: string, local = owned.get(id)) => {
     const lease =
-      local && now() < local.deadline && (await get(`${leases}/${name(id)}`));
+      local &&
+      owned.get(id) === local &&
+      now() < local.deadline &&
+      (await get(`${leases}/${name(id)}`));
     if (
       !lease ||
       lease.spec?.holderIdentity !== options.replica ||
@@ -217,15 +227,11 @@ export async function createKubernetesOwnership(
       owned.get(id) !== local ||
       now() >= local.deadline
     ) {
-      forget(id);
+      forget(id, local);
       throw Error("browser_controller_fenced");
     }
     observe(lease);
     return lease;
-  };
-  const assertOwned = async (id: string) => {
-    const lease = await readOwnedLease(id);
-    return { ...ownerOf(lease), name: lease.metadata.name };
   };
   const decode = (secret: any, id: string): ExecutionRecord | undefined => {
     verify(secret, name(id));
@@ -317,6 +323,25 @@ export async function createKubernetesOwnership(
     path: string,
     { uid, resourceVersion }: { uid: string; resourceVersion: string },
   ) => api(path, "DELETE", { preconditions: { uid, resourceVersion } }, signal());
+  const deleteExecutionLease = async (
+    id: string,
+    metadata: { uid: string; resourceVersion: string },
+  ) => {
+    const path = `${leases}/${name(id)}`;
+    try {
+      await deleteVersion(path, metadata);
+    } catch (error) {
+      if (!absent(error)) {
+        if (!uncertainMutation(error)) throw error;
+        const remaining = await get(path);
+        if (remaining) {
+          verify(remaining, name(id));
+          if (remaining.metadata.uid === metadata.uid) throw error;
+        }
+      }
+    }
+    evict(id, metadata.uid);
+  };
   const secretOwnedBy = (secret: any, uid: string) =>
     secret?.metadata.ownerReferences[0].uid === uid;
   const handoff = async (id: string) => {
@@ -342,15 +367,18 @@ export async function createKubernetesOwnership(
   const resolveOnce = async (
     id: string,
     create = false,
+    callerSignal?: AbortSignal,
   ): Promise<ExecutionOwner | undefined> => {
+    callerSignal?.throwIfAborted();
     if (!validId(id)) throw Error("browser_execution_id_invalid");
-    let lease = observed.get(id)?.lease ?? (await get(`${leases}/${name(id)}`));
+    let lease =
+      observed.get(id)?.lease ?? (await get(`${leases}/${name(id)}`, callerSignal));
     if (
       lease &&
       now() - (observed.get(id)?.changedAt ?? now()) >=
         lease.spec.leaseDurationSeconds * 1000
     )
-      lease = await get(`${leases}/${name(id)}`);
+      lease = await get(`${leases}/${name(id)}`, callerSignal);
     let current = lease && observe(lease);
     if (!lease && !create) return;
     const observation = observed.get(id);
@@ -359,8 +387,17 @@ export async function createKubernetesOwnership(
       (!current?.replica ||
         now() - observation.changedAt >= lease.spec.leaseDurationSeconds * 1000);
     if (!lease || expired) {
+      callerSignal?.throwIfAborted();
+      const created = !lease;
+      const uid = lease?.metadata.uid;
       const epoch = Number(lease?.metadata.annotations[prefix + "epoch"] ?? 0) + 1;
       const started = now();
+      const claim = {
+        holderIdentity: options.replica,
+        leaseDurationSeconds: Math.ceil(leaseMs / 1000),
+        renewTime: renewTime(),
+      };
+      let acquired = true;
       try {
         lease = await saveLease(
           lease ?? {
@@ -374,56 +411,100 @@ export async function createKubernetesOwnership(
             [prefix + "peer"]: options.peerOrigin,
             [prefix + "phase"]: "active",
           },
-          {
-            holderIdentity: options.replica,
-            leaseDurationSeconds: Math.ceil(leaseMs / 1000),
-            renewTime: renewTime(),
-          },
+          claim,
         );
-        owned.set(id, {
-          epoch,
-          uid: lease.metadata.uid,
-          deadline: started + leaseMs,
-          ready: false,
-        });
-        current = ownerOf(lease);
       } catch (error) {
-        if (!conflict(error) && !absent(error)) throw error;
-        const uid = lease?.metadata.uid;
+        const contended = conflict(error) || absent(error);
+        if (!contended && !uncertainMutation(error)) throw error;
         lease = await get(`${leases}/${name(id)}`);
+        if (
+          !contended &&
+          (!lease ||
+            (uid && lease.metadata.uid !== uid) ||
+            lease.metadata.annotations?.[prefix + "epoch"] !== String(epoch) ||
+            lease.metadata.annotations?.[prefix + "peer"] !== options.peerOrigin ||
+            lease.spec?.holderIdentity !== claim.holderIdentity ||
+            lease.spec?.renewTime !== claim.renewTime)
+        )
+          throw error;
         if (!lease) {
           if (uid) evict(id, uid);
           if (!create) return;
           throw Error("browser_controller_owner_moved");
         }
         current = observe(lease);
+        acquired = !contended;
+      }
+      if (acquired) {
+        owned.set(id, {
+          epoch,
+          uid: lease.metadata.uid,
+          deadline: started + leaseMs,
+          ready: false,
+        });
+        current = { ...ownerOf(lease), created };
       }
     }
     if (current?.replica === options.replica) {
       const local = owned.get(id);
       if (!local) throw Error("browser_controller_fenced");
       if (!local.ready) {
-        await handoff(id);
-        await assertOwned(id);
+        try {
+          await handoff(id);
+          await assertOwned(id);
+        } catch (error) {
+          // This newly created Lease has never admitted a registration or worker.
+          if (current.created) {
+            try {
+              await deleteExecutionLease(id, lease.metadata);
+            } catch (cleanup) {
+              throw Error("browser_registration_cleanup_unconfirmed", {
+                cause: new AggregateError([error, cleanup]),
+              });
+            }
+          }
+          throw error;
+        }
         local.ready = true;
       }
     }
     return current;
   };
   const serialize = createSerialWork();
-  const resolve = (id: string, create = false) =>
-    serialize(id, () => resolveOnce(id, create));
-  const readOwnedRecord = async (id: string) => {
+  const resolve = (id: string, create = false, signal?: AbortSignal) =>
+    serialize(id, () => resolveOnce(id, create, signal));
+  const readOwnedRecord = async (id: string, local = owned.get(id)) => {
+    if (!local || owned.get(id) !== local) throw Error("browser_controller_fenced");
     const { secret, record } = await readSecret(id);
-    const lease = await readOwnedLease(id);
-    if (!secretOwnedBy(secret, lease.metadata.uid)) {
-      forget(id);
+    const lease = await readOwnedLease(id, local);
+    if (owned.get(id) !== local || !secretOwnedBy(secret, lease.metadata.uid)) {
+      forget(id, local);
       throw Error("browser_controller_fenced");
     }
-    return { lease, secret, record };
+    return { lease, secret, record, local };
+  };
+  const assertOwned = async (id: string, removingWorkerId?: string) => {
+    const { lease, record } = removingWorkerId
+      ? await readOwnedRecord(id)
+      : { lease: await readOwnedLease(id), record: undefined };
+    // A Pod DELETE cannot check a Lease and Pod revision atomically. Only allow
+    // deletion once the worker is no longer eligible for active recovery.
+    if (
+      removingWorkerId &&
+      record?.data.workerId === removingWorkerId &&
+      ![
+        "finalizing",
+        "cleanup-pending",
+        "recovery-required",
+        "recovery-blocked",
+        "finished",
+      ].some((phase) => record.data.phase === phase)
+    )
+      throw Error("browser_worker_still_active");
+    return { ...ownerOf(lease), name: lease.metadata.name };
   };
   const write = async (id: string, revision: number, data: Record<string, unknown>) => {
-    const { lease, secret, record: previous } = await readOwnedRecord(id);
+    const { lease, secret, record: previous, local } = await readOwnedRecord(id);
     if ((previous?.revision ?? 0) !== revision)
       throw Error(
         revision ? "browser_execution_record_changed" : "browser_execution_revoked",
@@ -433,7 +514,7 @@ export async function createKubernetesOwnership(
       await saveRecord(id, secret, record, ownerOf(lease));
     } catch (error) {
       if (conflict(error)) {
-        forget(id);
+        forget(id, local);
         throw Error("browser_controller_fenced");
       }
       throw error;
@@ -444,13 +525,15 @@ export async function createKubernetesOwnership(
     id: string,
     profileId: unknown,
     action: "acquire" | "release" | "fence",
+    local = owned.get(id),
   ) => {
     if (!validProfileId(profileId)) throw Error("browser_profile_id_invalid");
     const key = profileName(profileId),
       path = `${leases}/${key}`;
     for (let attempt = 0; attempt < (action === "fence" ? 16 : 1); attempt++) {
+      if (!local || owned.get(id) !== local) throw Error("browser_controller_fenced");
       const previous = await get(path);
-      const { lease, record } = await readOwnedRecord(id);
+      const { lease, record } = await readOwnedRecord(id, local);
       if (!record || record.data.profileId !== profileId)
         throw Error("browser_profile_binding_invalid");
       const finished = record.data.phase === "finished";
@@ -503,6 +586,7 @@ export async function createKubernetesOwnership(
     }
     throw Error("browser_controller_owner_moved");
   };
+  const serializeProfile = createSerialWork();
   const indexLegacy = async (record: ExecutionRecord) => {
     const id = record.executionId;
     const lease = await readOwnedLease(id);
@@ -519,11 +603,15 @@ export async function createKubernetesOwnership(
     );
   };
   const complete = async (id: string) => {
-    const { lease, record } = await readOwnedRecord(id);
+    const { lease, record, local } = await readOwnedRecord(id);
     if (record?.data.phase !== "finished")
       throw Error("browser_execution_record_changed");
     if (record.data.profileId)
-      await profile(id, String(record.data.profileId), "release");
+      await profile(id, String(record.data.profileId), "release", local);
+    if (record.data.registrationAborted === true) {
+      await deleteExecutionLease(id, lease.metadata);
+      return false;
+    }
     await saveLease(
       lease,
       {
@@ -535,6 +623,60 @@ export async function createKubernetesOwnership(
       },
       { holderIdentity: "" },
     );
+    return true;
+  };
+  const discardRegistration = async (
+    id: string,
+    owner: ExecutionOwner,
+    incarnation?: string,
+  ) => {
+    const checkOwner = (lease: any) => {
+      if (lease.metadata.uid !== owner.uid || ownerOf(lease).epoch !== owner.epoch)
+        throw Error("browser_controller_fenced");
+    };
+    const aborted = (record?: ExecutionRecord) =>
+      record?.data.registrationAborted === true &&
+      record.data.incarnation === incarnation;
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const { lease, secret, record } = await readOwnedRecord(id);
+      checkOwner(lease);
+      if (aborted(record)) return void (await complete(id));
+      if (
+        record &&
+        (!incarnation ||
+          record.data.incarnation !== incarnation ||
+          record.data.phase !== "registered" ||
+          record.data.workerId !== undefined)
+      )
+        throw Error("browser_execution_record_changed");
+      try {
+        // Fence delayed registration writes before releasing the Profile or deleting its Lease.
+        await saveRecord(
+          id,
+          secret,
+          {
+            executionId: id,
+            revision: (record?.revision ?? 0) + 1,
+            data: {
+              phase: "finished",
+              registrationAborted: true,
+              incarnation,
+              profileId: record?.data.profileId,
+              storageMode: record?.data.storageMode,
+            },
+          },
+          owner,
+        );
+      } catch (error) {
+        if (conflict(error)) continue;
+        const current = await readOwnedRecord(id);
+        checkOwner(current.lease);
+        if (!aborted(current.record)) throw error;
+      }
+      await complete(id);
+      return;
+    }
+    throw Error("browser_controller_owner_moved");
   };
   const compact = async () => {
     const finished = [...observed.entries()]
@@ -559,7 +701,8 @@ export async function createKubernetesOwnership(
   const active = () =>
     [...observed].filter(([, entry]) => !isFinished(entry.lease)).map(([id]) => id);
   let renewing: Promise<void>;
-  const renewLease = async (id: string, local: { epoch: number; uid: string }) => {
+  const renewLease = async (id: string, local: LocalOwner) => {
+    if (owned.get(id) !== local) throw Error("browser_controller_fenced");
     const cached = observed.get(id)?.lease;
     if (
       cached?.spec.holderIdentity === options.replica &&
@@ -572,7 +715,7 @@ export async function createKubernetesOwnership(
         if (!conflict(error)) throw error;
       }
     // A stale cache costs one read; a real takeover still fails the conditional write.
-    return saveLease(await readOwnedLease(id), {}, { renewTime: renewTime() });
+    return saveLease(await readOwnedLease(id, local), {}, { renewTime: renewTime() });
   };
   const renew = () =>
     (renewing ??= (async () => {
@@ -590,7 +733,7 @@ export async function createKubernetesOwnership(
                 now() >= local.deadline ||
                 (error as Error).message === "browser_controller_fenced"
               )
-                forget(id);
+                forget(id, local);
             }
           }),
         );
@@ -611,6 +754,7 @@ export async function createKubernetesOwnership(
     leaseMetadata: (id: string) => observed.get(id)?.lease.metadata,
     resolve,
     assertOwned,
+    discardRegistration,
     complete,
     compact,
     findCapability(token: string) {
@@ -652,8 +796,32 @@ export async function createKubernetesOwnership(
     onLost(callback: (id: string) => void) {
       lost = callback;
     },
-    acquireProfile: (id: string, profileId: string) =>
-      profile(id, profileId, "acquire"),
+    async acquireProfile(id: string, profileId: string) {
+      const local = owned.get(id);
+      if (!local) throw Error("browser_controller_fenced");
+      return serializeProfile(profileId, () =>
+        profile(id, profileId, "acquire", local),
+      );
+    },
+    withUnleasedProfile<T>(
+      profileId: string,
+      work: () => Promise<T>,
+      caller?: AbortSignal,
+    ) {
+      return serializeProfile(profileId, async () => {
+        if (!validProfileId(profileId)) throw Error("browser_profile_id_invalid");
+        const key = profileName(profileId);
+        const lease = await get(`${leases}/${key}`, caller);
+        if (lease) {
+          verify(lease, key, "profile");
+          const holder = lease.spec?.holderIdentity;
+          if (typeof holder !== "string" || (holder && !validId(holder)))
+            throw Error("browser_controller_state_corrupt");
+          if (holder) return;
+        }
+        return work();
+      });
+    },
     releaseProfile: (id: string, profileId: string) =>
       profile(id, profileId, "release"),
     journal: {

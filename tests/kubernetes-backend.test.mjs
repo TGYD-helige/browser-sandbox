@@ -207,14 +207,20 @@ async function fixture(
       };
       response.end(JSON.stringify(state.pod));
     } else if (request.method === "PATCH") {
-      assert.equal(body.metadata.resourceVersion, state.pod.metadata.resourceVersion);
+      await state.beforePatch?.();
+      if (body.metadata.resourceVersion !== state.pod.metadata.resourceVersion) {
+        response.writeHead(409).end("{}");
+        return;
+      }
       state.pod.metadata.annotations = {
         ...state.pod.metadata.annotations,
         ...body.metadata.annotations,
       };
       if (body.metadata.ownerReferences)
         state.pod.metadata.ownerReferences = body.metadata.ownerReferences;
-      state.pod.metadata.resourceVersion = "2";
+      state.pod.metadata.resourceVersion = String(
+        Number(state.pod.metadata.resourceVersion) + 1,
+      );
       response.end(JSON.stringify(state.pod));
     } else if (request.method === "DELETE") {
       if (
@@ -556,6 +562,46 @@ test("Kubernetes epoch fencing prevents stale deletion and permits confirmed sto
   await backend.remove(worker, AbortSignal.timeout(5000));
   assert.equal(state.deleted, true);
 });
+
+for (const changed of ["status", "Pod UID", "Lease UID"])
+  test(`fencing a live Pod across a patch conflict revalidates ${changed}`, async (t) => {
+    let epoch = 1;
+    let uid = "execution-uid";
+    const ownership = {
+      assertOwned: async () => ({ epoch, uid, name: "execution-lease" }),
+    };
+    const { backend, state } = await fixture(t, { ownership });
+    const signal = AbortSignal.timeout(5000);
+    const worker = await backend.create({ executionId, incarnation }, signal);
+    t.after(() => worker.runtime.close());
+    let statusChecks = 0;
+    worker.runtime.request = async ({ op }) => {
+      assert.equal(op, "worker_status");
+      statusChecks++;
+    };
+    epoch = 2;
+    state.beforePatch = () => {
+      state.beforePatch = undefined;
+      state.pod.metadata.resourceVersion = "2";
+      if (changed === "Pod UID") state.replacement = true;
+      if (changed === "Lease UID") uid = "other-execution-uid";
+    };
+    if (changed === "status") {
+      await backend.fence(worker, epoch, signal);
+      assert.equal(state.pod.metadata.annotations["browser-sandbox.io/epoch"], "2");
+      assert.equal(worker.epoch, 2);
+      assert.equal(statusChecks, 1);
+    } else {
+      await assert.rejects(
+        backend.fence(worker, epoch, signal),
+        changed === "Pod UID"
+          ? /browser_worker_ownership_mismatch/
+          : /browser_controller_fenced/,
+      );
+      assert.equal(state.pod.metadata.annotations["browser-sandbox.io/epoch"], "1");
+      assert.equal(statusChecks, 0);
+    }
+  });
 
 test("a Pod POST paused across takeover cannot publish a stale worker", async (t) => {
   let epoch = 1;

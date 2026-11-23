@@ -151,6 +151,7 @@ export async function createKubernetesBackend(
     owned(pod, expected, uid);
     const current = await options.ownership?.assertOwned(
       expected[prefix + "execution"],
+      `${name}/${pod.metadata.uid}`,
     );
     if (current) needsFence(pod, current);
     else if (!hasKubernetesOwner(pod, parent))
@@ -490,29 +491,43 @@ export async function createKubernetesBackend(
       const before = await options.ownership.assertOwned(worker.executionId);
       if (before.epoch !== epoch) throw Error("browser_controller_fenced");
       const [name, uid] = worker.id.split("/");
-      const pod = await getPod(name, signal);
-      const current = await options.ownership.assertOwned(worker.executionId);
-      if (before.uid !== current.uid || current.epoch !== epoch)
-        throw Error("browser_controller_fenced");
-      if (!pod) return;
-      owned(pod, labels(worker.executionId, worker.incarnation, worker.profileId), uid);
-      if (needsFence(pod, current))
-        await api(
-          `${base}/pods/${name}`,
-          "PATCH",
-          {
-            metadata: {
-              resourceVersion: pod.metadata.resourceVersion,
-              ownerReferences: [leaseOwner(current)],
-              annotations: {
-                [prefix + "epoch"]: String(epoch),
+      const expected = labels(worker.executionId, worker.incarnation, worker.profileId);
+      for (let attempt = 0; ; attempt++) {
+        const pod = await getPod(name, signal);
+        const current = await options.ownership.assertOwned(worker.executionId);
+        signal.throwIfAborted();
+        if (before.uid !== current.uid || current.epoch !== epoch)
+          throw Error("browser_controller_fenced");
+        if (!stopped && (!pod || pod.metadata.deletionTimestamp))
+          throw Error("browser_worker_lost");
+        if (!pod) return;
+        owned(pod, expected, uid);
+        if (!needsFence(pod, current)) break;
+        try {
+          await api(
+            `${base}/pods/${name}`,
+            "PATCH",
+            {
+              metadata: {
+                resourceVersion: pod.metadata.resourceVersion,
+                ownerReferences: [leaseOwner(current)],
+                annotations: { [prefix + "epoch"]: String(epoch) },
               },
             },
-          },
-          signal,
-        );
+            signal,
+          );
+          break;
+        } catch (error) {
+          // Kubelet status writes can advance the Pod version without changing ownership.
+          if (
+            !(error instanceof KubernetesError && error.status === 409) ||
+            attempt >= 2
+          )
+            throw error;
+        }
+      }
       worker.epoch = epoch;
-      worker.runtime.setEpoch?.(epoch, current.uid);
+      worker.runtime.setEpoch?.(epoch, before.uid);
       if (stopped) return;
       await worker.runtime.request(
         { op: "worker_status", executionId: worker.executionId },
