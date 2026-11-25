@@ -24,7 +24,7 @@ export interface KubernetesWorkerTemplate {
     runAsUser?: number;
     allowPrivilegeEscalation?: boolean;
     capabilities?: { drop?: string[]; add?: string[] };
-    seccompProfile: { type: "Localhost"; localhostProfile: string };
+    seccompProfile: { type: "Localhost"; localhostProfile: string } | { type: "Image" };
   };
   shmSize?: string;
   terminationGracePeriodSeconds?: number;
@@ -57,6 +57,8 @@ export async function createKubernetesBackend(
   options: KubernetesBackendOptions,
 ): Promise<ManagedBackend> {
   const template = options.template;
+  const seccomp = template.securityContext?.seccompProfile;
+  const imageSeccomp = seccomp?.type === "Image";
   const grace = template.terminationGracePeriodSeconds ?? 60;
   const creationTimeoutMs = options.creationTimeoutMs ?? 120000;
   const maxExecutionMs = options.maxExecutionMs ?? 3600000;
@@ -78,8 +80,7 @@ export async function createKubernetesBackend(
     !Number.isSafeInteger(grace) ||
     grace < 1 ||
     grace > 600 ||
-    template.securityContext?.seccompProfile?.type !== "Localhost" ||
-    !template.securityContext.seccompProfile.localhostProfile ||
+    (!imageSeccomp && (seccomp?.type !== "Localhost" || !seccomp.localhostProfile)) ||
     (template.extensions &&
       Number(Boolean(template.extensions.configMap)) +
         Number(Boolean(template.extensions.persistentVolumeClaim)) !==
@@ -260,6 +261,15 @@ export async function createKubernetesBackend(
                 {
                   name: "worker",
                   image: options.image,
+                  ...(imageSeccomp
+                    ? {
+                        command: [
+                          "/opt/browser-sandbox/worker-seccomp",
+                          "node",
+                          "/opt/browser-sandbox/dist/main.js",
+                        ],
+                      }
+                    : {}),
                   args: ["worker"],
                   env: [
                     {
@@ -270,6 +280,8 @@ export async function createKubernetesBackend(
                   ],
                   securityContext: {
                     ...template.securityContext,
+                    // The image launcher installs the filter before Node starts.
+                    seccompProfile: imageSeccomp ? { type: "Unconfined" } : seccomp,
                     privileged: false,
                     allowPrivilegeEscalation: false,
                   },

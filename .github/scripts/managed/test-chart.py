@@ -185,6 +185,15 @@ class ChartTest(unittest.TestCase):
                     render("--set-string", f"runtime.{name}=override")
                 self.assertNotEqual(error.exception.returncode, 0)
 
+    def test_worker_seccomp_source_is_explicit(self):
+        settings = "--set", "worker.securityContext.seccompProfile.type=Image"
+        configuration = next(item for item in render(*settings) if "worker-template.json" in item.get("data", {}))
+        template = json.loads(configuration["data"]["worker-template.json"])
+        self.assertEqual(template["securityContext"]["seccompProfile"]["type"], "Image")
+        for profile in ("Unconfined", "RuntimeDefault"):
+            with self.subTest(profile=profile), self.assertRaises(subprocess.CalledProcessError):
+                render("--set", f"worker.securityContext.seccompProfile.type={profile}")
+
     def test_drain_and_controller_have_separate_least_privilege_roles(self):
         resources = render()
         deployment = next(item for item in resources if item["kind"] == "Deployment")

@@ -291,27 +291,7 @@ try {
   assert(/^sha256:[a-f0-9]{64}$/.test(nextDigest));
   const nextRepository = nextNormalized.slice(0, nextNormalized.lastIndexOf(":"));
   const nextPinned = `${nextRepository}@${nextDigest}`;
-  extraction = await run("docker", ["create", image]);
-  await run("docker", [
-    "cp",
-    `${extraction}:/opt/browser-sandbox/seccomp.json`,
-    join(directory, "browser-sandbox.json"),
-  ]);
-  await run("docker", ["rm", extraction]);
-  extraction = undefined;
   for (const node of nodes) {
-    await run("docker", [
-      "exec",
-      node.metadata.name,
-      "mkdir",
-      "-p",
-      "/var/lib/kubelet/seccomp",
-    ]);
-    await run("docker", [
-      "cp",
-      join(directory, "browser-sandbox.json"),
-      `${node.metadata.name}:/var/lib/kubelet/seccomp/browser-sandbox.json`,
-    ]);
     await run("docker", [
       "exec",
       node.metadata.name,
@@ -410,7 +390,7 @@ try {
       },
     }),
   );
-  stage = "single shared-state controller without a journal PVC";
+  stage = "single shared-state controller and image-filtered worker on a fresh node";
   await kubectl(
     "run",
     "client",
@@ -428,6 +408,14 @@ try {
     "setInterval(()=>{},1000)",
   );
   await kubectl("wait", "--for=condition=Ready", "pod/client", "--timeout=120s");
+  await run("docker", [
+    "exec",
+    workerNode,
+    "test",
+    "!",
+    "-e",
+    "/var/lib/kubelet/seccomp/browser-sandbox.json",
+  ]);
   installed = true;
   await run("helm", [
     "install",
@@ -439,17 +427,32 @@ try {
     values,
     "--set",
     "controller.sharedState=true,controllerData.skipCreation=true,profileStore.enabled=false",
+    "--set",
+    "worker.securityContext.seccompProfile.type=Image",
     "--wait",
     "--timeout",
     "120s",
   ]);
   assert.equal(await kubectl("get", "pvc", "-o", "name"), "");
   const shared = await client("hold");
-  const sharedWorkerUid = (await pods())[0]?.metadata.uid;
-  assert(sharedWorkerUid);
+  const [sharedWorker] = await pods();
+  assert.equal(sharedWorker?.spec.nodeName, workerNode);
+  assert.equal(sharedWorker.spec.automountServiceAccountToken, false);
+  const { securityContext } = sharedWorker.spec.containers[0];
+  assert.equal(securityContext.privileged, false);
+  assert.equal(securityContext.allowPrivilegeEscalation, false);
+  const workerStatus = await kubectl(
+    "exec",
+    sharedWorker.metadata.name,
+    "--",
+    "cat",
+    "/proc/1/status",
+  );
+  assert.match(workerStatus, /^NoNewPrivs:\s+1$/m);
+  assert.match(workerStatus, /^Seccomp:\s+2$/m);
   await kubectl("rollout", "restart", `deployment/${deployment}`);
   await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
-  assert.equal((await pods())[0]?.metadata.uid, sharedWorkerUid);
+  assert.equal((await pods())[0]?.metadata.uid, sharedWorker.metadata.uid);
   assert.deepEqual(await client("resume", shared.executionId), {
     samePage: true,
     sameGeneration: true,
@@ -465,6 +468,30 @@ try {
     "120s",
   ]);
   installed = false;
+
+  stage = "provision Localhost seccomp profile";
+  extraction = await run("docker", ["create", image]);
+  await run("docker", [
+    "cp",
+    `${extraction}:/opt/browser-sandbox/seccomp.json`,
+    join(directory, "browser-sandbox.json"),
+  ]);
+  await run("docker", ["rm", extraction]);
+  extraction = undefined;
+  for (const node of nodes) {
+    await run("docker", [
+      "exec",
+      node.metadata.name,
+      "mkdir",
+      "-p",
+      "/var/lib/kubelet/seccomp",
+    ]);
+    await run("docker", [
+      "cp",
+      join(directory, "browser-sandbox.json"),
+      `${node.metadata.name}:/var/lib/kubelet/seccomp/browser-sandbox.json`,
+    ]);
+  }
 
   stage = "Helm install";
   installed = true;
@@ -984,6 +1011,9 @@ try {
     activeActive: activeActiveReport,
     helmJournalUpgradeAndRollbackPreservedPvc: true,
     singleSharedStateControllerRecoveredWithoutJournalPvc: true,
+    imageSeccompWorkerOnFreshNode: nodes.find(
+      (node) => node.metadata.name === workerNode,
+    ).status.nodeInfo.containerRuntimeVersion,
     controllerStartupMs,
     ...functional,
     rolloutPreservedWorker: true,

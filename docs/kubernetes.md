@@ -4,7 +4,7 @@ The Kubernetes backend lazily creates one bare worker Pod per execution behind o
 
 ## Install
 
-Build or select one browser-sandbox image and resolve its immutable manifest digest. The same image runs the controller and all new workers. Provision the image's generated `/opt/browser-sandbox/seccomp.json` as `browser-sandbox.json` in the kubelet seccomp directory on every eligible worker node; this profile is architecture-specific. Set `worker.securityContext.seccompProfile.localhostProfile` if your provisioned filename differs. The chart creates no node installer or worker Deployment. An administrative Job runs only during uninstall, using the same pinned image without browser privileges.
+Build or select one browser-sandbox image and resolve its immutable manifest digest. The same image runs the controller and all new workers. Provision the image's generated `/opt/browser-sandbox/seccomp.json` as `browser-sandbox.json` in the kubelet seccomp directory on every eligible worker node; this profile is architecture-specific. Set `worker.securityContext.seccompProfile.localhostProfile` if your provisioned filename differs. The chart creates no node installer or worker Deployment. For pools without a per-node seccomp file, use the [image-loaded profile](#image-loaded-worker-seccomp). An administrative Job runs only during uninstall, using the same pinned image without browser privileges.
 
 ```sh
 helm install browser charts/browser-sandbox --namespace browsers --create-namespace \
@@ -27,7 +27,7 @@ Operators configure one Helm release and one image digest. `runtime` accepts onl
 | Value | Worker behavior |
 |---|---|
 | `worker.resources` | Container requests and limits |
-| `worker.securityContext` | Browser-required capabilities and provisioned Localhost seccomp profile; privileged mode and privilege escalation are disabled |
+| `worker.securityContext` | Browser-required capabilities and the worker seccomp profile source. Privileged mode and privilege escalation are disabled. |
 | `worker.shmSize` | Memory-backed `/dev/shm` emptyDir limit |
 | `worker.terminationGracePeriodSeconds` | Graceful stop budget; also included in the Pod deadline |
 | `worker.nodeSelector`, `worker.tolerations`, `worker.affinity` | Placement constraints |
@@ -40,6 +40,14 @@ Extension ConfigMaps/PVCs must contain only extension assets and support the cho
 Workers use `restartPolicy: Never`, no automatic ServiceAccount token, one Browserless execution, no host ports and no Service. `activeDeadlineSeconds` covers the longer of `TIMEOUT` and `BROWSER_MAX_EXECUTION_MS`, the creation budget, the 180-second finalization/Profile save budget, and the termination grace period. No renewal extends this infrastructure backstop. The controller uses a bounded creation deadline and reports Pending timeout, image-pull failure and worker loss explicitly. It never replays browser commands into another Pod. If a creation request loses its acknowledgement and absence cannot be confirmed safely, cleanup is reported as unconfirmed.
 
 Workers do not request `net.ipv4.ip_local_reserved_ports`: there is no co-resident agent sharing their network namespace. Existing worker UID rules continue to protect loopback Browserless/CDP ports. Browser execution still requires the Linux capabilities and generated seccomp profile; controller Pods run without those privileges.
+
+### Image-loaded worker seccomp
+
+Set `worker.securityContext.seccompProfile.type=Image` to run workers on Linux nodes without a Browser Sandbox seccomp file or label. Use a digest that includes the worker launcher. Keep any placement settings that identify your worker pool and remove selectors or affinity that require a profile-readiness label.
+
+The worker Pod requests Kubernetes `Unconfined` for this container so the CRI does not add a conflicting filter. The launcher in the pinned image sets `no_new_privs`, loads the worker filter generated from the same policy as `Localhost`, and exits if setup fails. It loads the filter before starting the application, and Chromium and the other worker descendants inherit it. Keep Kubernetes `pods/exec` and ephemeral container access restricted to trusted operators because those process entry points are outside the launcher. Use `Localhost` if your admission policy requires the CRI to apply seccomp. The worker still uses the same capabilities, NetworkPolicy, private ports, and ServiceAccount token settings.
+
+Stock containerd `RuntimeDefault` filters the namespace creation syscalls needed by Chromium with the worker's capability set. The managed Kubernetes CI matrix exercises `Image` on native Linux amd64 and arm64 with k3d/K3s and containerd. It verifies the process filter and both Chromium sandbox layers before provisioning any `Localhost` file on the test nodes. The CI report records the runtime version. On a different runtime, verify a real sandboxed browser session and NetworkPolicy enforcement before admitting workloads.
 
 ## Network isolation
 
@@ -64,7 +72,7 @@ Helm uninstall first runs a bounded `pre-delete` administrative Job. It refuses 
 
 ## Supported runtime
 
-Run workers on Linux amd64 or arm64 nodes with the architecture-specific seccomp profile installed. Verify NetworkPolicy enforcement and a real sandboxed renderer on the actual cluster before admitting workloads. Pod separation alone does not establish tenant isolation.
+Run workers on Linux amd64 or arm64 nodes. For `Localhost`, install the architecture-specific seccomp profile on each eligible node. Verify NetworkPolicy enforcement and a real sandboxed renderer on the actual cluster before admitting workloads. Pod separation alone does not establish tenant isolation.
 
 ## Persistent storage
 
