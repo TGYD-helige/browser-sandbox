@@ -12,6 +12,14 @@
 {{- if and (eq $replicas 1) (not $mountJournal) (not .Values.controller.sharedState) }}
 {{- fail "controllerData.skipCreation requires controller.sharedState or controllerData.existingClaim when controller.replicas is 1" }}
 {{- end }}
+{{- if and .Release.IsUpgrade (eq $replicas 1) (not $mountJournal) }}
+{{- $current := lookup "apps/v1" "Deployment" .Release.Namespace (include "browser-sandbox.name" .) }}
+{{- range (dig "spec" "template" "spec" "volumes" (list) $current) }}
+{{- if eq .name "controller-data" }}
+{{- fail "cannot skip an existing controller journal mount during upgrade; keep the claim mounted to import the journal" }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{- range $name, $_ := .Values.runtime }}
 {{- if not (has $name (list "TIMEOUT" "TZ" "BROWSER_STARTUP_TIMEOUT" "LANG")) }}
 {{- fail (printf "runtime.%s is not a shared worker setting; controller environment is managed by the chart" $name) }}

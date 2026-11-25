@@ -390,7 +390,7 @@ try {
       },
     }),
   );
-  stage = "single shared-state controller and Unconfined worker on a fresh node";
+  stage = "single shared-state controller and Unconfined worker";
   await kubectl(
     "run",
     "client",
@@ -408,14 +408,15 @@ try {
     "setInterval(()=>{},1000)",
   );
   await kubectl("wait", "--for=condition=Ready", "pod/client", "--timeout=120s");
-  await run("docker", [
-    "exec",
-    workerNode,
-    "test",
-    "!",
-    "-e",
-    "/var/lib/kubelet/seccomp/browser-sandbox.json",
-  ]);
+  if (clusterAttempted)
+    await run("docker", [
+      "exec",
+      workerNode,
+      "test",
+      "!",
+      "-e",
+      "/var/lib/kubelet/seccomp/browser-sandbox.json",
+    ]);
   installed = true;
   await run("helm", [
     "install",
@@ -1012,8 +1013,11 @@ try {
     activeActive: activeActiveReport,
     helmJournalUpgradeAndRollbackPreservedPvc: true,
     singleSharedStateControllerRecoveredWithoutJournalPvc: true,
-    unconfinedWorkerOnFreshNode: nodes.find((node) => node.metadata.name === workerNode)
-      .status.nodeInfo.containerRuntimeVersion,
+    unconfinedWorker: {
+      containerRuntimeVersion: nodes.find((node) => node.metadata.name === workerNode)
+        .status.nodeInfo.containerRuntimeVersion,
+      checkedWithoutNodeProfile: clusterAttempted,
+    },
     controllerStartupMs,
     ...functional,
     rolloutPreservedWorker: true,
