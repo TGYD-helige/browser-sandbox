@@ -7,6 +7,10 @@ on:
     branches: [master]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -42,43 +46,85 @@ jobs:
           path: managed-results/
           if-no-files-found: ignore
 
-  kubernetes:
-    name: Kubernetes (${{ matrix.runner }})
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+  kubernetes-fixtures:
+    name: Kubernetes fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: pnpm
+      - uses: ./.github/actions/setup-kubernetes
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: azure/setup-helm@v4
-        with:
-          version: v4.1.1
-      - run: bash .github/scripts/managed/install-k3d.sh
-      - run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - run: pnpm install --frozen-lockfile && pnpm build
       - run: python -m pip install -r .github/scripts/managed/requirements.txt
       - run: python .github/scripts/managed/test-chart.py && python .github/scripts/managed/test-k3d-cluster.py && node --test .github/scripts/managed/test-active-active.mjs
+
+  kubernetes-images:
+    name: Kubernetes images (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
       - run: docker build -t browser-sandbox:managed .
       - run: docker build -f .github/scripts/managed/Dockerfile.client -t browser-sandbox-client:managed .
       - run: bash .github/scripts/verify-image.sh browser-sandbox:managed
-      - name: Single controller and three-replica active-active matrix
-        run: node .github/scripts/managed/kubernetes.mjs
+      - name: Export the native images
+        run: docker save --output managed-images.tar browser-sandbox:managed browser-sandbox-client:managed
+      - uses: actions/upload-artifact@v4
+        with:
+          name: managed-kubernetes-images-${{ matrix.runner }}
+          path: managed-images.tar
+          compression-level: 1
+          overwrite: true
+          retention-days: 3
+          if-no-files-found: error
+
+  kubernetes:
+    name: Kubernetes ${{ matrix.suite }} (${{ matrix.runner }})
+    needs: kubernetes-images
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        suite: [fresh-node, single-controller, journal, active-active]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-kubernetes
+      - run: pnpm install --prod --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: managed-kubernetes-images-${{ matrix.runner }}
+          path: ${{ runner.temp }}/managed-kubernetes-images
+      - name: Load the shared native images
+        run: |
+          archive="$RUNNER_TEMP/managed-kubernetes-images/managed-images.tar"
+          docker load --input "$archive"
+          unlink "$archive"
+      - name: Run Kubernetes suite
+        env:
+          KUBERNETES_SUITE: ${{ matrix.suite }}
+        run: node .github/scripts/managed/kubernetes.mjs "$KUBERNETES_SUITE"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: managed-kubernetes-${{ matrix.runner }}-attempt-${{ github.run_attempt }}
+          name: managed-kubernetes-${{ matrix.suite }}-${{ matrix.runner }}-attempt-${{ github.run_attempt }}
           path: managed-results/
           if-no-files-found: ignore

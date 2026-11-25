@@ -63,6 +63,20 @@ export async function verifyJournalRollback({
       uid = await claimUid();
       assert(uid, `Expected a bound journal claim for retain=${retain}`);
 
+      await assert.rejects(
+        helm(
+          "upgrade",
+          release,
+          chart,
+          "--reuse-values",
+          "--set",
+          "controller.sharedState=true,controllerData.skipCreation=true",
+          "--dry-run=server",
+        ),
+        /cannot skip an existing controller journal mount during upgrade/,
+      );
+      assert.equal(await claimUid(), uid, "Rejected upgrade altered the journal claim");
+
       if (localProfile) {
         profileUid = await claimUid(profileClaim);
         assert(profileUid, "Expected the original Profile PVC");

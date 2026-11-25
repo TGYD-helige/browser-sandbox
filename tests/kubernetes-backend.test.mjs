@@ -105,7 +105,14 @@ test("Kubernetes creates an owned single-execution Pod and fences deletion by UI
 
 async function fixture(
   t,
-  { pending = false, deleteRace = false, createStatus, waitingReason, ownership } = {},
+  {
+    pending = false,
+    deleteRace = false,
+    createStatus,
+    waitingReason,
+    ownership,
+    seccompProfile = { type: "Localhost", localhostProfile: "browser-sandbox.json" },
+  } = {},
 ) {
   const state = {
     pod: undefined,
@@ -280,13 +287,30 @@ async function fixture(
     image: `amaster/browser-sandbox@sha256:${"a".repeat(64)}`,
     template: {
       terminationGracePeriodSeconds: 1,
-      securityContext: {
-        seccompProfile: { type: "Localhost", localhostProfile: "browser-sandbox.json" },
-      },
+      securityContext: { seccompProfile },
     },
   });
   return { backend, state };
 }
+
+test("Unconfined skips the worker profile and preserves Pod protections", async (t) => {
+  const { backend, state } = await fixture(t, {
+    seccompProfile: { type: "Unconfined", localhostProfile: "browser-sandbox.json" },
+  });
+  const worker = await backend.create(
+    { executionId, incarnation },
+    AbortSignal.timeout(5000),
+  );
+  t.after(() => worker.runtime.close());
+  const { command, args, securityContext } = state.pod.spec.containers[0];
+  assert.equal(command, undefined);
+  assert.deepEqual(args, ["worker"]);
+  assert.deepEqual(securityContext.seccompProfile, { type: "Unconfined" });
+  assert.equal(securityContext.privileged, false);
+  assert.equal(securityContext.allowPrivilegeEscalation, false);
+  assert.equal(state.pod.spec.automountServiceAccountToken, false);
+  await backend.remove(worker, AbortSignal.timeout(5000));
+});
 
 test("stale Kubernetes cleanup cannot delete a replacement Pod", async (t) => {
   const { backend, state } = await fixture(t);

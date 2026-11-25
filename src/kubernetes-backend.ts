@@ -24,7 +24,9 @@ export interface KubernetesWorkerTemplate {
     runAsUser?: number;
     allowPrivilegeEscalation?: boolean;
     capabilities?: { drop?: string[]; add?: string[] };
-    seccompProfile: { type: "Localhost"; localhostProfile: string };
+    seccompProfile:
+      | { type: "Localhost"; localhostProfile: string }
+      | { type: "Unconfined" };
   };
   shmSize?: string;
   terminationGracePeriodSeconds?: number;
@@ -57,6 +59,7 @@ export async function createKubernetesBackend(
   options: KubernetesBackendOptions,
 ): Promise<ManagedBackend> {
   const template = options.template;
+  const seccomp = template.securityContext?.seccompProfile;
   const grace = template.terminationGracePeriodSeconds ?? 60;
   const creationTimeoutMs = options.creationTimeoutMs ?? 120000;
   const maxExecutionMs = options.maxExecutionMs ?? 3600000;
@@ -78,8 +81,8 @@ export async function createKubernetesBackend(
     !Number.isSafeInteger(grace) ||
     grace < 1 ||
     grace > 600 ||
-    template.securityContext?.seccompProfile?.type !== "Localhost" ||
-    !template.securityContext.seccompProfile.localhostProfile ||
+    (seccomp?.type !== "Unconfined" &&
+      (seccomp?.type !== "Localhost" || !seccomp.localhostProfile)) ||
     (template.extensions &&
       Number(Boolean(template.extensions.configMap)) +
         Number(Boolean(template.extensions.persistentVolumeClaim)) !==
@@ -270,6 +273,8 @@ export async function createKubernetesBackend(
                   ],
                   securityContext: {
                     ...template.securityContext,
+                    seccompProfile:
+                      seccomp.type === "Unconfined" ? { type: "Unconfined" } : seccomp,
                     privileged: false,
                     allowPrivilegeEscalation: false,
                   },

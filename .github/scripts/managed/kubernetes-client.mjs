@@ -202,6 +202,34 @@ try {
       ).result.value,
       marker,
     );
+    const { targetId: sandboxTarget } = await cdp.call("Target.createTarget", {
+      url: "chrome://sandbox",
+    });
+    const { sessionId: sandboxSession } = await cdp.call("Target.attachToTarget", {
+      targetId: sandboxTarget,
+      flatten: true,
+    });
+    const sandboxDeadline = Date.now() + 10000;
+    while (true) {
+      const text =
+        (
+          await cdp.call(
+            "Runtime.evaluate",
+            { expression: "document.body?.innerText", returnByValue: true },
+            sandboxSession,
+          )
+        ).result.value ?? "";
+      const pidNamespace = /PID namespaces\s+Yes/i.test(text);
+      const networkNamespace = /Network namespaces\s+Yes/i.test(text);
+      const seccomp = /Seccomp-BPF sandbox\s+Yes/i.test(text);
+      if (pidNamespace && networkNamespace && seccomp) break;
+      assert(
+        Date.now() < sandboxDeadline,
+        `Chromium sandbox status: PID=${pidNamespace} network=${networkNamespace} seccomp=${seccomp}`,
+      );
+      await delay(50);
+    }
+    await cdp.call("Target.closeTarget", { targetId: sandboxTarget });
     if (action === "hold") {
       await writeFile(
         `/tmp/managed-retention-${executionId}.json`,
@@ -290,28 +318,6 @@ try {
       await assert.rejects(connectCdp(grant.cdpUrl), /browser_cdp_/);
       const fresh = await runtime.request({ op: "endpoint", executionId });
       await connect(fresh.wsEndpoint);
-      const { targetId: sandboxTarget } = await cdp.call("Target.createTarget", {
-        url: "chrome://sandbox",
-      });
-      const { sessionId: sandboxSession } = await cdp.call("Target.attachToTarget", {
-        targetId: sandboxTarget,
-        flatten: true,
-      });
-      const sandboxDeadline = Date.now() + 10000;
-      while (true) {
-        const text =
-          (
-            await cdp.call(
-              "Runtime.evaluate",
-              { expression: "document.body?.innerText", returnByValue: true },
-              sandboxSession,
-            )
-          ).result.value ?? "";
-        if (/Seccomp-BPF sandbox\s+Yes/.test(text)) break;
-        assert(Date.now() < sandboxDeadline, "renderer seccomp sandbox is not enabled");
-        await delay(50);
-      }
-      await cdp.call("Target.closeTarget", { targetId: sandboxTarget });
       await closeCdp();
       // Reuse the existing agent-browser harness package through the controller URL.
       const home = await mkdtemp(join(tmpdir(), "managed-agent-"));

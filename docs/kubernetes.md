@@ -4,7 +4,7 @@ The Kubernetes backend lazily creates one bare worker Pod per execution behind o
 
 ## Install
 
-Build or select one browser-sandbox image and resolve its immutable manifest digest. The same image runs the controller and all new workers. Provision the image's generated `/opt/browser-sandbox/seccomp.json` as `browser-sandbox.json` in the kubelet seccomp directory on every eligible worker node; this profile is architecture-specific. Set `worker.securityContext.seccompProfile.localhostProfile` if your provisioned filename differs. The chart creates no node installer or worker Deployment. An administrative Job runs only during uninstall, using the same pinned image without browser privileges.
+Build or select one browser-sandbox image and resolve its immutable manifest digest. The same image runs the controller and all new workers. Provision the image's generated `/opt/browser-sandbox/seccomp.json` as `browser-sandbox.json` in the kubelet seccomp directory on every eligible worker node; this profile is architecture-specific. Set `worker.securityContext.seccompProfile.localhostProfile` if your provisioned filename differs. The chart creates no node installer or worker Deployment. For pools without a per-node seccomp file, see [running workers without an outer seccomp filter](#running-workers-without-an-outer-seccomp-filter). An administrative Job runs only during uninstall, using the same pinned image without browser privileges.
 
 ```sh
 helm install browser charts/browser-sandbox --namespace browsers --create-namespace \
@@ -27,7 +27,7 @@ Operators configure one Helm release and one image digest. `runtime` accepts onl
 | Value | Worker behavior |
 |---|---|
 | `worker.resources` | Container requests and limits |
-| `worker.securityContext` | Browser-required capabilities and provisioned Localhost seccomp profile; privileged mode and privilege escalation are disabled |
+| `worker.securityContext` | Browser-required capabilities and the worker seccomp profile source. Privileged mode and privilege escalation are disabled. |
 | `worker.shmSize` | Memory-backed `/dev/shm` emptyDir limit |
 | `worker.terminationGracePeriodSeconds` | Graceful stop budget; also included in the Pod deadline |
 | `worker.nodeSelector`, `worker.tolerations`, `worker.affinity` | Placement constraints |
@@ -39,7 +39,15 @@ Extension ConfigMaps/PVCs must contain only extension assets and support the cho
 
 Workers use `restartPolicy: Never`, no automatic ServiceAccount token, one Browserless execution, no host ports and no Service. `activeDeadlineSeconds` covers the longer of `TIMEOUT` and `BROWSER_MAX_EXECUTION_MS`, the creation budget, the 180-second finalization/Profile save budget, and the termination grace period. No renewal extends this infrastructure backstop. The controller uses a bounded creation deadline and reports Pending timeout, image-pull failure and worker loss explicitly. It never replays browser commands into another Pod. If a creation request loses its acknowledgement and absence cannot be confirmed safely, cleanup is reported as unconfirmed.
 
-Workers do not request `net.ipv4.ip_local_reserved_ports`: there is no co-resident agent sharing their network namespace. Existing worker UID rules continue to protect loopback Browserless/CDP ports. Browser execution still requires the Linux capabilities and generated seccomp profile; controller Pods run without those privileges.
+Workers do not request `net.ipv4.ip_local_reserved_ports`: there is no co-resident agent sharing their network namespace. Existing worker UID rules continue to protect loopback Browserless/CDP ports. Browser execution requires the configured Linux capabilities and a kernel that allows Chromium to create its sandbox namespaces. Controller Pods run without those capabilities.
+
+### Running workers without an outer seccomp filter
+
+Set `worker.securityContext.seccompProfile.type=Unconfined` to opt out of the worker-level seccomp filter. Keep any placement settings that select your worker pool and remove selectors or affinity that require a profile-readiness label. No Browser Sandbox-specific seccomp file is needed on the node. The cluster's admission policy must permit `Unconfined` for the worker container.
+
+Chromium still uses its namespace and renderer seccomp sandboxes. The controller keeps its own seccomp profile, and worker capabilities, NetworkPolicy, private ports, privilege-escalation settings, and ServiceAccount token settings remain in effect. Opting out gives the worker processes access to more kernel syscalls where their other permissions allow it. Use the default `Localhost` profile when you need that extra layer of protection.
+
+Stock containerd `RuntimeDefault` filters the namespace creation syscalls needed by Chromium with the worker's capability set. The managed Kubernetes CI `fresh-node` suite exercises `Unconfined` with k3d/K3s and containerd on native Linux amd64 and arm64. It checks Chromium's namespace and Seccomp-BPF status before provisioning any `Localhost` file. The CI report records the runtime version. Verify a sandboxed browser session and NetworkPolicy enforcement on the target cluster before admitting workloads.
 
 ## Network isolation
 
@@ -64,7 +72,7 @@ Helm uninstall first runs a bounded `pre-delete` administrative Job. It refuses 
 
 ## Supported runtime
 
-Run workers on Linux amd64 or arm64 nodes with the architecture-specific seccomp profile installed. Verify NetworkPolicy enforcement and a real sandboxed renderer on the actual cluster before admitting workloads. Pod separation alone does not establish tenant isolation.
+Run workers on Linux amd64 or arm64 nodes. For `Localhost`, install the architecture-specific seccomp profile on each eligible node. Verify NetworkPolicy enforcement and a real sandboxed renderer on the actual cluster before admitting workloads. Pod separation alone does not establish tenant isolation.
 
 ## Persistent storage
 
@@ -84,7 +92,7 @@ Deleting an execution Lease also deletes its worker through Kubernetes garbage c
 
 A new owner conditionally advances the execution Lease epoch and Secret resourceVersion and fences the bound Profile Lease before recovering access. Worker protocol v2 rejects lower-epoch controls and cancels old storage/automation callbacks. Pod epoch annotations and UID/resourceVersion deletion preconditions fence cleanup. The controller checks the durable execution record before deleting a Pod and preserves a published worker when a creation request is canceled during publication. Default single-controller mode can still recover previously released v1 workers. They cannot enforce fencing, so finish them before enabling shared state; a v1 worker encountered in shared-state mode is retained with an explicit protocol error. A controller that loses ownership closes its access and control connections. Graceful rollout releases Leases and preserves workers, and an ungraceful loss takes a Lease duration plus recovery time to reconnect. Live connections drop during these events; browser state survives only while the original worker remains alive. SIGTERM can reset in-flight host HTTP requests in both single-controller and shared-state modes. Host clients must reconnect, query status to reconcile an uncertain result, and retry only idempotent operations; do not automatically replay website writes or an operation whose outcome is unknown.
 
-Peer origins use the Pod IP, so shared state requires IPv4-primary Pod networking; an IPv6 Pod IP fails startup with `browser_controller_configuration_invalid`. With multiple replicas, the chart uses RollingUpdate, a controller PodDisruptionBudget and preferred Pod anti-affinity, and does not mount the journal PVC. The chart keeps its journal claim in the Helm release at every replica count so scaling does not delete or orphan it. `controllerData.retain` controls whether Helm keeps the chart-managed claim on uninstall. A fresh multi-replica installation that needs no journal storage can set `controllerData.skipCreation=true`. Use this only when there is no chart-managed journal to preserve. Scaling that installation to one replica requires enabling creation or selecting a `controllerData.existingClaim`. An HTTP readiness probe removes a paused or unresponsive controller from Service endpoints before the default Lease duration expires. Both Helm and controller startup reject `profileStore.enabled` with more than one replica. Persistent Profiles require a host remote storage adapter; after ownership changes, reconnect that adapter to the same host Service before finalization. A pending save keeps its Profile lease and worker until confirmed.
+Peer origins use the Pod IP, so shared state requires IPv4-primary Pod networking; an IPv6 Pod IP fails startup with `browser_controller_configuration_invalid`. With multiple replicas, the chart uses RollingUpdate, a controller PodDisruptionBudget and preferred Pod anti-affinity, and does not mount the journal PVC. The chart keeps its journal claim in the Helm release at every replica count so scaling does not delete or orphan it. `controllerData.retain` controls whether Helm keeps the chart-managed claim on uninstall. A fresh shared-state installation that needs no journal storage can set `controllerData.skipCreation=true`. For one replica, set `controller.sharedState=true` explicitly, including when scaling down from multiple replicas. Use this only when there is no journal to preserve. A live Helm upgrade rejects skipping the journal when the current Deployment still mounts it. When rendering offline, preserve the mount in your upgrade values so the controller can import the journal. When `controllerData.existingClaim` is set, a single shared-state controller mounts that claim read-only to import the journal. An HTTP readiness probe removes a paused or unresponsive controller from Service endpoints before the default Lease duration expires. Both Helm and controller startup reject `profileStore.enabled` with more than one replica. Persistent Profiles require a host remote storage adapter; after ownership changes, reconnect that adapter to the same host Service before finalization. A pending save keeps its Profile lease and worker until confirmed.
 
 ### Import an existing installation
 

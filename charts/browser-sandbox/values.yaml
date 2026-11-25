@@ -50,6 +50,7 @@ worker:
       drop: [ALL]
       add: [SETUID, SETGID, CHOWN, KILL, DAC_OVERRIDE, SYS_CHROOT, NET_ADMIN]
     seccompProfile:
+      # Unconfined opts out of the worker-level seccomp filter.
       type: Localhost
       localhostProfile: browser-sandbox.json
   shmSize: 512Mi
@@ -90,7 +91,7 @@ profileStore:
 
 # Retained controller-only execution journal, independent of Profile storage.
 controllerData:
-  # A fresh multi-replica installation without a journal can skip provisioning.
+  # A fresh shared-state installation without a journal can skip provisioning.
   skipCreation: false
   existingClaim: ""
   storageClass: ""

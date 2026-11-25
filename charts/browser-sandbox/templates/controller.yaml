@@ -8,8 +8,17 @@
 {{- if and (gt $replicas 1) .Values.profileStore.enabled }}
 {{- fail "profileStore.enabled is incompatible with controller.replicas > 1; use host remote storage" }}
 {{- end }}
-{{- if and (eq $replicas 1) .Values.controllerData.skipCreation (not .Values.controllerData.existingClaim) }}
-{{- fail "controllerData.skipCreation requires controllerData.existingClaim when controller.replicas is 1" }}
+{{- $mountJournal := and (eq $replicas 1) (or .Values.controllerData.existingClaim (not .Values.controllerData.skipCreation)) }}
+{{- if and (eq $replicas 1) (not $mountJournal) (not .Values.controller.sharedState) }}
+{{- fail "controllerData.skipCreation requires controller.sharedState or controllerData.existingClaim when controller.replicas is 1" }}
+{{- end }}
+{{- if and .Release.IsUpgrade (eq $replicas 1) (not $mountJournal) }}
+{{- $current := lookup "apps/v1" "Deployment" .Release.Namespace (include "browser-sandbox.name" .) }}
+{{- range (dig "spec" "template" "spec" "volumes" (list) $current) }}
+{{- if eq .name "controller-data" }}
+{{- fail "cannot skip an existing controller journal mount during upgrade; keep the claim mounted to import the journal" }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- range $name, $_ := .Values.runtime }}
 {{- if not (has $name (list "TIMEOUT" "TZ" "BROWSER_STARTUP_TIMEOUT" "LANG")) }}
@@ -114,7 +123,7 @@ spec:
             - name: BROWSER_PEER_ORIGIN
               value: "http://$(BROWSER_POD_IP):8084"
             {{- end }}
-            {{- if eq $replicas 1 }}
+            {{- if $mountJournal }}
             - name: BROWSER_CONTROLLER_STATE
               value: /controller-data/executions
             {{- end }}
@@ -180,7 +189,7 @@ spec:
             tcpSocket:
               port: access
           volumeMounts:
-            {{- if eq $replicas 1 }}
+            {{- if $mountJournal }}
             - name: controller-data
               mountPath: /controller-data
               {{- if .Values.controller.sharedState }}
@@ -195,7 +204,7 @@ spec:
               mountPath: /var/lib/browser-sandbox
             {{- end }}
       volumes:
-        {{- if eq $replicas 1 }}
+        {{- if $mountJournal }}
         - name: controller-data
           persistentVolumeClaim:
             claimName: {{ default (printf "%s-data" (include "browser-sandbox.name" .)) .Values.controllerData.existingClaim }}
