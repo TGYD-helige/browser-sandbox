@@ -8,6 +8,16 @@ import { setTimeout as delay } from "node:timers/promises";
 import { activeActive } from "./active-active.mjs";
 import { verifyJournalRollback } from "./journal-rollback.mjs";
 
+const suite = process.argv[2] ?? "all";
+assert(
+  ["all", "fresh-node", "single-controller", "journal", "active-active"].includes(
+    suite,
+  ),
+  `Unknown Kubernetes suite: ${suite}`,
+);
+const runFreshNode = suite === "all" || suite === "fresh-node";
+const runSingleController = suite === "all" || suite === "single-controller";
+
 const directory = await mkdtemp(join(tmpdir(), "browser-kubernetes-"));
 const suffix = randomUUID().slice(0, 8);
 const cluster = process.env.TEST_K3D_CLUSTER ?? `browser-${suffix}`;
@@ -185,8 +195,15 @@ const controllerReady = async () =>
     },
     30000,
   );
-await mkdir("managed-results", { recursive: true });
-try {
+const writeReport = async (report) => {
+  await writeFile(
+    "managed-results/kubernetes.json",
+    `${JSON.stringify(report, null, 2)}\n`,
+  );
+  console.log(JSON.stringify(report));
+};
+
+const runSuite = async () => {
   if (!process.env.TEST_K3D_CLUSTER) {
     clusterAttempted = true;
     await run(
@@ -207,24 +224,28 @@ try {
       node.metadata.labels["node-role.kubernetes.io/control-plane"] !== undefined,
   ).metadata.name;
   const workerNode = nodes.find((node) => node.metadata.name !== server).metadata.name;
-  await run(
-    "docker",
-    [
-      "build",
-      "--build-arg",
-      `BROWSER_IMAGE=${image}`,
-      "-f",
-      ".github/scripts/managed/Dockerfile.protocol",
-      "-t",
-      nextImage,
-      ".",
-    ],
-    { timeout: 300000 },
-  );
-  for (const candidate of [image, clientImage, nextImage]) {
-    await run("k3d", ["image", "import", candidate, "-c", cluster], {
-      timeout: 300000,
-    });
+  if (runSingleController)
+    await run(
+      "docker",
+      [
+        "build",
+        "--build-arg",
+        `BROWSER_IMAGE=${image}`,
+        "-f",
+        ".github/scripts/managed/Dockerfile.protocol",
+        "-t",
+        nextImage,
+        ".",
+      ],
+      { timeout: 300000 },
+    );
+  const candidates = [image];
+  if (suite !== "journal") candidates.push(clientImage);
+  if (runSingleController) candidates.push(nextImage);
+  await run("k3d", ["image", "import", ...candidates, "-c", cluster], {
+    timeout: 300000,
+  });
+  for (const candidate of candidates) {
     // Docker's containerd image store can export only the config digest as a reference.
     const candidateName = candidate.includes("/")
       ? candidate
@@ -283,14 +304,18 @@ try {
   const repository = normalized.slice(0, normalized.lastIndexOf(":"));
   const pinned = `${repository}@${digest}`;
   const nextNormalized = `docker.io/library/${nextImage}`;
-  const nextRow = images
-    .split("\n")
-    .find((line) => line.split(/\s+/)[0] === nextNormalized);
-  assert(nextRow, "Imported protocol image was not found");
-  const nextDigest = nextRow.split(/\s+/)[2];
-  assert(/^sha256:[a-f0-9]{64}$/.test(nextDigest));
   const nextRepository = nextNormalized.slice(0, nextNormalized.lastIndexOf(":"));
-  const nextPinned = `${nextRepository}@${nextDigest}`;
+  let nextDigest;
+  if (runSingleController) {
+    const nextRow = images
+      .split("\n")
+      .find((line) => line.split(/\s+/)[0] === nextNormalized);
+    nextDigest = nextRow?.split(/\s+/)[2];
+    assert(
+      nextDigest && /^sha256:[a-f0-9]{64}$/.test(nextDigest),
+      "Invalid protocol image digest",
+    );
+  }
   for (const node of nodes) {
     await run("docker", [
       "exec",
@@ -304,61 +329,71 @@ try {
       normalized,
       pinned,
     ]);
-    await run("docker", [
-      "exec",
-      node.metadata.name,
-      "ctr",
-      "-n",
-      "k8s.io",
-      "images",
-      "tag",
-      "--force",
-      nextNormalized,
-      nextPinned,
-    ]);
+    if (nextDigest)
+      await run("docker", [
+        "exec",
+        node.metadata.name,
+        "ctr",
+        "-n",
+        "k8s.io",
+        "images",
+        "tag",
+        "--force",
+        nextNormalized,
+        `${nextRepository}@${nextDigest}`,
+      ]);
   }
-  stage = "NetworkPolicy enforcement";
-  // Fail before installing the controller if the CNI doesn't enforce policy.
-  await run("node", [".github/scripts/managed/kubernetes-network.mjs"], {
-    env: { PROBE_IMAGE: pinned },
-    timeout: 240000,
-  });
+  if (runFreshNode) {
+    stage = "NetworkPolicy enforcement";
+    // Fail before installing the controller if the CNI doesn't enforce policy.
+    await run("node", [".github/scripts/managed/kubernetes-network.mjs"], {
+      env: { PROBE_IMAGE: pinned },
+      timeout: 240000,
+    });
+  }
   await run("kubectl", ["create", "namespace", namespace]);
-  await kubectl(
-    "run",
-    "host-storage",
-    `--image=${clientImage}`,
-    "--labels=browser-sandbox-test-storage=true",
-    "--restart=Never",
-    "--overrides=" +
-      JSON.stringify({
-        spec: {
-          automountServiceAccountToken: false,
-          nodeName: server,
-          containers: [
-            {
-              name: "host-storage",
-              image: clientImage,
-              command: [
-                "node",
-                "/opt/browser-sandbox/.github/scripts/managed/host-storage.mjs",
-              ],
-              readinessProbe: { tcpSocket: { port: 9083 }, periodSeconds: 1 },
-            },
-          ],
-        },
-      }),
-  );
-  await kubectl("wait", "--for=condition=Ready", "pod/host-storage", "--timeout=120s");
-  const hostStoragePod = JSON.parse(
-    await kubectl("get", "pod/host-storage", "-o", "json"),
-  );
-  assert.notEqual(
-    hostStoragePod.spec.nodeName,
-    workerNode,
-    "Host archive fixture must remain off the drain target",
-  );
-  hostStorageAddress = hostStoragePod.status.podIP;
+  if (runSingleController || suite === "active-active") {
+    await kubectl(
+      "run",
+      "host-storage",
+      `--image=${clientImage}`,
+      "--labels=browser-sandbox-test-storage=true",
+      "--restart=Never",
+      "--overrides=" +
+        JSON.stringify({
+          spec: {
+            automountServiceAccountToken: false,
+            nodeName: server,
+            containers: [
+              {
+                name: "host-storage",
+                image: clientImage,
+                command: [
+                  "node",
+                  "/opt/browser-sandbox/.github/scripts/managed/host-storage.mjs",
+                ],
+                readinessProbe: { tcpSocket: { port: 9083 }, periodSeconds: 1 },
+              },
+            ],
+          },
+        }),
+    );
+    await kubectl(
+      "wait",
+      "--for=condition=Ready",
+      "pod/host-storage",
+      "--timeout=120s",
+    );
+    const hostStoragePod = JSON.parse(
+      await kubectl("get", "pod/host-storage", "-o", "json"),
+    );
+    assert.notEqual(
+      hostStoragePod.spec.nodeName,
+      workerNode,
+      "Host archive fixture must remain off the drain target",
+    );
+    hostStorageAddress = hostStoragePod.status.podIP;
+  }
   const values = join(directory, "values.json");
   await writeFile(
     values,
@@ -373,7 +408,9 @@ try {
         maxExecutionMs: 180000,
       },
       networkPolicy: {
-        storageEgress: [{ address: hostStorageAddress, port: 9083 }],
+        storageEgress: hostStorageAddress
+          ? [{ address: hostStorageAddress, port: 9083 }]
+          : [],
         apiServerCidrs: [
           "10.43.0.1/32",
           ...nodes.map(
@@ -390,7 +427,17 @@ try {
       },
     }),
   );
-  stage = "single shared-state controller and Unconfined worker";
+  const checkJournal = async () => {
+    stage = "Helm journal claim upgrade and rollback";
+    await verifyJournalRollback({ run, kubectl, namespace, directory, values });
+  };
+  if (suite === "journal") {
+    await checkJournal();
+    await writeReport({ helmJournalUpgradeAndRollbackPreservedPvc: true });
+    return;
+  }
+
+  stage = "client setup";
   await kubectl(
     "run",
     "client",
@@ -408,68 +455,92 @@ try {
     "setInterval(()=>{},1000)",
   );
   await kubectl("wait", "--for=condition=Ready", "pod/client", "--timeout=120s");
-  if (clusterAttempted)
-    await run("docker", [
-      "exec",
-      workerNode,
-      "test",
-      "!",
-      "-e",
-      "/var/lib/kubelet/seccomp/browser-sandbox.json",
+  const freshNodeResults = {
+    singleSharedStateControllerRecoveredWithoutJournalPvc: true,
+    unconfinedWorker: {
+      containerRuntimeVersion: nodes.find((node) => node.metadata.name === workerNode)
+        .status.nodeInfo.containerRuntimeVersion,
+      checkedWithoutNodeProfile: clusterAttempted,
+    },
+  };
+  if (runFreshNode) {
+    stage = "single shared-state controller and Unconfined worker";
+    if (clusterAttempted)
+      await run("docker", [
+        "exec",
+        workerNode,
+        "test",
+        "!",
+        "-e",
+        "/var/lib/kubelet/seccomp/browser-sandbox.json",
+      ]);
+    installed = true;
+    await run("helm", [
+      "install",
+      release,
+      "charts/browser-sandbox",
+      "-n",
+      namespace,
+      "-f",
+      values,
+      "--set",
+      "controller.sharedState=true,controllerData.skipCreation=true,profileStore.enabled=false",
+      "--set",
+      "worker.securityContext.seccompProfile.type=Unconfined",
+      "--wait",
+      "--timeout",
+      "120s",
     ]);
-  installed = true;
-  await run("helm", [
-    "install",
-    release,
-    "charts/browser-sandbox",
-    "-n",
-    namespace,
-    "-f",
-    values,
-    "--set",
-    "controller.sharedState=true,controllerData.skipCreation=true,profileStore.enabled=false",
-    "--set",
-    "worker.securityContext.seccompProfile.type=Unconfined",
-    "--wait",
-    "--timeout",
-    "120s",
-  ]);
-  assert.equal(await kubectl("get", "pvc", "-o", "name"), "");
-  const shared = await client("hold");
-  const [sharedWorker] = await pods();
-  assert.equal(sharedWorker?.spec.nodeName, workerNode);
-  assert.equal(sharedWorker.spec.automountServiceAccountToken, false);
-  const { securityContext } = sharedWorker.spec.containers[0];
-  assert.deepEqual(securityContext.seccompProfile, { type: "Unconfined" });
-  assert.equal(securityContext.privileged, false);
-  assert.equal(securityContext.allowPrivilegeEscalation, false);
-  const workerStatus = await kubectl(
-    "exec",
-    sharedWorker.metadata.name,
-    "--",
-    "cat",
-    "/proc/1/status",
-  );
-  assert.match(workerStatus, /^NoNewPrivs:\s+1$/m);
-  assert.match(workerStatus, /^Seccomp:\s+0$/m);
-  await kubectl("rollout", "restart", `deployment/${deployment}`);
-  await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
-  assert.equal((await pods())[0]?.metadata.uid, sharedWorker.metadata.uid);
-  assert.deepEqual(await client("resume", shared.executionId), {
-    samePage: true,
-    sameGeneration: true,
-  });
-  await client("finish", shared.executionId);
-  await run("helm", [
-    "uninstall",
-    release,
-    "-n",
-    namespace,
-    "--wait",
-    "--timeout",
-    "120s",
-  ]);
-  installed = false;
+    assert.equal(await kubectl("get", "pvc", "-o", "name"), "");
+    await run("helm", [
+      "upgrade",
+      release,
+      "charts/browser-sandbox",
+      "-n",
+      namespace,
+      "--reuse-values",
+      "--dry-run=server",
+    ]);
+    const shared = await client("hold");
+    const [sharedWorker] = await pods();
+    assert.equal(sharedWorker?.spec.nodeName, workerNode);
+    assert.equal(sharedWorker.spec.automountServiceAccountToken, false);
+    const { securityContext } = sharedWorker.spec.containers[0];
+    assert.deepEqual(securityContext.seccompProfile, { type: "Unconfined" });
+    assert.equal(securityContext.privileged, false);
+    assert.equal(securityContext.allowPrivilegeEscalation, false);
+    const workerStatus = await kubectl(
+      "exec",
+      sharedWorker.metadata.name,
+      "--",
+      "cat",
+      "/proc/1/status",
+    );
+    assert.match(workerStatus, /^NoNewPrivs:\s+1$/m);
+    assert.match(workerStatus, /^Seccomp:\s+0$/m);
+    await kubectl("rollout", "restart", `deployment/${deployment}`);
+    await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
+    assert.equal((await pods())[0]?.metadata.uid, sharedWorker.metadata.uid);
+    assert.deepEqual(await client("resume", shared.executionId), {
+      samePage: true,
+      sameGeneration: true,
+    });
+    await client("finish", shared.executionId);
+    await run("helm", [
+      "uninstall",
+      release,
+      "-n",
+      namespace,
+      "--wait",
+      "--timeout",
+      "120s",
+    ]);
+    installed = false;
+    if (suite === "fresh-node") {
+      await writeReport(freshNodeResults);
+      return;
+    }
+  }
 
   stage = "provision Localhost seccomp profile";
   extraction = await run("docker", ["create", image]);
@@ -493,6 +564,15 @@ try {
       join(directory, "browser-sandbox.json"),
       `${node.metadata.name}:/var/lib/kubelet/seccomp/browser-sandbox.json`,
     ]);
+  }
+
+  const checkActiveActive = async () => {
+    stage = "three-replica active-active";
+    return activeActive({ run, kubectl, namespace, directory, values, clientImage });
+  };
+  if (suite === "active-active") {
+    await writeReport({ activeActive: await checkActiveActive() });
+    return;
   }
 
   stage = "Helm install";
@@ -998,26 +1078,15 @@ try {
     "Helm uninstall left worker Pods",
     async () => (await pods()).length === 0,
   );
-  stage = "Helm journal claim upgrade and rollback";
-  await verifyJournalRollback({ run, kubectl, namespace, directory, values });
-  stage = "three-replica active-active";
-  const activeActiveReport = await activeActive({
-    run,
-    kubectl,
-    namespace,
-    directory,
-    values,
-    clientImage,
-  });
-  const report = {
-    activeActive: activeActiveReport,
-    helmJournalUpgradeAndRollbackPreservedPvc: true,
-    singleSharedStateControllerRecoveredWithoutJournalPvc: true,
-    unconfinedWorker: {
-      containerRuntimeVersion: nodes.find((node) => node.metadata.name === workerNode)
-        .status.nodeInfo.containerRuntimeVersion,
-      checkedWithoutNodeProfile: clusterAttempted,
-    },
+  const additionalResults = {};
+  if (suite === "all") {
+    await checkJournal();
+    additionalResults.helmJournalUpgradeAndRollbackPreservedPvc = true;
+    additionalResults.activeActive = await checkActiveActive();
+    Object.assign(additionalResults, freshNodeResults);
+  }
+  await writeReport({
+    ...additionalResults,
     controllerStartupMs,
     ...functional,
     rolloutPreservedWorker: true,
@@ -1032,12 +1101,12 @@ try {
     uninstallRemovedWorkers: true,
     uninstallRetainedProfileStore: true,
     heldArchitecture: held.architecture,
-  };
-  await writeFile(
-    "managed-results/kubernetes.json",
-    `${JSON.stringify(report, null, 2)}\n`,
-  );
-  console.log(JSON.stringify(report));
+  });
+};
+
+await mkdir("managed-results", { recursive: true });
+try {
+  await runSuite();
 } catch (error) {
   // Logs may contain capability URLs. Retain only known diagnostic codes and Pod state.
   const list = await kubectl("get", "pods", "-o", "json")
@@ -1087,7 +1156,8 @@ try {
       "-p",
       JSON.stringify({ metadata: { finalizers: [] } }),
     ).catch(() => {});
-  await run("docker", ["image", "rm", nextImage]).catch(() => {});
+  if (runSingleController)
+    await run("docker", ["image", "rm", nextImage]).catch(() => {});
   if (cordoned) await run("kubectl", ["uncordon", cordoned]).catch(() => {});
   if (installed)
     await run("helm", [

@@ -1,0 +1,18 @@
+name: Setup Kubernetes test tools
+description: Install the pinned tooling shared by the Kubernetes test jobs.
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@v4
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+        cache: pnpm
+    - uses: azure/setup-helm@v4
+      with:
+        version: v4.1.1
+    - name: Install k3d
+      shell: bash
+      run: |
+        bash .github/scripts/managed/install-k3d.sh
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"

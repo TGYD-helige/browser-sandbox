@@ -47,7 +47,7 @@ Set `worker.securityContext.seccompProfile.type=Unconfined` to opt out of the wo
 
 Chromium still uses its namespace and renderer seccomp sandboxes. The controller keeps its own seccomp profile, and worker capabilities, NetworkPolicy, private ports, privilege-escalation settings, and ServiceAccount token settings remain in effect. Opting out gives the worker processes access to more kernel syscalls where their other permissions allow it. Use the default `Localhost` profile when you need that extra layer of protection.
 
-Stock containerd `RuntimeDefault` filters the namespace creation syscalls needed by Chromium with the worker's capability set. The managed Kubernetes CI matrix exercises `Unconfined` with k3d/K3s and containerd on native Linux amd64 and arm64. It checks Chromium's namespace and Seccomp-BPF status before provisioning any `Localhost` file. The CI report records the runtime version. Verify a sandboxed browser session and NetworkPolicy enforcement on the target cluster before admitting workloads.
+Stock containerd `RuntimeDefault` filters the namespace creation syscalls needed by Chromium with the worker's capability set. The managed Kubernetes CI `fresh-node` suite exercises `Unconfined` with k3d/K3s and containerd on native Linux amd64 and arm64. It checks Chromium's namespace and Seccomp-BPF status before provisioning any `Localhost` file. The CI report records the runtime version. Verify a sandboxed browser session and NetworkPolicy enforcement on the target cluster before admitting workloads.
 
 ## Network isolation
 
