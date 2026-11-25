@@ -390,7 +390,7 @@ try {
       },
     }),
   );
-  stage = "single shared-state controller and image-filtered worker on a fresh node";
+  stage = "single shared-state controller and Unconfined worker on a fresh node";
   await kubectl(
     "run",
     "client",
@@ -428,7 +428,7 @@ try {
     "--set",
     "controller.sharedState=true,controllerData.skipCreation=true,profileStore.enabled=false",
     "--set",
-    "worker.securityContext.seccompProfile.type=Image",
+    "worker.securityContext.seccompProfile.type=Unconfined",
     "--wait",
     "--timeout",
     "120s",
@@ -439,6 +439,7 @@ try {
   assert.equal(sharedWorker?.spec.nodeName, workerNode);
   assert.equal(sharedWorker.spec.automountServiceAccountToken, false);
   const { securityContext } = sharedWorker.spec.containers[0];
+  assert.deepEqual(securityContext.seccompProfile, { type: "Unconfined" });
   assert.equal(securityContext.privileged, false);
   assert.equal(securityContext.allowPrivilegeEscalation, false);
   const workerStatus = await kubectl(
@@ -449,7 +450,7 @@ try {
     "/proc/1/status",
   );
   assert.match(workerStatus, /^NoNewPrivs:\s+1$/m);
-  assert.match(workerStatus, /^Seccomp:\s+2$/m);
+  assert.match(workerStatus, /^Seccomp:\s+0$/m);
   await kubectl("rollout", "restart", `deployment/${deployment}`);
   await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
   assert.equal((await pods())[0]?.metadata.uid, sharedWorker.metadata.uid);
@@ -1011,9 +1012,8 @@ try {
     activeActive: activeActiveReport,
     helmJournalUpgradeAndRollbackPreservedPvc: true,
     singleSharedStateControllerRecoveredWithoutJournalPvc: true,
-    imageSeccompWorkerOnFreshNode: nodes.find(
-      (node) => node.metadata.name === workerNode,
-    ).status.nodeInfo.containerRuntimeVersion,
+    unconfinedWorkerOnFreshNode: nodes.find((node) => node.metadata.name === workerNode)
+      .status.nodeInfo.containerRuntimeVersion,
     controllerStartupMs,
     ...functional,
     rolloutPreservedWorker: true,

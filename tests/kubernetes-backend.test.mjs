@@ -293,19 +293,17 @@ async function fixture(
   return { backend, state };
 }
 
-test("image seccomp requires the worker launcher and preserves Pod protections", async (t) => {
-  const { backend, state } = await fixture(t, { seccompProfile: { type: "Image" } });
+test("Unconfined skips the worker profile and preserves Pod protections", async (t) => {
+  const { backend, state } = await fixture(t, {
+    seccompProfile: { type: "Unconfined", localhostProfile: "browser-sandbox.json" },
+  });
   const worker = await backend.create(
     { executionId, incarnation },
     AbortSignal.timeout(5000),
   );
   t.after(() => worker.runtime.close());
   const { command, args, securityContext } = state.pod.spec.containers[0];
-  assert.deepEqual(command, [
-    "/opt/browser-sandbox/worker-seccomp",
-    "node",
-    "/opt/browser-sandbox/dist/main.js",
-  ]);
+  assert.equal(command, undefined);
   assert.deepEqual(args, ["worker"]);
   assert.deepEqual(securityContext.seccompProfile, { type: "Unconfined" });
   assert.equal(securityContext.privileged, false);

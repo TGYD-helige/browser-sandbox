@@ -50,7 +50,7 @@ worker:
       drop: [ALL]
       add: [SETUID, SETGID, CHOWN, KILL, DAC_OVERRIDE, SYS_CHROOT, NET_ADMIN]
     seccompProfile:
-      # Image loads the built-in worker filter at startup without a node file.
+      # Unconfined opts out of the worker-level seccomp filter.
       type: Localhost
       localhostProfile: browser-sandbox.json
   shmSize: 512Mi

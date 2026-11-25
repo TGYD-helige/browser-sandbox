@@ -13,13 +13,6 @@ COPY skills/browser-sandbox-auth/scripts/auth.mjs ./skills/browser-sandbox-auth/
 COPY scripts/copy-assets.mjs ./scripts/copy-assets.mjs
 RUN pnpm build && pnpm prune --prod
 
-FROM build AS worker-seccomp
-RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev libseccomp-dev
-COPY config/seccomp-source.json ./seccomp-source.json
-COPY scripts/build-worker-seccomp.mjs scripts/worker-seccomp.c ./scripts/
-RUN node scripts/build-worker-seccomp.mjs seccomp-source.json > scripts/worker-seccomp-rules.h \
-  && gcc -O2 -Wall -Wextra -Werror scripts/worker-seccomp.c -lseccomp -o worker-seccomp
-
 FROM ${CLOAK_IMAGE} AS cloak
 COPY scripts/extract-cloak.py /tmp/extract-cloak.py
 RUN python /tmp/extract-cloak.py && chmod -R go-w /cloak
@@ -43,7 +36,6 @@ WORKDIR /opt/browser-sandbox
 # Ubuntu's existing Chrome AppArmor profile attaches to this root-owned path.
 COPY --from=cloak --chown=0:0 /cloak /opt/google/chrome
 COPY --from=build /build/dist ./dist
-COPY --from=worker-seccomp /build/worker-seccomp ./worker-seccomp
 COPY --from=build /build/node_modules ./node_modules
 COPY package.json ./
 COPY examples ./examples
@@ -58,7 +50,7 @@ RUN chmod -R go-w /opt/browser-sandbox \
   && node /opt/browser-sandbox/dist/prepare-seccomp.js /opt/browser-sandbox/seccomp-source.json /opt/browser-sandbox/seccomp.json \
   && command -v flock \
   && node -e "if(typeof process.execve!=='function')throw Error('Node execve required'); const p=require(process.env.APP_DIR+'/package.json'); if(p.version!=='2.57.0')throw Error('Browserless version mismatch'); const tar=require('tar-stream'); if(typeof tar.pack!=='function'||typeof tar.extract!=='function')throw Error('Profile archive dependency missing')"
-RUN apt-get update && apt-get install -y --no-install-recommends fonts-noto-cjk fonts-liberation fonts-noto-color-emoji util-linux iptables libseccomp2 && fc-cache -f && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends fonts-noto-cjk fonts-liberation fonts-noto-color-emoji util-linux iptables && fc-cache -f && rm -rf /var/lib/apt/lists/*
 WORKDIR ${APP_DIR}
 ENV HOST=127.0.0.1 PORT=3001 CONCURRENT=2 QUEUED=4 TIMEOUT=1800000 TZ=UTC \
     DEBUG=quiet ENABLE_DEBUGGER=false BROWSER_CONTROL_SOCKET=/run/browser-sandbox/control.sock

@@ -19,8 +19,8 @@ app.kubernetes.io/instance: {{ .Release.Name | quote }}
 
 {{- define "browser-sandbox.worker-template" -}}
 {{- $profile := .Values.worker.securityContext.seccompProfile -}}
-{{- if not (or (eq $profile.type "Image") (and (eq $profile.type "Localhost") $profile.localhostProfile)) -}}
-{{- fail "worker.securityContext.seccompProfile must use Image or Localhost with a localhostProfile" -}}
+{{- if not (or (eq $profile.type "Unconfined") (and (eq $profile.type "Localhost") $profile.localhostProfile)) -}}
+{{- fail "worker.securityContext.seccompProfile must use Unconfined or Localhost with a localhostProfile" -}}
 {{- end -}}
 {{- merge (dict "imagePullSecrets" .Values.imagePullSecrets) (omit .Values.worker "disruptionBudget") | toPrettyJson -}}
 {{- end -}}
