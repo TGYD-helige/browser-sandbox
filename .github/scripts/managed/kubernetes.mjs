@@ -410,6 +410,62 @@ try {
       },
     }),
   );
+  stage = "single shared-state controller without a journal PVC";
+  await kubectl(
+    "run",
+    "client",
+    "--labels=browser-sandbox.io/host-control=true",
+    `--image=${clientImage}`,
+    "--restart=Never",
+    "--overrides=" +
+      JSON.stringify({
+        spec: { automountServiceAccountToken: false, nodeName: server },
+      }),
+    "--command",
+    "--",
+    "node",
+    "-e",
+    "setInterval(()=>{},1000)",
+  );
+  await kubectl("wait", "--for=condition=Ready", "pod/client", "--timeout=120s");
+  installed = true;
+  await run("helm", [
+    "install",
+    release,
+    "charts/browser-sandbox",
+    "-n",
+    namespace,
+    "-f",
+    values,
+    "--set",
+    "controller.sharedState=true,controllerData.skipCreation=true,profileStore.enabled=false",
+    "--wait",
+    "--timeout",
+    "120s",
+  ]);
+  assert.equal(await kubectl("get", "pvc", "-o", "name"), "");
+  const shared = await client("hold");
+  const sharedWorkerUid = (await pods())[0]?.metadata.uid;
+  assert(sharedWorkerUid);
+  await kubectl("rollout", "restart", `deployment/${deployment}`);
+  await kubectl("rollout", "status", `deployment/${deployment}`, "--timeout=120s");
+  assert.equal((await pods())[0]?.metadata.uid, sharedWorkerUid);
+  assert.deepEqual(await client("resume", shared.executionId), {
+    samePage: true,
+    sameGeneration: true,
+  });
+  await client("finish", shared.executionId);
+  await run("helm", [
+    "uninstall",
+    release,
+    "-n",
+    namespace,
+    "--wait",
+    "--timeout",
+    "120s",
+  ]);
+  installed = false;
+
   stage = "Helm install";
   installed = true;
   const installStarted = performance.now();
@@ -429,23 +485,6 @@ try {
     "profileStore.enabled=false",
   ]);
   const controllerStartupMs = performance.now() - installStarted;
-  await kubectl(
-    "run",
-    "client",
-    "--labels=browser-sandbox.io/host-control=true",
-    `--image=${clientImage}`,
-    "--restart=Never",
-    "--overrides=" +
-      JSON.stringify({
-        spec: { automountServiceAccountToken: false, nodeName: server },
-      }),
-    "--command",
-    "--",
-    "node",
-    "-e",
-    "setInterval(()=>{},1000)",
-  );
-  await kubectl("wait", "--for=condition=Ready", "pod/client", "--timeout=120s");
   const missingStorage = await profileClient("missing-storage");
   assert.equal((await pods()).length, 0);
   await run("helm", [
@@ -944,6 +983,7 @@ try {
   const report = {
     activeActive: activeActiveReport,
     helmJournalUpgradeAndRollbackPreservedPvc: true,
+    singleSharedStateControllerRecoveredWithoutJournalPvc: true,
     controllerStartupMs,
     ...functional,
     rolloutPreservedWorker: true,

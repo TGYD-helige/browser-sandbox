@@ -229,16 +229,30 @@ class ChartTest(unittest.TestCase):
                 resources = render("--set", f"controller.replicas={replicas}", "--set", "controllerData.existingClaim=retained")
                 self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in resources))
 
-    def test_active_active_can_install_without_provisioning_a_journal_claim(self):
+    def test_shared_state_can_install_without_provisioning_a_journal_claim(self):
         skip_creation = ("--set", "controllerData.skipCreation=true")
-        resources = render(*skip_creation, "--set", "controller.replicas=3")
-        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in resources))
+        for settings in (("--set", "controller.sharedState=true"), ("--set", "controller.replicas=3")):
+            with self.subTest(settings=settings):
+                resources = render(*skip_creation, *settings)
+                self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in resources))
+                deployment = next(item for item in resources if item["kind"] == "Deployment")
+                pod = deployment["spec"]["template"]["spec"]
+                container = pod["containers"][0]
+                self.assertNotIn("controller-data", {volume["name"] for volume in pod["volumes"]})
+                self.assertNotIn("controller-data", {mount["name"] for mount in container["volumeMounts"]})
+                env = {item["name"]: item.get("value") for item in container["env"]}
+                self.assertEqual(env["BROWSER_SHARED_STATE"], "true")
+                self.assertNotIn("BROWSER_CONTROLLER_STATE", env)
         with self.assertRaises(subprocess.CalledProcessError):
             render(*skip_creation)
-        resources = render(*skip_creation, "--set", "controllerData.existingClaim=retained")
+        resources = render(*skip_creation, "--set", "controller.sharedState=true", "--set", "controllerData.existingClaim=retained")
+        self.assertFalse(any(item["kind"] == "PersistentVolumeClaim" for item in resources))
         deployment = next(item for item in resources if item["kind"] == "Deployment")
-        volumes = deployment["spec"]["template"]["spec"]["volumes"]
-        self.assertIn({"name": "controller-data", "persistentVolumeClaim": {"claimName": "retained"}}, volumes)
+        pod = deployment["spec"]["template"]["spec"]
+        self.assertIn({"name": "controller-data", "persistentVolumeClaim": {"claimName": "retained"}}, pod["volumes"])
+        container = pod["containers"][0]
+        self.assertIn({"name": "controller-data", "mountPath": "/controller-data", "readOnly": True}, container["volumeMounts"])
+        self.assertIn({"name": "BROWSER_CONTROLLER_STATE", "value": "/controller-data/executions"}, container["env"])
 
     def test_active_active_has_shared_state_peer_isolation_and_no_rwo_mount(self):
         resources = render("--set", "controller.replicas=3")
