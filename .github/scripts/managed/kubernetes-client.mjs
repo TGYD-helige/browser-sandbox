@@ -219,14 +219,13 @@ try {
             sandboxSession,
           )
         ).result.value ?? "";
-      if (
-        /Namespace Sandbox\s+Yes/.test(text) &&
-        /Seccomp-BPF sandbox\s+Yes/.test(text)
-      )
-        break;
+      const pidNamespace = /PID namespaces\s+Yes/i.test(text);
+      const networkNamespace = /Network namespaces\s+Yes/i.test(text);
+      const seccomp = /Seccomp-BPF sandbox\s+Yes/i.test(text);
+      if (pidNamespace && networkNamespace && seccomp) break;
       assert(
         Date.now() < sandboxDeadline,
-        "Chromium namespace and seccomp sandboxes are not enabled",
+        `Chromium sandbox status: PID=${pidNamespace} network=${networkNamespace} seccomp=${seccomp}`,
       );
       await delay(50);
     }
