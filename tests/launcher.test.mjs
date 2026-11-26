@@ -150,6 +150,7 @@ for (const quiesce of [false, true])
 function fixture(
   cookieStore = () => ({ restore: async () => {}, save: async () => {} }),
   extensionsDir = undefined,
+  workerExecutionId = undefined,
 ) {
   const sockets = [],
     requests = [];
@@ -186,6 +187,7 @@ function fixture(
     token: "test",
     privacyArgs: [],
     extensionsDir,
+    workerExecutionId,
     cookieStore,
   });
   const req = (index) => ({ parsed: sockets[index].url });
@@ -210,7 +212,7 @@ function fixture(
       close: async () => {},
       exit() {
         child.exitCode = 0;
-        child.emit("exit", 0);
+        child.emit("exit", 0, null);
       },
     };
   }
@@ -231,6 +233,26 @@ function fixture(
     socketCreated: socketCreated.promise,
   };
 }
+
+test("a managed Chrome exit is logged once without CDP details", async (t) => {
+  const logs = [];
+  t.mock.method(console, "error", (line) => logs.push(JSON.parse(line)));
+  const f = fixture(undefined, undefined, "same-workspace");
+  const pending = f.start(new AbortController().signal);
+  await f.socketCreated;
+  const starting = f.browserManager.getBrowserForRequest(f.req(0));
+  const browser = f.browser("ws://localhost/private-token");
+  f.requests[0].resolve(browser);
+  await starting;
+  f.sockets[0].emit("open");
+  const handle = await pending;
+  browser.exit();
+  f.sockets[0].emit("close");
+  await handle.close();
+  assert.deepEqual(logs, [
+    { event: "browser_unexpected_exit", exitCode: 0, signal: null },
+  ]);
+});
 
 test("launcher enables configured extensions without bypassing other Chrome defaults", async () => {
   const root = await mkdtemp(join(tmpdir(), "browser-launch-extensions-"));

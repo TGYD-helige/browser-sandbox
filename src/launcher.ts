@@ -6,6 +6,7 @@ import {
   BrowserCleanupUnconfirmed,
   VerifiedBrowserCheckpointFailure,
 } from "./lifecycle-errors.js";
+import { logWorkerLifecycle } from "./worker-lifecycle.js";
 
 async function waitForExit(exited: Promise<unknown>, timeoutMs: number) {
   const timer = new AbortController();
@@ -52,6 +53,7 @@ export function createBrowserLauncher({
   privacyArgs,
   extensionsDir = undefined as string | undefined,
   cookieStore = createCookieStore,
+  workerExecutionId = undefined as string | undefined,
 }) {
   const launches = new Map();
   const readExtensions =
@@ -66,7 +68,9 @@ export function createBrowserLauncher({
       entry.browser = browser;
       // Track the child before any asynchronous setup can fail.
       entry.child = browser.process();
-      entry.child?.once("exit", () => {
+      entry.child?.once("exit", (exitCode, signal) => {
+        if (entry.managed && entry.ready && !entry.stopping && !entry.cancelled)
+          logWorkerLifecycle("browser_unexpected_exit", { exitCode, signal }, true);
         entry.exited.resolve();
         entry.disconnected.resolve();
       });
@@ -168,6 +172,7 @@ export function createBrowserLauncher({
       const trackingId = randomBytes(16).toString("hex");
       const entry: any = {
         sessionBoundary,
+        managed: Boolean(workerExecutionId) && executionId === workerExecutionId,
         filesDir,
         exited: Promise.withResolvers(),
         cookies: cookieStore(WebSocket, {
@@ -274,6 +279,17 @@ export function createBrowserLauncher({
           }
         })()
           .catch((error) => {
+            if (entry.managed)
+              logWorkerLifecycle(
+                "browser_shutdown_failed",
+                {
+                  code:
+                    error instanceof VerifiedBrowserCheckpointFailure
+                      ? error.message
+                      : "browser_cleanup_unconfirmed",
+                },
+                true,
+              );
             if (error instanceof VerifiedBrowserCheckpointFailure) throw error;
             throw new BrowserCleanupUnconfirmed(error);
           })

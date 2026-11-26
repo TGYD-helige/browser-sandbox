@@ -195,6 +195,148 @@ const controllerReady = async () =>
     },
     30000,
   );
+const jsonLogRecords = (output) =>
+  output.split("\n").flatMap((line) => {
+    const space = line.indexOf(" ");
+    try {
+      const record = JSON.parse(line.slice(space + 1));
+      return record && typeof record === "object"
+        ? [{ ...record, time: Date.parse(line.slice(0, space)) }]
+        : [];
+    } catch {
+      return [];
+    }
+  });
+
+const workerLifecycle = async (pod) => {
+  const records = jsonLogRecords(
+    await kubectl("logs", pod.metadata.name, "-c", "worker", "--timestamps"),
+  );
+  const events = [
+    "worker_starting",
+    "worker_probe_succeeded",
+    "worker_ready",
+    "browser_launch_succeeded",
+  ];
+  const lifecycle = records.filter(({ event }) => events.includes(event));
+  assert.deepEqual(
+    lifecycle.map(({ event }) => event),
+    events,
+  );
+  return Object.fromEntries(lifecycle.map((record) => [record.event, record]));
+};
+
+const benchmarkColdStart = async (node) => {
+  const samples = [];
+  for (let index = 0; index < 10; index++) {
+    const executionId = randomUUID();
+    try {
+      const clientTiming = await client("cold-start", executionId);
+      const worker = (await pods()).find(
+        (pod) => pod.metadata.labels["browser-sandbox.io/execution"] === executionId,
+      );
+      assert.equal(worker?.spec.nodeName, node.metadata.name);
+      const logs = await workerLifecycle(worker);
+      const controllerReady = jsonLogRecords(
+        await kubectl(
+          "logs",
+          `deployment/${deployment}`,
+          "-c",
+          "controller",
+          "--timestamps",
+          "--since=2m",
+        ),
+      ).find((record) => record.type === "ready" && record.executionId === executionId);
+      assert(controllerReady, "Controller did not report worker readiness");
+      const events = JSON.parse(
+        await kubectl(
+          "get",
+          "events",
+          "--field-selector",
+          `involvedObject.uid=${worker.metadata.uid}`,
+          "-o",
+          "json",
+        ),
+      ).items;
+      const pulling = events.find((event) => event.reason === "Pulling");
+      const pulled = events.find((event) => event.reason === "Pulled");
+      const eventTime = (event) => Date.parse(event.firstTimestamp ?? event.eventTime);
+      if (pulling) assert(pulled, "Image pull did not report completion");
+      const created = Date.parse(worker.metadata.creationTimestamp);
+      const started = Date.parse(
+        worker.status.containerStatuses.find(({ name }) => name === "worker").state
+          .running.startedAt,
+      );
+      const ready = Date.parse(
+        worker.status.conditions.find(
+          ({ type, status }) => type === "Ready" && status === "True",
+        ).lastTransitionTime,
+      );
+      const probe = logs.worker_probe_succeeded;
+      const launch = logs.browser_launch_succeeded;
+      const sample = {
+        ...clientTiming,
+        registrationToFirstCdpMs: clientTiming.registrationMs + clientTiming.coldCdpMs,
+        podToContainerMs: started - created,
+        containerToPodReadyMs: ready - started,
+        workerStartupMs: logs.worker_ready.durationMs,
+        probeMs: probe.durationMs,
+        rendererProbeMs: probe.rendererProbeMs,
+        probeCleanupMs: probe.probeCleanupMs,
+        controllerReadyMs: controllerReady.elapsedMs,
+        runtimeReadyToControllerReadyMs: controllerReady.time - logs.worker_ready.time,
+        preparationMs: launch.preparationMs,
+        profileAcquireMs: launch.profileAcquireMs,
+        profileRestoreMs: launch.profileRestoreMs,
+        browserLaunchMs: launch.browserLaunchMs,
+        imagePullMs: pulling ? eventTime(pulled) - eventTime(pulling) : null,
+      };
+      for (const value of Object.values(sample))
+        assert(value === null || Number.isFinite(value));
+      samples.push(sample);
+    } finally {
+      await client("finish", executionId);
+      assert(
+        !(await pods()).some(
+          (pod) => pod.metadata.labels["browser-sandbox.io/execution"] === executionId,
+        ),
+        "Benchmark worker survived finalization",
+      );
+    }
+  }
+  const summarize = (group) =>
+    Object.fromEntries(
+      Object.keys(group[0]).map((phase) => {
+        const values = group
+          .map((sample) => sample[phase])
+          .filter((value) => value !== null)
+          .sort((a, b) => a - b);
+        if (!values.length) return [phase, { samples: 0 }];
+        const middle = Math.floor(values.length / 2);
+        return [
+          phase,
+          {
+            median:
+              values.length % 2
+                ? values[middle]
+                : (values[middle - 1] + values[middle]) / 2,
+            p95: values[Math.ceil(values.length * 0.95) - 1],
+            samples: values.length,
+          },
+        ];
+      }),
+    );
+  const cached = samples.filter((sample) => sample.imagePullMs === null);
+  const pulled = samples.filter((sample) => sample.imagePullMs !== null);
+  return {
+    node: node.status.nodeInfo,
+    allocatable: node.status.allocatable,
+    samples,
+    ...(cached.length ? { cached: summarize(cached) } : {}),
+    ...(pulled.length ? { pulled: summarize(pulled) } : {}),
+  };
+};
+
 const writeReport = async (report) => {
   await writeFile(
     "managed-results/kubernetes.json",
@@ -526,6 +668,10 @@ const runSuite = async () => {
       sameGeneration: true,
     });
     await client("finish", shared.executionId);
+    stage = "managed worker cold-start benchmark";
+    freshNodeResults.coldStart = await benchmarkColdStart(
+      nodes.find((node) => node.metadata.name === workerNode),
+    );
     await run("helm", [
       "uninstall",
       release,

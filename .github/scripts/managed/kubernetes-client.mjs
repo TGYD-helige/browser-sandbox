@@ -49,6 +49,21 @@ try {
     } finally {
       await runtime.request({ op: "finalize", executionId });
     }
+  } else if (action === "cold-start") {
+    const started = performance.now();
+    const { wsEndpoint } = await runtime.request({ op: "register", executionId });
+    const registrationMs = performance.now() - started;
+    const firstCdp = async () => {
+      const start = performance.now();
+      await connect(wsEndpoint);
+      await cdp.call("Browser.getVersion");
+      return performance.now() - start;
+    };
+    const coldCdpMs = await firstCdp();
+    await sessionRequest(wsEndpoint, "retain", 60000);
+    await closeCdp();
+    const warmCdpMs = await firstCdp();
+    console.log(JSON.stringify({ registrationMs, coldCdpMs, warmCdpMs }));
   } else if (action === "status") {
     console.log(
       JSON.stringify(

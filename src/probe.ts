@@ -5,6 +5,8 @@ import { EXTENSION_STARTUP_ERRORS } from "./lifecycle-errors.js";
 export async function verifyTarget(gateway, WebSocket) {
   const executionId = randomUUID();
   let socket: any;
+  const started = performance.now();
+  let rendererReady: number;
   try {
     const { wsEndpoint } = await gateway.command({
       op: "register",
@@ -68,8 +70,13 @@ export async function verifyTarget(gateway, WebSocket) {
     const { data } = await call("Page.captureScreenshot", {}, sessionId);
     if (typeof data !== "string" || data.length < 100)
       throw Error("browser_renderer_probe_failed");
+    rendererReady = performance.now();
   } finally {
     socket?.terminate();
     await gateway.command({ op: "finish", executionId });
   }
+  return {
+    rendererProbeMs: rendererReady - started,
+    probeCleanupMs: performance.now() - rendererReady,
+  };
 }

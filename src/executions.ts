@@ -23,6 +23,7 @@ import { createProfileArchive } from "./profiles.js";
 import { BrowserSession } from "./session.js";
 import { Takeover } from "./takeover.js";
 import { BrowserViewport } from "./viewport.js";
+import { logWorkerLifecycle } from "./worker-lifecycle.js";
 import { WORKER_PROTOCOL, type WorkerStatus, workerIdle } from "./worker-protocol.js";
 
 interface BrowserHandle {
@@ -91,6 +92,7 @@ export async function createExecutions({
   profileArchive = createProfileArchive(),
   startupTimeoutMs,
   maxSessionMs,
+  workerExecutionId = undefined as string | undefined,
   onBrowserStarting = undefined as ((entry: Execution) => void) | undefined,
 }) {
   if (!Number.isSafeInteger(maxBrowsers) || maxBrowsers < 1)
@@ -542,6 +544,9 @@ export async function createExecutions({
     if (!entry.starting) {
       entry.session.starting();
       let hardExpiresAt: number;
+      const managed = entry.executionId === workerExecutionId;
+      const preparationStarted = performance.now();
+      let launchStarted: number;
       const phases = {
         profileAcquireMs: 0,
         profileRestoreMs: 0,
@@ -592,7 +597,7 @@ export async function createExecutions({
           }
           if (abort.signal.aborted || entry.revoked) fail("browser_launch_cancelled");
           hardExpiresAt = Date.now() + maxSessionMs;
-          const start = performance.now();
+          launchStarted = performance.now();
           const browser = await launch({
             ...entry,
             signal: abort.signal,
@@ -607,12 +612,17 @@ export async function createExecutions({
               ),
             ),
           });
-          phases.browserLaunchMs = performance.now() - start;
+          phases.browserLaunchMs = performance.now() - launchStarted;
           return browser;
         })
         .then((browser) => {
           if (entry.starting === starting && !entry.revoked && !abort.signal.aborted) {
             entry.session.ready(hardExpiresAt);
+            if (managed)
+              logWorkerLifecycle("browser_launch_succeeded", {
+                preparationMs: launchStarted - preparationStarted,
+                ...phases,
+              });
             if (preparationTiming.hasSubscribers)
               preparationTiming.publish({
                 executionId: entry.executionId,
@@ -624,6 +634,15 @@ export async function createExecutions({
           return browser;
         })
         .catch(async (error) => {
+          if (managed && entry.starting === starting)
+            logWorkerLifecycle(
+              "browser_launch_failed",
+              {
+                phase: launchStarted === undefined ? "preparation" : "chrome",
+                durationMs: performance.now() - (launchStarted ?? preparationStarted),
+              },
+              true,
+            );
           if (
             acquiredLease &&
             !(error instanceof BrowserCleanupUnconfirmed) &&
