@@ -8,4 +8,7 @@ FROM ${BROWSER_IMAGE} AS failure
 COPY .github/scripts/managed/probe-failure.mjs /opt/browser-sandbox/dist/probe-failure.mjs
 RUN cd /opt/browser-sandbox/dist \
     && grep -F 'await captureRenderer(cdp.call, browserContextId);' probe.js \
-    && sed -i 's/await captureRenderer(cdp.call, browserContextId);/const { rejectScreenshot } = await import(".\/probe-failure.mjs"); await captureRenderer(rejectScreenshot.bind(null, cdp), browserContextId);/' probe.js
+    && sed -i 's/await captureRenderer(cdp.call, browserContextId);/const { rejectScreenshot } = await import(".\/probe-failure.mjs"); await captureRenderer(rejectScreenshot.bind(null, cdp), browserContextId);/' probe.js \
+    && grep -F 'pending.push([data, binary]);' cdp-proxy.js \
+    && sed -i '1i import { observeProbeCommand } from "./probe-failure.mjs";' cdp-proxy.js \
+    && sed -i 's/pending.push(\[data, binary\]);/pending.push([data, binary]); observeProbeCommand(data);/' cdp-proxy.js

@@ -242,7 +242,7 @@ export async function createExecutions({
   }
   // Invalidate by launch identity: late events from an old browser must never
   // clear a newer launch, and profile reuse must wait for verified shutdown.
-  function retire(entry: Execution, starting = entry.starting) {
+  function retire(entry: Execution, starting = entry.starting, reason?: Error) {
     if (!starting || entry.starting !== starting) return entry.closing;
     clearTimeout(entry.idle);
     entry.idle = null;
@@ -252,7 +252,7 @@ export async function createExecutions({
     entry.observation = null;
     entry.viewport = null;
     entry.viewportOwner = undefined;
-    entry.abort?.abort();
+    entry.abort?.abort(reason);
     // A cancelled successor has not replaced the previous failed checkpoint.
     const previousClosing = entry.closing;
     entry.closing = Promise.resolve(entry.reusable)

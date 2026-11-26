@@ -3,6 +3,7 @@ import timers from "node:timers/promises";
 import { createCookieStore } from "./cookies.js";
 import { createExtensionReader } from "./extensions.js";
 import {
+  BROWSER_CDP_LOST,
   BrowserCleanupUnconfirmed,
   VerifiedBrowserCheckpointFailure,
 } from "./lifecycle-errors.js";
@@ -75,7 +76,7 @@ export function createBrowserLauncher({
       if (entry.managed)
         browser.once("close", () => {
           // Browserless can react to a native CDP disconnect before the child emits exit.
-          entry.unexpectedDisconnect = !entry.closeRequested && !entry.cancelled;
+          entry.unexpectedDisconnect ||= !entry.closeRequested && !entry.cancelled;
         });
       entry.child?.once("exit", (exitCode, signal) => {
         if (
@@ -159,6 +160,7 @@ export function createBrowserLauncher({
           try {
             await verifyRenderer(browser.wsEndpoint(), entry.signal);
           } catch {
+            entry.signal.throwIfAborted();
             entry.probeFailed = true;
             logWorkerLifecycle(
               "browser_renderer_probe_failed",
@@ -268,6 +270,8 @@ export function createBrowserLauncher({
       held.on("error", entry.disconnected.resolve);
       held.on("close", entry.disconnected.resolve);
       const abort = () => {
+        if (signal.reason === BROWSER_CDP_LOST && !entry.closeRequested)
+          entry.unexpectedDisconnect = true;
         entry.cancelled = true;
         // Disconnecting Browserless first can kill Chrome before native databases flush.
         if (sessionBoundary && entry.ready) {

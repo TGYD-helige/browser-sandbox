@@ -271,6 +271,96 @@ test("a rejected managed renderer probe prevents Browserless admission", {
   }
 });
 
+test("a cancelled managed renderer probe does not report a renderer failure", {
+  timeout: 2000,
+}, async (t) => {
+  const logs = [];
+  t.mock.method(console, "error", (line) => logs.push(JSON.parse(line)));
+  const started = deferred();
+  const f = fixture(
+    undefined,
+    undefined,
+    "same-workspace",
+    async (_endpoint, signal) => {
+      started.resolve();
+      await once(signal, "abort");
+      throw Error("browser_cdp_closed");
+    },
+  );
+  const abort = new AbortController();
+  const pending = f.start(abort.signal);
+  await f.socketCreated;
+  const browser = f.browser();
+  const browserless = f.browserManager
+    .getBrowserForRequest(f.req(0))
+    .catch(() => browser.exit());
+  f.requests[0].resolve(browser);
+  try {
+    await started.promise;
+    abort.abort();
+    await assert.rejects(pending, /browser_session_failed/);
+    assert.deepEqual(logs, []);
+  } finally {
+    abort.abort();
+    browser.exit();
+    await browserless;
+  }
+});
+
+test("a worker logs unexpected Chrome exit after its gateway CDP connection closes first", {
+  timeout: 3000,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "browser-unexpected-cdp-loss-"));
+  const executionId = "11111111-1111-4111-8111-111111111111";
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+  const logs = [];
+  t.mock.method(console, "error", (line) => logs.push(JSON.parse(line)));
+  let gateway, client, browser;
+  t.after(async () => {
+    client?.terminate();
+    browser?.exit();
+    try {
+      await gateway?.stop();
+    } finally {
+      for (const socket of upstream.clients) socket.terminate();
+      await new Promise((resolve) => upstream.close(resolve));
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  await once(upstream, "listening");
+  const f = fixture(undefined, undefined, executionId);
+  browser = f.browser(`ws://127.0.0.1:${upstream.address().port}`);
+  gateway = await createGateway({
+    WebSocket,
+    WebSocketServer,
+    workerExecutionId: executionId,
+    healthy: async () => true,
+    port: 0,
+    dataRoot: join(root, "data"),
+    socketPath: join(root, "control.sock"),
+    async launch(options) {
+      const pending = f.launch(options);
+      const starting = f.browserManager.getBrowserForRequest(f.req(0));
+      f.requests[0].resolve(browser);
+      await starting;
+      f.sockets[0].emit("open");
+      return pending;
+    },
+  });
+  const { wsEndpoint } = await gateway.command({ op: "register", executionId });
+  const connected = once(upstream, "connection");
+  client = new WebSocket(wsEndpoint);
+  const [native] = await connected;
+  const heldClosed = once(f.sockets[0], "close");
+  native.terminate();
+  await heldClosed;
+  browser.emit("close");
+  browser.exit();
+  assert.deepEqual(logs, [
+    { event: "browser_unexpected_exit", exitCode: 0, signal: null },
+  ]);
+});
+
 for (const order of ["exit first", "CDP disconnect first", "requested shutdown"]) {
   test(`managed Chrome exit logging with ${order}`, async (t) => {
     const logs = [];
