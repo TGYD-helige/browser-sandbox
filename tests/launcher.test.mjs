@@ -238,7 +238,9 @@ function fixture(
   };
 }
 
-test("a rejected managed renderer probe prevents Browserless admission", async () => {
+test("a rejected managed renderer probe prevents Browserless admission", {
+  timeout: 2000,
+}, async () => {
   const gate = deferred();
   gate.promise.catch(() => {});
   const started = deferred();

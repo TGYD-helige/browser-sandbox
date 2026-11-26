@@ -1,4 +1,4 @@
-import { logWorkerLifecycle } from "./worker-lifecycle.js";
+import { exitWorkerWithFailure, logWorkerLifecycle } from "./worker-lifecycle.js";
 import { WORKER_PROTOCOL } from "./worker-protocol.js";
 
 const role = process.argv[2] ?? "local";
@@ -24,11 +24,9 @@ else if (role === "worker") {
       error instanceof Error && /^browser_[a-z_]{1,100}$/.test(error.message)
         ? error.message
         : "browser_worker_startup_failed";
-    logWorkerLifecycle(
-      "worker_start_failed",
-      { code, durationMs: performance.now() - started },
-      true,
-    );
-    process.exit(1);
+    await exitWorkerWithFailure("worker_start_failed", {
+      code,
+      durationMs: performance.now() - started,
+    });
   }
 } else throw Error("browser_role_invalid");

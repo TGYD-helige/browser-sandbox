@@ -13,7 +13,7 @@ import {
 } from "./network-policy.js";
 import { BROWSER_PRIVACY_ARGS } from "./privacy.js";
 import { verifyExecutionRenderer, verifyTarget } from "./probe.js";
-import { logWorkerLifecycle } from "./worker-lifecycle.js";
+import { exitWorkerWithFailure, logWorkerLifecycle } from "./worker-lifecycle.js";
 import { createWorkerFence } from "./worker-protocol.js";
 import { createWorkerStorage } from "./worker-storage.js";
 
@@ -195,7 +195,7 @@ for (const signal of ["SIGINT", "SIGTERM"])
       await backend.stop();
       process.exit(0);
     } catch {
-      if (workerExecutionId) logWorkerLifecycle("worker_shutdown_failed", {}, true);
+      if (workerExecutionId) await exitWorkerWithFailure("worker_shutdown_failed");
       process.exit(1);
     }
   });
