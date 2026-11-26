@@ -3,9 +3,11 @@ import timers from "node:timers/promises";
 import { createCookieStore } from "./cookies.js";
 import { createExtensionReader } from "./extensions.js";
 import {
+  BROWSER_CDP_LOST,
   BrowserCleanupUnconfirmed,
   VerifiedBrowserCheckpointFailure,
 } from "./lifecycle-errors.js";
+import { logWorkerLifecycle } from "./worker-lifecycle.js";
 
 async function waitForExit(exited: Promise<unknown>, timeoutMs: number) {
   const timer = new AbortController();
@@ -52,21 +54,45 @@ export function createBrowserLauncher({
   privacyArgs,
   extensionsDir = undefined as string | undefined,
   cookieStore = createCookieStore,
+  workerExecutionId = undefined as string | undefined,
+  verifyRenderer = undefined as
+    | ((endpoint: string, signal: AbortSignal) => Promise<void>)
+    | undefined,
 }) {
   const launches = new Map();
   const readExtensions =
     extensionsDir === undefined ? undefined : createExtensionReader(extensionsDir);
   class ExecutionHooks extends Hooks {
+    after(args) {
+      if (args.status === "timedout") {
+        const entry = launches.get(args.req.parsed.searchParams.get("trackingId"));
+        if (entry) entry.closeRequested = true;
+      }
+      return super.after(args);
+    }
+
     async browser({ browser, req }) {
       const entry = launches.get(req.parsed.searchParams.get("trackingId"));
       if (!entry) {
         browser.process()?.kill("SIGKILL");
         throw Error("browser_execution_missing");
       }
+      const hookStarted = performance.now();
       entry.browser = browser;
       // Track the child before any asynchronous setup can fail.
       entry.child = browser.process();
-      entry.child?.once("exit", () => {
+      if (entry.managed)
+        browser.once("close", () => {
+          // Browserless can react to a native CDP disconnect before the child emits exit.
+          entry.unexpectedDisconnect ||= !entry.closeRequested && !entry.cancelled;
+        });
+      entry.child?.once("exit", (exitCode, signal) => {
+        if (
+          entry.managed &&
+          entry.ready &&
+          (entry.unexpectedDisconnect || (!entry.closeRequested && !entry.cancelled))
+        )
+          logWorkerLifecycle("browser_unexpected_exit", { exitCode, signal }, true);
         entry.exited.resolve();
         entry.disconnected.resolve();
       });
@@ -107,6 +133,7 @@ export function createBrowserLauncher({
       const close = browser.close.bind(browser);
       browser.close = () => {
         if (!entry.stopping) {
+          entry.closeRequested = true;
           const exited = () =>
             entry.child &&
             (entry.child.exitCode !== null || entry.child.signalCode !== null);
@@ -135,6 +162,35 @@ export function createBrowserLauncher({
         }
         return entry.stopping;
       };
+      if (entry.managed) {
+        const probeStarted = performance.now();
+        if (verifyRenderer) {
+          try {
+            await verifyRenderer(browser.wsEndpoint(), entry.signal);
+          } catch {
+            entry.signal.throwIfAborted();
+            entry.probeFailed = true;
+            logWorkerLifecycle(
+              "browser_renderer_probe_failed",
+              {
+                durationMs: performance.now() - probeStarted,
+              },
+              true,
+            );
+            throw Error("browser_renderer_probe_failed");
+          }
+        }
+        entry.signal.throwIfAborted();
+        entry.hookFinished = performance.now();
+        entry.launchTimings = {
+          browserlessAdmissionMs: entry.browserlessStarted - entry.socketStarted,
+          chromeStartupMs: hookStarted - entry.browserlessStarted,
+          browserHookSetupMs: probeStarted - hookStarted,
+          executionRendererProbeMs: verifyRenderer
+            ? entry.hookFinished - probeStarted
+            : 0,
+        };
+      }
     }
   }
   class ExecutionBrowserManager extends BrowserManager {
@@ -144,6 +200,7 @@ export function createBrowserLauncher({
     getBrowserForRequest(req, ...args) {
       const entry = launches.get(req.parsed.searchParams.get("trackingId"));
       if (!entry || entry.cancelled) throw Error("browser_launch_cancelled");
+      entry.browserlessStarted = performance.now();
       // Register before yielding: socket cancellation must await the server's launch, not its handshake.
       return (entry.starting = super.getBrowserForRequest(req, ...args));
     }
@@ -168,6 +225,8 @@ export function createBrowserLauncher({
       const trackingId = randomBytes(16).toString("hex");
       const entry: any = {
         sessionBoundary,
+        managed: Boolean(workerExecutionId) && executionId === workerExecutionId,
+        signal,
         filesDir,
         exited: Promise.withResolvers(),
         cookies: cookieStore(WebSocket, {
@@ -214,10 +273,18 @@ export function createBrowserLauncher({
       if (extensions.length && Buffer.byteLength(url.pathname + url.search) > 12 * 1024)
         throw Error("browser_extensions_launch_request_too_large");
       launches.set(trackingId, entry);
+      entry.socketStarted = performance.now();
       const held = new WebSocket(url, { handshakeTimeout: 1800000 });
-      held.on("error", entry.disconnected.resolve);
-      held.on("close", entry.disconnected.resolve);
+      const onHeldDisconnect = () => {
+        entry.unexpectedDisconnect ||=
+          entry.ready && !entry.closeRequested && !entry.cancelled;
+        entry.disconnected.resolve();
+      };
+      held.on("error", onHeldDisconnect);
+      held.on("close", onHeldDisconnect);
       const abort = () => {
+        if (signal.reason === BROWSER_CDP_LOST && !entry.closeRequested)
+          entry.unexpectedDisconnect = true;
         entry.cancelled = true;
         // Disconnecting Browserless first can kill Chrome before native databases flush.
         if (sessionBoundary && entry.ready) {
@@ -274,6 +341,17 @@ export function createBrowserLauncher({
           }
         })()
           .catch((error) => {
+            if (entry.managed)
+              logWorkerLifecycle(
+                "browser_shutdown_failed",
+                {
+                  code:
+                    error instanceof VerifiedBrowserCheckpointFailure
+                      ? error.message
+                      : "browser_cleanup_unconfirmed",
+                },
+                true,
+              );
             if (error instanceof VerifiedBrowserCheckpointFailure) throw error;
             throw new BrowserCleanupUnconfirmed(error);
           })
@@ -298,10 +376,22 @@ export function createBrowserLauncher({
           endpoint: entry.browser.wsEndpoint(),
           close,
           closed: entry.disconnected.promise,
+          ...(entry.managed
+            ? {
+                launchTimings: {
+                  ...entry.launchTimings,
+                  browserlessHandshakeMs: performance.now() - entry.hookFinished,
+                },
+              }
+            : {}),
         };
       } catch {
         await close();
-        throw Error("browser_session_failed");
+        throw Error(
+          entry.probeFailed
+            ? "browser_renderer_probe_failed"
+            : "browser_session_failed",
+        );
       }
     },
   };

@@ -1,3 +1,5 @@
+export const BROWSER_CDP_LOST = Error("browser_cdp_lost");
+
 // Only the launcher may construct this after observing its captured child's exit.
 // The checkpoint still failed; this proves profile reuse, not successful persistence.
 export class VerifiedBrowserCheckpointFailure extends Error {

@@ -108,7 +108,7 @@ export function attachCdpProxy({
           }));
           const lost = () => {
             if (!entry.peers.has(pair)) return; // Normal client disconnect already cleaned up.
-            executions.retire(entry, starting);
+            executions.retire(entry, starting, BROWSER_CDP_LOST);
             cleanup(); // Surface the failure; a later connection starts fresh. No automatic replay.
           };
           upstream.on("error", lost);
@@ -143,4 +143,4 @@ export function attachCdpProxy({
   return ws;
 }
 
-import { EXTENSION_STARTUP_ERRORS } from "./lifecycle-errors.js";
+import { BROWSER_CDP_LOST, EXTENSION_STARTUP_ERRORS } from "./lifecycle-errors.js";

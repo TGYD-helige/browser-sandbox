@@ -150,6 +150,8 @@ for (const quiesce of [false, true])
 function fixture(
   cookieStore = () => ({ restore: async () => {}, save: async () => {} }),
   extensionsDir = undefined,
+  workerExecutionId = undefined,
+  verifyRenderer = undefined,
 ) {
   const sockets = [],
     requests = [];
@@ -180,12 +182,16 @@ function fixture(
   }
   const runtime = createBrowserLauncher({
     BrowserManager: Manager,
-    Hooks: class {},
+    Hooks: class {
+      async after() {}
+    },
     WebSocket: Socket,
     base: "http://localhost",
     token: "test",
     privacyArgs: [],
     extensionsDir,
+    workerExecutionId,
+    verifyRenderer,
     cookieStore,
   });
   const req = (index) => ({ parsed: sockets[index].url });
@@ -196,7 +202,7 @@ function fixture(
     child.kill = () => {
       throw Error("unexpected fallback kill");
     };
-    return {
+    return Object.assign(new EventEmitter(), {
       browser: {
         target: () => ({
           createCDPSession: async () => ({
@@ -207,12 +213,14 @@ function fixture(
       },
       process: () => child,
       wsEndpoint: () => endpoint,
-      close: async () => {},
+      async close() {
+        this.emit("close");
+      },
       exit() {
         child.exitCode = 0;
-        child.emit("exit", 0);
+        child.emit("exit", 0, null);
       },
-    };
+    });
   }
   const start = (signal) =>
     runtime.launch({
@@ -230,6 +238,164 @@ function fixture(
     start,
     socketCreated: socketCreated.promise,
   };
+}
+
+test("a rejected managed renderer probe prevents Browserless admission", {
+  timeout: 2000,
+}, async () => {
+  const gate = deferred();
+  gate.promise.catch(() => {});
+  const started = deferred();
+  const f = fixture(undefined, undefined, "same-workspace", async () => {
+    started.resolve();
+    await gate.promise;
+  });
+  const pending = f.start(new AbortController().signal);
+  await f.socketCreated;
+  const browser = f.browser();
+  const browserless = f.browserManager.getBrowserForRequest(f.req(0)).then(
+    () => f.sockets[0].emit("open"),
+    async () => {
+      browser.exit();
+      f.sockets[0].emit("close");
+    },
+  );
+  f.requests[0].resolve(browser);
+  try {
+    await Promise.race([started.promise, browserless]);
+    gate.reject(Error("test renderer failure"));
+    await assert.rejects(pending, /browser_renderer_probe_failed/);
+  } finally {
+    gate.resolve();
+    browser.exit();
+    f.sockets[0].terminate();
+    await browserless;
+  }
+});
+
+test("a cancelled managed renderer probe does not report a renderer failure", {
+  timeout: 2000,
+}, async (t) => {
+  const logs = [];
+  t.mock.method(console, "error", (line) => logs.push(JSON.parse(line)));
+  const started = deferred();
+  const f = fixture(
+    undefined,
+    undefined,
+    "same-workspace",
+    async (_endpoint, signal) => {
+      started.resolve();
+      await once(signal, "abort");
+      throw Error("browser_cdp_closed");
+    },
+  );
+  const abort = new AbortController();
+  const pending = f.start(abort.signal);
+  await f.socketCreated;
+  const browser = f.browser();
+  const browserless = f.browserManager
+    .getBrowserForRequest(f.req(0))
+    .catch(() => browser.exit());
+  f.requests[0].resolve(browser);
+  try {
+    await started.promise;
+    abort.abort();
+    await assert.rejects(pending, /browser_session_failed/);
+    assert.deepEqual(logs, []);
+  } finally {
+    abort.abort();
+    browser.exit();
+    await browserless;
+  }
+});
+
+for (const first of ["gateway", "Browserless", "Browserless timeout"]) {
+  test(`a worker classifies Chrome exit after ${first} disconnects first`, {
+    timeout: 3000,
+  }, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), "browser-unexpected-cdp-loss-"));
+    const executionId = "11111111-1111-4111-8111-111111111111";
+    const upstream = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    const logs = [];
+    t.mock.method(console, "error", (line) => logs.push(JSON.parse(line)));
+    let gateway, client, browser;
+    t.after(async () => {
+      client?.terminate();
+      browser?.exit();
+      try {
+        await gateway?.stop();
+      } finally {
+        for (const socket of upstream.clients) socket.terminate();
+        await new Promise((resolve) => upstream.close(resolve));
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+    await once(upstream, "listening");
+    const f = fixture(undefined, undefined, executionId);
+    browser = f.browser(`ws://127.0.0.1:${upstream.address().port}`);
+    gateway = await createGateway({
+      WebSocket,
+      WebSocketServer,
+      workerExecutionId: executionId,
+      healthy: async () => true,
+      port: 0,
+      dataRoot: join(root, "data"),
+      socketPath: join(root, "control.sock"),
+      async launch(options) {
+        const pending = f.launch(options);
+        const starting = f.browserManager.getBrowserForRequest(f.req(0));
+        f.requests[0].resolve(browser);
+        await starting;
+        f.sockets[0].emit("open");
+        return pending;
+      },
+    });
+    const { wsEndpoint } = await gateway.command({ op: "register", executionId });
+    const connected = once(upstream, "connection");
+    client = new WebSocket(wsEndpoint);
+    const [native] = await connected;
+    const closed = once(client, "close");
+    if (first === "Browserless timeout")
+      await f.hooks.after({ status: "timedout", req: f.req(0) });
+    if (first === "gateway") native.terminate();
+    else f.sockets[0].emit("close");
+    await closed;
+    browser.emit("close");
+    browser.exit();
+    assert.deepEqual(
+      logs,
+      first === "Browserless timeout"
+        ? []
+        : [{ event: "browser_unexpected_exit", exitCode: 0, signal: null }],
+    );
+  });
+}
+
+for (const order of ["exit first", "CDP disconnect first", "requested shutdown"]) {
+  test(`managed Chrome exit logging with ${order}`, async (t) => {
+    const logs = [];
+    t.mock.method(console, "error", (line) => logs.push(JSON.parse(line)));
+    const f = fixture(undefined, undefined, "same-workspace");
+    const pending = f.start(new AbortController().signal);
+    await f.socketCreated;
+    const starting = f.browserManager.getBrowserForRequest(f.req(0));
+    const browser = f.browser("ws://localhost/private-token");
+    f.requests[0].resolve(browser);
+    await starting;
+    f.sockets[0].emit("open");
+    const handle = await pending;
+    if (order === "CDP disconnect first") browser.emit("close");
+    if (order !== "exit first") await browser.close();
+    browser.exit();
+    f.sockets[0].emit("close");
+    await handle.close();
+    assert.deepEqual(
+      logs,
+      order === "requested shutdown"
+        ? []
+        : [{ event: "browser_unexpected_exit", exitCode: 0, signal: null }],
+    );
+  });
 }
 
 test("launcher enables configured extensions without bypassing other Chrome defaults", async () => {

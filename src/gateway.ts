@@ -43,6 +43,7 @@ export async function createGateway({
   let remote: Awaited<ReturnType<typeof createAccessServer>>;
   const executions = await createExecutions({
     launch,
+    workerExecutionId,
     dataRoot,
     maxBrowsers,
     getPort: () => (server.address() as AddressInfo).port,

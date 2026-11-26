@@ -49,6 +49,37 @@ try {
     } finally {
       await runtime.request({ op: "finalize", executionId });
     }
+  } else if (action === "cold-start") {
+    const started = performance.now();
+    const { wsEndpoint } = await runtime.request({ op: "register", executionId });
+    const registrationMs = performance.now() - started;
+    const firstCdp = async () => {
+      const start = performance.now();
+      await connect(wsEndpoint);
+      await cdp.call("Browser.getVersion");
+      return performance.now() - start;
+    };
+    const coldCdpMs = await firstCdp();
+    assert.deepEqual(
+      (await cdp.call("Target.getBrowserContexts")).browserContextIds,
+      [],
+    );
+    await sessionRequest(wsEndpoint, "retain", 60000);
+    await closeCdp();
+    const warmCdpMs = await firstCdp();
+    console.log(JSON.stringify({ registrationMs, coldCdpMs, warmCdpMs }));
+  } else if (action === "probe-failure") {
+    const { wsEndpoint } = await runtime.request({ op: "register", executionId });
+    await connect(wsEndpoint);
+    const outcomes = await Promise.allSettled([
+      cdp.call("Browser.getVersion"),
+      cdp.call("Target.createTarget", { url: "data:text/plain,probe-failure-cdp" }),
+    ]);
+    for (const outcome of outcomes) {
+      assert.equal(outcome.status, "rejected");
+      assert.equal(outcome.reason.message, "browser_cdp_closed");
+    }
+    console.log(JSON.stringify({ rejected: true }));
   } else if (action === "status") {
     console.log(
       JSON.stringify(

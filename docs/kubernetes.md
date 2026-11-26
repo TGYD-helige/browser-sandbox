@@ -41,6 +41,10 @@ Workers use `restartPolicy: Never`, no automatic ServiceAccount token, one Brows
 
 Workers do not request `net.ipv4.ip_local_reserved_ports`: there is no co-resident agent sharing their network namespace. Existing worker UID rules continue to protect loopback Browserless/CDP ports. Browser execution requires the configured Linux capabilities and a kernel that allows Chromium to create its sandbox namespaces. Controller Pods run without those capabilities.
 
+### Read worker lifecycle logs
+
+Use `kubectl logs <worker-pod> -c worker --timestamps` to see JSON lifecycle events. `worker_starting` and `worker_ready` mark runtime startup and readiness. The worker verifies a real renderer in a disposable BrowserContext on each execution Chrome before forwarding external CDP commands. A failed probe rejects the launch. `browser_launch_succeeded` reports execution and Profile preparation, Browserless admission, Chrome startup, browser hook setup, renderer verification and handshake durations in milliseconds. Failed startup, probe, launch, and shutdown events go to stderr, as does an unexpected Chrome exit. The worker records omit credentials, URLs, Profile identifiers, and request data. Look up the worker Pod by its `browser-sandbox.io/execution` label to correlate it with controller events. The image's Browserless `DEBUG` default remains `quiet`.
+
 ### Running workers without an outer seccomp filter
 
 Set `worker.securityContext.seccompProfile.type=Unconfined` to opt out of the worker-level seccomp filter. Keep any placement settings that select your worker pool and remove selectors or affinity that require a profile-readiness label. No Browser Sandbox-specific seccomp file is needed on the node. The cluster's admission policy must permit `Unconfined` for the worker container.

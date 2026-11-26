@@ -10,12 +10,18 @@ import { verifyJournalRollback } from "./journal-rollback.mjs";
 
 const suite = process.argv[2] ?? "all";
 assert(
-  ["all", "fresh-node", "single-controller", "journal", "active-active"].includes(
-    suite,
-  ),
+  [
+    "all",
+    "fresh-node",
+    "single-controller",
+    "journal",
+    "active-active",
+    "probe-ab",
+  ].includes(suite),
   `Unknown Kubernetes suite: ${suite}`,
 );
-const runFreshNode = suite === "all" || suite === "fresh-node";
+const probeAB = suite === "probe-ab";
+const runFreshNode = suite === "all" || suite === "fresh-node" || probeAB;
 const runSingleController = suite === "all" || suite === "single-controller";
 
 const directory = await mkdtemp(join(tmpdir(), "browser-kubernetes-"));
@@ -25,6 +31,10 @@ const namespace = `browser-${suffix}`;
 const release = "trial";
 const deployment = "trial-browser";
 const image = process.env.BROWSER_IMAGE ?? "browser-sandbox:managed";
+const probeImages = ["probe-startup", "probe-failure"].map(
+  (variant) => `browser-sandbox-${variant}-${suffix}:fixture`,
+);
+const probeRefs = probeImages.map((name) => `docker.io/library/${name}`);
 const nextImage = `browser-sandbox:protocol-${suffix}`;
 const clientImage =
   process.env.BROWSER_CLIENT_IMAGE ?? "browser-sandbox-client:managed";
@@ -37,6 +47,7 @@ let stage = "cluster setup";
 let installed = false;
 let hostStorageAddress;
 let clusterAttempted = false;
+let probeNodes = [];
 let cordoned;
 let heldFinalizer;
 let extraction;
@@ -195,6 +206,155 @@ const controllerReady = async () =>
     },
     30000,
   );
+const jsonLogRecords = (output) =>
+  output.split("\n").flatMap((line) => {
+    const space = line.indexOf(" ");
+    try {
+      const record = JSON.parse(line.slice(space + 1));
+      return record && typeof record === "object"
+        ? [{ ...record, time: Date.parse(line.slice(0, space)) }]
+        : [];
+    } catch {
+      return [];
+    }
+  });
+
+const workerLifecycle = async (pod, startupProbe) => {
+  const records = jsonLogRecords(
+    await kubectl("logs", pod.metadata.name, "-c", "worker", "--timestamps"),
+  );
+  const events = [
+    "worker_starting",
+    ...(startupProbe ? ["worker_probe_succeeded"] : []),
+    "worker_ready",
+    "browser_launch_succeeded",
+  ];
+  const lifecycle = records.filter(
+    ({ event }) => event === "worker_probe_succeeded" || events.includes(event),
+  );
+  assert.deepEqual(
+    lifecycle.map(({ event }) => event),
+    events,
+  );
+  return Object.fromEntries(lifecycle.map((record) => [record.event, record]));
+};
+
+const benchmarkColdStart = async (node, startupProbe = false, count = 10) => {
+  const samples = [];
+  for (let index = 0; index < count; index++) {
+    const executionId = randomUUID();
+    try {
+      const clientTiming = await client("cold-start", executionId);
+      const worker = (await pods()).find(
+        (pod) => pod.metadata.labels["browser-sandbox.io/execution"] === executionId,
+      );
+      assert.equal(worker?.spec.nodeName, node.metadata.name);
+      const logs = await workerLifecycle(worker, startupProbe);
+      const controllerReady = jsonLogRecords(
+        await kubectl(
+          "logs",
+          `deployment/${deployment}`,
+          "-c",
+          "controller",
+          "--timestamps",
+          "--since=2m",
+        ),
+      ).find((record) => record.type === "ready" && record.executionId === executionId);
+      assert(controllerReady, "Controller did not report worker readiness");
+      const events = JSON.parse(
+        await kubectl(
+          "get",
+          "events",
+          "--field-selector",
+          `involvedObject.uid=${worker.metadata.uid}`,
+          "-o",
+          "json",
+        ),
+      ).items;
+      const pulling = events.find((event) => event.reason === "Pulling");
+      const pulled = events.find((event) => event.reason === "Pulled");
+      const eventTime = (event) => Date.parse(event.firstTimestamp ?? event.eventTime);
+      if (pulling) assert(pulled, "Image pull did not report completion");
+      const created = Date.parse(worker.metadata.creationTimestamp);
+      const started = Date.parse(
+        worker.status.containerStatuses.find(({ name }) => name === "worker").state
+          .running.startedAt,
+      );
+      const ready = Date.parse(
+        worker.status.conditions.find(
+          ({ type, status }) => type === "Ready" && status === "True",
+        ).lastTransitionTime,
+      );
+      const probe = logs.worker_probe_succeeded;
+      const launch = logs.browser_launch_succeeded;
+      const sample = {
+        ...clientTiming,
+        registrationToFirstCdpMs: clientTiming.registrationMs + clientTiming.coldCdpMs,
+        podToContainerMs: started - created,
+        containerToPodReadyMs: ready - started,
+        workerStartupMs: logs.worker_ready.durationMs,
+        probeMs: startupProbe ? probe.durationMs : launch.executionRendererProbeMs,
+        startupRendererProbeMs: startupProbe ? probe.rendererProbeMs : 0,
+        probeCleanupMs: startupProbe ? probe.probeCleanupMs : null,
+        browserlessAdmissionMs: launch.browserlessAdmissionMs,
+        chromeStartupMs: launch.chromeStartupMs,
+        browserHookSetupMs: launch.browserHookSetupMs,
+        executionRendererProbeMs: launch.executionRendererProbeMs,
+        browserlessHandshakeMs: launch.browserlessHandshakeMs,
+        controllerReadyMs: controllerReady.elapsedMs,
+        runtimeReadyToControllerReadyMs: controllerReady.time - logs.worker_ready.time,
+        preparationMs: launch.preparationMs,
+        profileAcquireMs: launch.profileAcquireMs,
+        profileRestoreMs: launch.profileRestoreMs,
+        browserLaunchMs: launch.browserLaunchMs,
+        imagePullMs: pulling ? eventTime(pulled) - eventTime(pulling) : null,
+      };
+      for (const value of Object.values(sample))
+        assert(value === null || Number.isFinite(value));
+      samples.push(sample);
+    } finally {
+      await client("finish", executionId);
+      assert(
+        !(await pods()).some(
+          (pod) => pod.metadata.labels["browser-sandbox.io/execution"] === executionId,
+        ),
+        "Benchmark worker survived finalization",
+      );
+    }
+  }
+  const summarize = (group) =>
+    Object.fromEntries(
+      Object.keys(group[0]).map((phase) => {
+        const values = group
+          .map((sample) => sample[phase])
+          .filter((value) => value !== null)
+          .sort((a, b) => a - b);
+        if (!values.length) return [phase, { samples: 0 }];
+        const middle = Math.floor(values.length / 2);
+        return [
+          phase,
+          {
+            median:
+              values.length % 2
+                ? values[middle]
+                : (values[middle - 1] + values[middle]) / 2,
+            p95: values[Math.ceil(values.length * 0.95) - 1],
+            samples: values.length,
+          },
+        ];
+      }),
+    );
+  const cached = samples.filter((sample) => sample.imagePullMs === null);
+  const pulled = samples.filter((sample) => sample.imagePullMs !== null);
+  return {
+    node: node.status.nodeInfo,
+    allocatable: node.status.allocatable,
+    samples,
+    ...(cached.length ? { cached: summarize(cached) } : {}),
+    ...(pulled.length ? { pulled: summarize(pulled) } : {}),
+  };
+};
+
 const writeReport = async (report) => {
   await writeFile(
     "managed-results/kubernetes.json",
@@ -242,6 +402,35 @@ const runSuite = async () => {
   const candidates = [image];
   if (suite !== "journal") candidates.push(clientImage);
   if (runSingleController) candidates.push(nextImage);
+  if (probeAB) {
+    for (const [index, target] of ["startup", "failure"].entries()) {
+      await run(
+        "docker",
+        [
+          "build",
+          "--build-arg",
+          `BROWSER_IMAGE=${image}`,
+          "--target",
+          target,
+          "--label",
+          `browser-sandbox.probe-fixture=${suffix}`,
+          "-f",
+          ".github/scripts/managed/Dockerfile.probe",
+          "-t",
+          probeImages[index],
+          ".",
+        ],
+        { timeout: 300000 },
+      );
+      const fixture = probeImages[index];
+      candidates.push(fixture);
+      probeRefs.push(
+        await run("docker", ["image", "inspect", "--format", "{{.Id}}", fixture]),
+      );
+    }
+  }
+  if (probeAB && !clusterAttempted)
+    probeNodes = nodes.map((node) => node.metadata.name);
   await run("k3d", ["image", "import", ...candidates, "-c", cluster], {
     timeout: 300000,
   });
@@ -296,40 +485,26 @@ const runSuite = async () => {
     "images",
     "ls",
   ]);
-  const normalized = image.includes("/") ? image : `docker.io/library/${image}`;
-  const row = images.split("\n").find((line) => line.split(/\s+/)[0] === normalized);
-  assert(row, "Imported worker image was not found in containerd");
-  const digest = row.split(/\s+/)[2];
-  assert(/^sha256:[a-f0-9]{64}$/.test(digest));
-  const repository = normalized.slice(0, normalized.lastIndexOf(":"));
-  const pinned = `${repository}@${digest}`;
-  const nextNormalized = `docker.io/library/${nextImage}`;
-  const nextRepository = nextNormalized.slice(0, nextNormalized.lastIndexOf(":"));
-  let nextDigest;
-  if (runSingleController) {
-    const nextRow = images
-      .split("\n")
-      .find((line) => line.split(/\s+/)[0] === nextNormalized);
-    nextDigest = nextRow?.split(/\s+/)[2];
+  const reference = (tag) => {
+    const name = tag.includes("/") ? tag : `docker.io/library/${tag}`;
+    const row = images.split("\n").find((line) => line.split(/\s+/)[0] === name);
+    const digest = row?.split(/\s+/)[2];
     assert(
-      nextDigest && /^sha256:[a-f0-9]{64}$/.test(nextDigest),
-      "Invalid protocol image digest",
+      digest && /^sha256:[a-f0-9]{64}$/.test(digest),
+      "Invalid imported image digest",
     );
-  }
+    const repository = name.slice(0, name.lastIndexOf(":"));
+    return { name, repository, digest, pinned: `${repository}@${digest}` };
+  };
+  const primary = reference(image);
+  const { name: normalized, repository, digest, pinned } = primary;
+  const next = runSingleController ? reference(nextImage) : undefined;
+  const nextDigest = next?.digest;
+  const nextRepository = next?.repository;
+  const variants = probeAB ? probeImages.map(reference) : [];
+  probeRefs.push(...variants.map(({ pinned }) => pinned));
   for (const node of nodes) {
-    await run("docker", [
-      "exec",
-      node.metadata.name,
-      "ctr",
-      "-n",
-      "k8s.io",
-      "images",
-      "tag",
-      "--force",
-      normalized,
-      pinned,
-    ]);
-    if (nextDigest)
+    for (const ref of [primary, ...(next ? [next] : []), ...variants])
       await run("docker", [
         "exec",
         node.metadata.name,
@@ -339,8 +514,8 @@ const runSuite = async () => {
         "images",
         "tag",
         "--force",
-        nextNormalized,
-        `${nextRepository}@${nextDigest}`,
+        ref.name,
+        ref.pinned,
       ]);
   }
   if (runFreshNode) {
@@ -526,6 +701,62 @@ const runSuite = async () => {
       sameGeneration: true,
     });
     await client("finish", shared.executionId);
+    stage = "managed worker cold-start benchmark";
+    const benchmarkNode = nodes.find((node) => node.metadata.name === workerNode);
+    if (probeAB) {
+      const selectImage = async (ref) => {
+        await run("helm", [
+          "upgrade",
+          release,
+          "charts/browser-sandbox",
+          "-n",
+          namespace,
+          "--reuse-values",
+          "--set-string",
+          `image.repository=${ref.repository},image.digest=${ref.digest}`,
+          "--wait",
+          "--timeout",
+          "120s",
+        ]);
+        await controllerReady();
+      };
+      const reports = [];
+      for (const startup of [true, false, false, true]) {
+        stage = `managed worker A/B ${startup ? "startup" : "execution"}`;
+        await selectImage(startup ? variants[0] : { repository, digest });
+        const report = await benchmarkColdStart(benchmarkNode, startup, 5);
+        assert.equal(
+          report.cached?.registrationToFirstCdpMs.samples,
+          5,
+          "Image must be cached",
+        );
+        reports.push({ probe: startup ? "startup" : "execution", ...report });
+      }
+      freshNodeResults.probeAB = reports;
+      stage = "execution renderer failure blocks external CDP";
+      await selectImage(variants[1]);
+      const executionId = randomUUID();
+      try {
+        assert.deepEqual(await client("probe-failure", executionId), {
+          rejected: true,
+        });
+        const worker = (await pods()).find(
+          (pod) => pod.metadata.labels["browser-sandbox.io/execution"] === executionId,
+        );
+        assert(worker, "Probe failure did not reach a worker");
+        const events = jsonLogRecords(
+          await kubectl("logs", worker.metadata.name, "-c", "worker", "--timestamps"),
+        ).map(({ event }) => event);
+        assert(events.includes("test_probe_cdp_target_absent"));
+        assert(events.includes("browser_renderer_probe_failed"));
+        assert(!events.includes("browser_launch_succeeded"));
+        freshNodeResults.probeFailureBlockedCdp = true;
+      } finally {
+        await client("finish", executionId);
+      }
+    } else {
+      freshNodeResults.coldStart = await benchmarkColdStart(benchmarkNode);
+    }
     await run("helm", [
       "uninstall",
       release,
@@ -536,7 +767,7 @@ const runSuite = async () => {
       "120s",
     ]);
     installed = false;
-    if (suite === "fresh-node") {
+    if (suite === "fresh-node" || probeAB) {
       await writeReport(freshNodeResults);
       return;
     }
@@ -1156,8 +1387,11 @@ try {
       "-p",
       JSON.stringify({ metadata: { finalizers: [] } }),
     ).catch(() => {});
-  if (runSingleController)
-    await run("docker", ["image", "rm", nextImage]).catch(() => {});
+  for (const fixture of [
+    ...(runSingleController ? [nextImage] : []),
+    ...(probeAB ? probeImages : []),
+  ])
+    await run("docker", ["image", "rm", fixture]).catch(() => {});
   if (cordoned) await run("kubectl", ["uncordon", cordoned]).catch(() => {});
   if (installed)
     await run("helm", [
@@ -1176,6 +1410,17 @@ try {
     "--ignore-not-found",
     "--wait=false",
   ).catch(() => {});
+  await Promise.all(
+    probeNodes.map((node) =>
+      run(
+        "docker",
+        ["exec", node, "ctr", "-n", "k8s.io", "images", "rm", ...probeRefs],
+        {
+          timeout: 15_000,
+        },
+      ).catch(() => {}),
+    ),
+  );
   if (extraction) await run("docker", ["rm", extraction]).catch(() => {});
   if (clusterAttempted)
     await run("bash", [
