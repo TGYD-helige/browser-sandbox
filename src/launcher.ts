@@ -63,6 +63,14 @@ export function createBrowserLauncher({
   const readExtensions =
     extensionsDir === undefined ? undefined : createExtensionReader(extensionsDir);
   class ExecutionHooks extends Hooks {
+    after(args) {
+      if (args.status === "timedout") {
+        const entry = launches.get(args.req.parsed.searchParams.get("trackingId"));
+        if (entry) entry.closeRequested = true;
+      }
+      return super.after(args);
+    }
+
     async browser({ browser, req }) {
       const entry = launches.get(req.parsed.searchParams.get("trackingId"));
       if (!entry) {
@@ -267,8 +275,13 @@ export function createBrowserLauncher({
       launches.set(trackingId, entry);
       entry.socketStarted = performance.now();
       const held = new WebSocket(url, { handshakeTimeout: 1800000 });
-      held.on("error", entry.disconnected.resolve);
-      held.on("close", entry.disconnected.resolve);
+      const onHeldDisconnect = () => {
+        entry.unexpectedDisconnect ||=
+          entry.ready && !entry.closeRequested && !entry.cancelled;
+        entry.disconnected.resolve();
+      };
+      held.on("error", onHeldDisconnect);
+      held.on("close", onHeldDisconnect);
       const abort = () => {
         if (signal.reason === BROWSER_CDP_LOST && !entry.closeRequested)
           entry.unexpectedDisconnect = true;

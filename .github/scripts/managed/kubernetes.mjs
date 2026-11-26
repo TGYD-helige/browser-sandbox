@@ -32,8 +32,9 @@ const release = "trial";
 const deployment = "trial-browser";
 const image = process.env.BROWSER_IMAGE ?? "browser-sandbox:managed";
 const probeImages = ["probe-startup", "probe-failure"].map(
-  (variant) => `browser-sandbox:${variant}-${suffix}`,
+  (variant) => `browser-sandbox-${variant}-${suffix}:fixture`,
 );
+const probeRefs = probeImages.map((name) => `docker.io/library/${name}`);
 const nextImage = `browser-sandbox:protocol-${suffix}`;
 const clientImage =
   process.env.BROWSER_CLIENT_IMAGE ?? "browser-sandbox-client:managed";
@@ -46,6 +47,7 @@ let stage = "cluster setup";
 let installed = false;
 let hostStorageAddress;
 let clusterAttempted = false;
+let probeNodes = [];
 let cordoned;
 let heldFinalizer;
 let extraction;
@@ -410,6 +412,8 @@ const runSuite = async () => {
           `BROWSER_IMAGE=${image}`,
           "--target",
           target,
+          "--label",
+          `browser-sandbox.probe-fixture=${suffix}`,
           "-f",
           ".github/scripts/managed/Dockerfile.probe",
           "-t",
@@ -418,9 +422,15 @@ const runSuite = async () => {
         ],
         { timeout: 300000 },
       );
-      candidates.push(probeImages[index]);
+      const fixture = probeImages[index];
+      candidates.push(fixture);
+      probeRefs.push(
+        await run("docker", ["image", "inspect", "--format", "{{.Id}}", fixture]),
+      );
     }
   }
+  if (probeAB && !clusterAttempted)
+    probeNodes = nodes.map((node) => node.metadata.name);
   await run("k3d", ["image", "import", ...candidates, "-c", cluster], {
     timeout: 300000,
   });
@@ -492,6 +502,7 @@ const runSuite = async () => {
   const nextDigest = next?.digest;
   const nextRepository = next?.repository;
   const variants = probeAB ? probeImages.map(reference) : [];
+  probeRefs.push(...variants.map(({ pinned }) => pinned));
   for (const node of nodes) {
     for (const ref of [primary, ...(next ? [next] : []), ...variants])
       await run("docker", [
@@ -1399,6 +1410,17 @@ try {
     "--ignore-not-found",
     "--wait=false",
   ).catch(() => {});
+  await Promise.all(
+    probeNodes.map((node) =>
+      run(
+        "docker",
+        ["exec", node, "ctr", "-n", "k8s.io", "images", "rm", ...probeRefs],
+        {
+          timeout: 15_000,
+        },
+      ).catch(() => {}),
+    ),
+  );
   if (extraction) await run("docker", ["rm", extraction]).catch(() => {});
   if (clusterAttempted)
     await run("bash", [
