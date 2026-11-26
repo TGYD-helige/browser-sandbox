@@ -122,6 +122,7 @@ export interface ControllerOptions {
     executionId: string;
     incarnation: string;
     elapsedMs?: number;
+    startupPhases?: ManagedWorker["startupPhases"];
     error?: string;
   }) => void;
   authenticateHost?: Parameters<typeof createNetworkHostControl>[0]["authenticateHost"];
@@ -930,7 +931,10 @@ export async function createController(options: ControllerOptions) {
         await persist(binding);
         queuedSignal.throwIfAborted();
         binding.creation = undefined;
-        event(binding, "ready", { elapsedMs: performance.now() - startedAt });
+        event(binding, "ready", {
+          elapsedMs: performance.now() - startedAt,
+          startupPhases: binding.worker?.startupPhases,
+        });
         return binding.worker;
       })();
       binding.starting = starting.catch((error) => {

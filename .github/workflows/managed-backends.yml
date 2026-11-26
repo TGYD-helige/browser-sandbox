@@ -6,6 +6,11 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
+    inputs:
+      startup_breakdown:
+        description: Run only the managed startup diagnostic
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -16,6 +21,7 @@ permissions:
 
 jobs:
   docker:
+    if: ${{ !inputs.startup_breakdown }}
     name: Docker (${{ matrix.runner }})
     strategy:
       fail-fast: false
@@ -47,6 +53,7 @@ jobs:
           if-no-files-found: ignore
 
   kubernetes-fixtures:
+    if: ${{ !inputs.startup_breakdown }}
     name: Kubernetes fixtures
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -81,6 +88,11 @@ jobs:
       - run: docker build -t browser-sandbox:managed .
       - run: docker build -f .github/scripts/managed/Dockerfile.client -t browser-sandbox-client:managed .
       - run: bash .github/scripts/verify-image.sh browser-sandbox:managed
+      - name: Build the diagnostic worker
+        if: ${{ inputs.startup_breakdown }}
+        run: |
+          docker build -f .github/scripts/managed/Dockerfile.probe --target diagnostics -t browser-sandbox:diagnostics .
+          docker tag browser-sandbox:diagnostics browser-sandbox:managed
       - name: Export the native images
         run: docker save --output managed-images.tar browser-sandbox:managed browser-sandbox-client:managed
       - uses: actions/upload-artifact@v4
@@ -99,7 +111,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
-        suite: [fresh-node, single-controller, journal, active-active, probe-ab]
+        suite: ${{ inputs.startup_breakdown && fromJSON('["startup-breakdown"]') || fromJSON('["fresh-node","single-controller","journal","active-active","probe-ab"]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:

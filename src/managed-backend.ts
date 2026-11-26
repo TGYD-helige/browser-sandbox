@@ -23,6 +23,12 @@ export interface ManagedWorker {
   epoch?: number;
   /** An owned cleanup resource with no surviving browser process or Profile disk. */
   infrastructureOnly?: boolean;
+  startupPhases?: {
+    podCreateRequestMs: number;
+    podCreateToContainerObservedMs?: number;
+    podCreateToReadyObservedMs: number;
+    podReadyObservedAt: number;
+  };
   runtime: BrowserRuntime & {
     close?(): void;
     setEpoch?(epoch: number, ownerUid?: string): void;

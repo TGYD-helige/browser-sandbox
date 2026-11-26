@@ -9,3 +9,7 @@ COPY .github/scripts/managed/probe-failure.mjs /opt/browser-sandbox/dist/probe-f
 RUN cd /opt/browser-sandbox/dist \
     && grep -F 'await captureRenderer(cdp.call, browserContextId);' probe.js \
     && sed -i 's/await captureRenderer(cdp.call, browserContextId);/const { rejectScreenshot } = await import(".\/probe-failure.mjs"); await captureRenderer(rejectScreenshot.bind(null, cdp), browserContextId);/' probe.js
+
+FROM ${BROWSER_IMAGE} AS diagnostics
+COPY .github/scripts/managed/startup-diagnostics.mjs /opt/browser-sandbox/dist/startup-diagnostics.mjs
+ENTRYPOINT ["node", "--import", "/opt/browser-sandbox/dist/startup-diagnostics.mjs", "/opt/browser-sandbox/dist/main.js"]

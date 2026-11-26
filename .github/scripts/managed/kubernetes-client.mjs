@@ -49,10 +49,21 @@ try {
     } finally {
       await runtime.request({ op: "finalize", executionId });
     }
-  } else if (action === "cold-start") {
+  } else if (action === "cold-start" || action === "worker-ready") {
     const started = performance.now();
     const { wsEndpoint } = await runtime.request({ op: "register", executionId });
     const registrationMs = performance.now() - started;
+    let workerPreparationMs = 0;
+    if (action === "worker-ready") {
+      const prepareStarted = performance.now();
+      const response = await fetch(
+        `${wsEndpoint.replace(/^ws/, "http")}/files/missing`,
+      );
+      assert.equal(response.status, 404);
+      await response.arrayBuffer();
+      workerPreparationMs = performance.now() - prepareStarted;
+      assert.equal((await sessionRequest(wsEndpoint)).state, "unused");
+    }
     const firstCdp = async () => {
       const start = performance.now();
       await connect(wsEndpoint);
@@ -60,6 +71,7 @@ try {
       return performance.now() - start;
     };
     const coldCdpMs = await firstCdp();
+    const registrationToFirstCdpMs = performance.now() - started;
     assert.deepEqual(
       (await cdp.call("Target.getBrowserContexts")).browserContextIds,
       [],
@@ -67,7 +79,15 @@ try {
     await sessionRequest(wsEndpoint, "retain", 60000);
     await closeCdp();
     const warmCdpMs = await firstCdp();
-    console.log(JSON.stringify({ registrationMs, coldCdpMs, warmCdpMs }));
+    console.log(
+      JSON.stringify({
+        registrationMs,
+        workerPreparationMs,
+        coldCdpMs,
+        warmCdpMs,
+        registrationToFirstCdpMs,
+      }),
+    );
   } else if (action === "probe-failure") {
     const { wsEndpoint } = await runtime.request({ op: "register", executionId });
     await connect(wsEndpoint);

@@ -224,6 +224,7 @@ export async function createKubernetesBackend(
             value: "/opt/browser-extensions",
           });
         attempted = true;
+        const podCreateStarted = performance.now();
         const pod = await api(
           `${base}/pods`,
           "POST",
@@ -326,6 +327,8 @@ export async function createKubernetesBackend(
           },
           signal,
         );
+        const podCreateRequestMs = performance.now() - podCreateStarted;
+        let podCreateToContainerObservedMs: number | undefined;
         uid = pod.metadata.uid;
         if (!uid) throw Error("browser_kubernetes_response_invalid");
         await assertSameOwner();
@@ -370,11 +373,23 @@ export async function createKubernetesBackend(
           )
             throw Error("browser_worker_configuration_invalid");
           if (
+            state.status?.containerStatuses?.some(
+              (container) => container.name === "worker" && container.state?.running,
+            )
+          )
+            podCreateToContainerObservedMs ??= performance.now() - podCreateStarted;
+          if (
             state.status?.phase === "Running" &&
             state.status.conditions?.some(
               (condition) => condition.type === "Ready" && condition.status === "True",
             )
           ) {
+            const startupPhases = {
+              podCreateRequestMs,
+              podCreateToContainerObservedMs,
+              podCreateToReadyObservedMs: performance.now() - podCreateStarted,
+              podReadyObservedAt: Date.now(),
+            };
             const origin = workerOrigin(
               state.status.podIP,
               "browser_kubernetes_response_invalid",
@@ -387,6 +402,7 @@ export async function createKubernetesBackend(
               incarnation,
               origin,
               profileId,
+              startupPhases,
               runtime: createControllerRuntime(origin, {
                 automation: placement.automation,
                 epoch,

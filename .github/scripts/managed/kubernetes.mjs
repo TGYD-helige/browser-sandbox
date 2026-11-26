@@ -17,11 +17,14 @@ assert(
     "journal",
     "active-active",
     "probe-ab",
+    "startup-breakdown",
   ].includes(suite),
   `Unknown Kubernetes suite: ${suite}`,
 );
 const probeAB = suite === "probe-ab";
-const runFreshNode = suite === "all" || suite === "fresh-node" || probeAB;
+const startupBreakdown = suite === "startup-breakdown";
+const runFreshNode =
+  suite === "all" || suite === "fresh-node" || probeAB || startupBreakdown;
 const runSingleController = suite === "all" || suite === "single-controller";
 
 const directory = await mkdtemp(join(tmpdir(), "browser-kubernetes-"));
@@ -234,15 +237,28 @@ const workerLifecycle = async (pod, startupProbe) => {
     lifecycle.map(({ event }) => event),
     events,
   );
-  return Object.fromEntries(lifecycle.map((record) => [record.event, record]));
+  return Object.fromEntries(
+    records
+      .filter(
+        ({ event }) =>
+          events.includes(event) ||
+          ["worker_ready_phases", "test_native_debugger_observed"].includes(event),
+      )
+      .map((record) => [record.event, record]),
+  );
 };
 
-const benchmarkColdStart = async (node, startupProbe = false, count = 10) => {
+const benchmarkColdStart = async (
+  node,
+  startupProbe = false,
+  count = 10,
+  action = "cold-start",
+) => {
   const samples = [];
   for (let index = 0; index < count; index++) {
     const executionId = randomUUID();
     try {
-      const clientTiming = await client("cold-start", executionId);
+      const clientTiming = await client(action, executionId);
       const worker = (await pods()).find(
         (pod) => pod.metadata.labels["browser-sandbox.io/execution"] === executionId,
       );
@@ -287,7 +303,6 @@ const benchmarkColdStart = async (node, startupProbe = false, count = 10) => {
       const launch = logs.browser_launch_succeeded;
       const sample = {
         ...clientTiming,
-        registrationToFirstCdpMs: clientTiming.registrationMs + clientTiming.coldCdpMs,
         podToContainerMs: started - created,
         containerToPodReadyMs: ready - started,
         workerStartupMs: logs.worker_ready.durationMs,
@@ -307,6 +322,46 @@ const benchmarkColdStart = async (node, startupProbe = false, count = 10) => {
         browserLaunchMs: launch.browserLaunchMs,
         imagePullMs: pulling ? eventTime(pulled) - eventTime(pulling) : null,
       };
+      if (startupBreakdown) {
+        const {
+          podCreateRequestMs,
+          podCreateToContainerObservedMs,
+          podCreateToReadyObservedMs,
+          podReadyObservedAt,
+        } = controllerReady.startupPhases;
+        const {
+          networkSetupMs,
+          browserlessLoadMs,
+          browserlessSetupMs,
+          browserlessListenMs,
+          gatewaySetupMs,
+        } = logs.worker_ready_phases;
+        const { wrapperSpawnAt, wrapperSpawnToDebuggerMs } =
+          logs.test_native_debugger_observed;
+        const hookAt =
+          launch.time -
+          launch.browserHookSetupMs -
+          launch.executionRendererProbeMs -
+          launch.browserlessHandshakeMs;
+        Object.assign(sample, {
+          podCreateRequestMs,
+          podCreateToContainerObservedMs,
+          podCreateToReadyObservedMs,
+          runtimeReadyToPodReadyObservedMs: podReadyObservedAt - logs.worker_ready.time,
+          podReadyObservedToControllerReadyMs:
+            controllerReady.time - podReadyObservedAt,
+          networkSetupMs,
+          browserlessLoadMs,
+          browserlessSetupMs,
+          browserlessListenMs,
+          gatewaySetupMs,
+          browserlessToWrapperSpawnMs:
+            wrapperSpawnAt - (hookAt - launch.chromeStartupMs),
+          wrapperSpawnToDebuggerMs,
+          observedDebuggerToHookMs:
+            hookAt - (wrapperSpawnAt + wrapperSpawnToDebuggerMs),
+        });
+      }
       for (const value of Object.values(sample))
         assert(value === null || Number.isFinite(value));
       samples.push(sample);
@@ -743,6 +798,20 @@ const runSuite = async () => {
       } finally {
         await client("finish", executionId);
       }
+    } else if (startupBreakdown) {
+      const reports = [];
+      for (const action of [
+        "cold-start",
+        "worker-ready",
+        "worker-ready",
+        "cold-start",
+      ]) {
+        stage = `startup breakdown ${action}`;
+        const report = await benchmarkColdStart(benchmarkNode, false, 5, action);
+        assert.equal(report.cached?.registrationToFirstCdpMs.samples, 5);
+        reports.push({ action, ...report });
+      }
+      freshNodeResults.startupBreakdown = reports;
     } else {
       freshNodeResults.coldStart = await benchmarkColdStart(benchmarkNode);
     }
@@ -756,7 +825,7 @@ const runSuite = async () => {
       "120s",
     ]);
     installed = false;
-    if (suite === "fresh-node" || probeAB) {
+    if (runFreshNode && suite !== "all") {
       await writeReport(freshNodeResults);
       return;
     }

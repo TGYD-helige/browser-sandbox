@@ -22,13 +22,16 @@ const workerExecutionId =
 const probeAtStartup = !workerExecutionId;
 if (process.env.PORT !== "3001") throw Error("browser_internal_port_invalid");
 if (process.getuid() !== 0) throw Error("browser_provider_identity_required");
+const networkStarted = performance.now();
 installBrowserNetworkPolicy();
 if (process.argv[2] === "worker")
   installWorkerNetworkPolicy(undefined, undefined, await storageDestinations());
+const networkSetupMs = performance.now() - networkStarted;
 const [major, minor] = release().split(".").map(Number);
 if (major < 4 || (major === 4 && minor < 8)) throw Error("browser_kernel_unsupported");
 // Set before loading Browserless: the secret never enters execution environments.
 process.env.TOKEN = randomBytes(32).toString("hex");
+const browserlessLoadStarted = performance.now();
 const {
   Browserless,
   BrowserManager,
@@ -40,6 +43,7 @@ const {
   Monitoring,
   WebHooks,
 } = await import(process.env.APP_DIR + "/build/exports.js");
+const browserlessLoadMs = performance.now() - browserlessLoadStarted;
 const require = createRequire(import.meta.url);
 const WebSocket = require("ws"),
   WebSocketServer = WebSocket.WebSocketServer;
@@ -80,7 +84,10 @@ const backend = new Browserless({
   monitoring,
   webhooks,
 });
+const browserlessListenStarted = performance.now();
 await backend.start();
+const browserlessListenMs = performance.now() - browserlessListenStarted;
+const gatewayStarted = performance.now();
 const healthUrl = new URL("/active", base);
 healthUrl.searchParams.set("token", process.env.TOKEN);
 let verified = false;
@@ -186,6 +193,15 @@ const networkControl = workerExecutionId
       ),
     })
   : undefined;
+if (workerExecutionId)
+  logWorkerLifecycle("worker_ready_phases", {
+    networkSetupMs,
+    browserlessLoadMs,
+    browserlessSetupMs:
+      browserlessListenStarted - browserlessLoadStarted - browserlessLoadMs,
+    browserlessListenMs,
+    gatewaySetupMs: performance.now() - gatewayStarted,
+  });
 verified = true;
 for (const signal of ["SIGINT", "SIGTERM"])
   process.once(signal, async () => {
