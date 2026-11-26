@@ -60,6 +60,10 @@ try {
       return performance.now() - start;
     };
     const coldCdpMs = await firstCdp();
+    assert.deepEqual(
+      (await cdp.call("Target.getBrowserContexts")).browserContextIds,
+      [],
+    );
     await sessionRequest(wsEndpoint, "retain", 60000);
     await closeCdp();
     const warmCdpMs = await firstCdp();
@@ -69,7 +73,7 @@ try {
     await connect(wsEndpoint);
     const outcomes = await Promise.allSettled([
       cdp.call("Browser.getVersion"),
-      cdp.call("Target.createTarget", { url: "about:blank" }),
+      cdp.call("Target.createTarget", { url: "data:text/plain,probe-failure-cdp" }),
     ]);
     for (const outcome of outcomes) {
       assert.equal(outcome.status, "rejected");

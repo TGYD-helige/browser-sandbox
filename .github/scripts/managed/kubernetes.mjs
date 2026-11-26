@@ -736,6 +736,7 @@ const runSuite = async () => {
         const events = jsonLogRecords(
           await kubectl("logs", worker.metadata.name, "-c", "worker", "--timestamps"),
         ).map(({ event }) => event);
+        assert(events.includes("test_probe_cdp_target_absent"));
         assert(events.includes("browser_renderer_probe_failed"));
         assert(!events.includes("browser_launch_succeeded"));
         freshNodeResults.probeFailureBlockedCdp = true;
