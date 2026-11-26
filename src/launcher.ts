@@ -68,8 +68,17 @@ export function createBrowserLauncher({
       entry.browser = browser;
       // Track the child before any asynchronous setup can fail.
       entry.child = browser.process();
+      if (entry.managed)
+        browser.once("close", () => {
+          // Browserless can react to a native CDP disconnect before the child emits exit.
+          entry.unexpectedDisconnect = !entry.closeRequested && !entry.cancelled;
+        });
       entry.child?.once("exit", (exitCode, signal) => {
-        if (entry.managed && entry.ready && !entry.stopping && !entry.cancelled)
+        if (
+          entry.managed &&
+          entry.ready &&
+          (entry.unexpectedDisconnect || (!entry.closeRequested && !entry.cancelled))
+        )
           logWorkerLifecycle("browser_unexpected_exit", { exitCode, signal }, true);
         entry.exited.resolve();
         entry.disconnected.resolve();
@@ -111,6 +120,7 @@ export function createBrowserLauncher({
       const close = browser.close.bind(browser);
       browser.close = () => {
         if (!entry.stopping) {
+          entry.closeRequested = true;
           const exited = () =>
             entry.child &&
             (entry.child.exitCode !== null || entry.child.signalCode !== null);

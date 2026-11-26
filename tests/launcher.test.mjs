@@ -198,7 +198,7 @@ function fixture(
     child.kill = () => {
       throw Error("unexpected fallback kill");
     };
-    return {
+    return Object.assign(new EventEmitter(), {
       browser: {
         target: () => ({
           createCDPSession: async () => ({
@@ -209,12 +209,14 @@ function fixture(
       },
       process: () => child,
       wsEndpoint: () => endpoint,
-      close: async () => {},
+      async close() {
+        this.emit("close");
+      },
       exit() {
         child.exitCode = 0;
         child.emit("exit", 0, null);
       },
-    };
+    });
   }
   const start = (signal) =>
     runtime.launch({
@@ -234,25 +236,32 @@ function fixture(
   };
 }
 
-test("a managed Chrome exit is logged once without CDP details", async (t) => {
-  const logs = [];
-  t.mock.method(console, "error", (line) => logs.push(JSON.parse(line)));
-  const f = fixture(undefined, undefined, "same-workspace");
-  const pending = f.start(new AbortController().signal);
-  await f.socketCreated;
-  const starting = f.browserManager.getBrowserForRequest(f.req(0));
-  const browser = f.browser("ws://localhost/private-token");
-  f.requests[0].resolve(browser);
-  await starting;
-  f.sockets[0].emit("open");
-  const handle = await pending;
-  browser.exit();
-  f.sockets[0].emit("close");
-  await handle.close();
-  assert.deepEqual(logs, [
-    { event: "browser_unexpected_exit", exitCode: 0, signal: null },
-  ]);
-});
+for (const order of ["exit first", "CDP disconnect first", "requested shutdown"]) {
+  test(`managed Chrome exit logging with ${order}`, async (t) => {
+    const logs = [];
+    t.mock.method(console, "error", (line) => logs.push(JSON.parse(line)));
+    const f = fixture(undefined, undefined, "same-workspace");
+    const pending = f.start(new AbortController().signal);
+    await f.socketCreated;
+    const starting = f.browserManager.getBrowserForRequest(f.req(0));
+    const browser = f.browser("ws://localhost/private-token");
+    f.requests[0].resolve(browser);
+    await starting;
+    f.sockets[0].emit("open");
+    const handle = await pending;
+    if (order === "CDP disconnect first") browser.emit("close");
+    if (order !== "exit first") await browser.close();
+    browser.exit();
+    f.sockets[0].emit("close");
+    await handle.close();
+    assert.deepEqual(
+      logs,
+      order === "requested shutdown"
+        ? []
+        : [{ event: "browser_unexpected_exit", exitCode: 0, signal: null }],
+    );
+  });
+}
 
 test("launcher enables configured extensions without bypassing other Chrome defaults", async () => {
   const root = await mkdtemp(join(tmpdir(), "browser-launch-extensions-"));
