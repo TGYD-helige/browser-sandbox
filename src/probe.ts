@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { connectCdp } from "./cdp.js";
 import { EXTENSION_STARTUP_ERRORS } from "./lifecycle-errors.js";
 
 /** Prove the target can run a sandboxed renderer before admitting executions. */
@@ -60,16 +61,7 @@ export async function verifyTarget(gateway, WebSocket) {
           }),
         );
       });
-    const { targetId } = await call("Target.createTarget", {
-      url: "about:blank",
-    });
-    const { sessionId } = await call("Target.attachToTarget", {
-      targetId,
-      flatten: true,
-    });
-    const { data } = await call("Page.captureScreenshot", {}, sessionId);
-    if (typeof data !== "string" || data.length < 100)
-      throw Error("browser_renderer_probe_failed");
+    await captureRenderer(call);
     rendererReady = performance.now();
   } finally {
     socket?.terminate();
@@ -79,4 +71,43 @@ export async function verifyTarget(gateway, WebSocket) {
     rendererProbeMs: rendererReady - started,
     probeCleanupMs: performance.now() - rendererReady,
   };
+}
+
+async function captureRenderer(
+  call: Awaited<ReturnType<typeof connectCdp>>["call"],
+  browserContextId?: string,
+) {
+  const { targetId } = await call("Target.createTarget", {
+    url: "about:blank",
+    ...(browserContextId ? { browserContextId } : {}),
+  });
+  const { sessionId } = await call("Target.attachToTarget", {
+    targetId,
+    flatten: true,
+  });
+  const { data } = await call("Page.captureScreenshot", {}, sessionId);
+  if (typeof data !== "string" || data.length < 100)
+    throw Error("browser_renderer_probe_failed");
+}
+
+export async function verifyExecutionRenderer(endpoint: string, signal: AbortSignal) {
+  const cdp = await connectCdp(
+    endpoint,
+    AbortSignal.any([signal, AbortSignal.timeout(15000)]),
+  );
+  try {
+    const { browserContextId } = await cdp.call("Target.createBrowserContext", {
+      disposeOnDetach: true,
+    });
+    if (typeof browserContextId !== "string" || browserContextId.length === 0)
+      throw Error("browser_renderer_probe_failed");
+    try {
+      await captureRenderer(cdp.call, browserContextId);
+    } finally {
+      await cdp.call("Target.disposeBrowserContext", { browserContextId });
+    }
+  } finally {
+    cdp.close();
+    await cdp.closed;
+  }
 }

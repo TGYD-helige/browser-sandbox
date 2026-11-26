@@ -64,6 +64,18 @@ try {
     await closeCdp();
     const warmCdpMs = await firstCdp();
     console.log(JSON.stringify({ registrationMs, coldCdpMs, warmCdpMs }));
+  } else if (action === "probe-failure") {
+    const { wsEndpoint } = await runtime.request({ op: "register", executionId });
+    await connect(wsEndpoint);
+    const outcomes = await Promise.allSettled([
+      cdp.call("Browser.getVersion"),
+      cdp.call("Target.createTarget", { url: "about:blank" }),
+    ]);
+    for (const outcome of outcomes) {
+      assert.equal(outcome.status, "rejected");
+      assert.equal(outcome.reason.message, "browser_cdp_closed");
+    }
+    console.log(JSON.stringify({ rejected: true }));
   } else if (action === "status") {
     console.log(
       JSON.stringify(

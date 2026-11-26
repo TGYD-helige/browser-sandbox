@@ -43,7 +43,7 @@ Workers do not request `net.ipv4.ip_local_reserved_ports`: there is no co-reside
 
 ### Read worker lifecycle logs
 
-Use `kubectl logs <worker-pod> -c worker --timestamps` to see JSON lifecycle events. `worker_starting`, `worker_probe_succeeded`, and `worker_ready` distinguish container startup, sandboxed renderer verification, and runtime readiness. `browser_launch_succeeded` reports execution preparation, Profile acquisition and restoration, and Chrome launch durations in milliseconds. Failed startup, probe, launch, and shutdown events go to stderr, as does an unexpected Chrome exit. The worker records omit credentials, URLs, Profile identifiers, and request data. Look up the worker Pod by its `browser-sandbox.io/execution` label to correlate it with controller events. The image's Browserless `DEBUG` default remains `quiet`.
+Use `kubectl logs <worker-pod> -c worker --timestamps` to see JSON lifecycle events. `worker_starting` and `worker_ready` mark runtime startup and readiness. The worker verifies a real renderer in a disposable BrowserContext on each execution Chrome before forwarding external CDP commands. A failed probe rejects the launch. `browser_launch_succeeded` reports execution and Profile preparation, Browserless admission, Chrome startup, browser hook setup, renderer verification and handshake durations in milliseconds. Failed startup, probe, launch, and shutdown events go to stderr, as does an unexpected Chrome exit. The worker records omit credentials, URLs, Profile identifiers, and request data. Look up the worker Pod by its `browser-sandbox.io/execution` label to correlate it with controller events. The image's Browserless `DEBUG` default remains `quiet`.
 
 ### Running workers without an outer seccomp filter
 

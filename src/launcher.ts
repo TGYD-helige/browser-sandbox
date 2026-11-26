@@ -54,6 +54,9 @@ export function createBrowserLauncher({
   extensionsDir = undefined as string | undefined,
   cookieStore = createCookieStore,
   workerExecutionId = undefined as string | undefined,
+  verifyRenderer = undefined as
+    | ((endpoint: string, signal: AbortSignal) => Promise<void>)
+    | undefined,
 }) {
   const launches = new Map();
   const readExtensions =
@@ -65,6 +68,7 @@ export function createBrowserLauncher({
         browser.process()?.kill("SIGKILL");
         throw Error("browser_execution_missing");
       }
+      const hookStarted = performance.now();
       entry.browser = browser;
       // Track the child before any asynchronous setup can fail.
       entry.child = browser.process();
@@ -149,6 +153,34 @@ export function createBrowserLauncher({
         }
         return entry.stopping;
       };
+      if (entry.managed) {
+        const probeStarted = performance.now();
+        if (verifyRenderer) {
+          try {
+            await verifyRenderer(browser.wsEndpoint(), entry.signal);
+          } catch {
+            entry.probeFailed = true;
+            logWorkerLifecycle(
+              "browser_renderer_probe_failed",
+              {
+                durationMs: performance.now() - probeStarted,
+              },
+              true,
+            );
+            throw Error("browser_renderer_probe_failed");
+          }
+        }
+        entry.signal.throwIfAborted();
+        entry.hookFinished = performance.now();
+        entry.launchTimings = {
+          browserlessAdmissionMs: entry.browserlessStarted - entry.socketStarted,
+          chromeStartupMs: hookStarted - entry.browserlessStarted,
+          browserHookSetupMs: probeStarted - hookStarted,
+          executionRendererProbeMs: verifyRenderer
+            ? entry.hookFinished - probeStarted
+            : 0,
+        };
+      }
     }
   }
   class ExecutionBrowserManager extends BrowserManager {
@@ -158,6 +190,7 @@ export function createBrowserLauncher({
     getBrowserForRequest(req, ...args) {
       const entry = launches.get(req.parsed.searchParams.get("trackingId"));
       if (!entry || entry.cancelled) throw Error("browser_launch_cancelled");
+      entry.browserlessStarted = performance.now();
       // Register before yielding: socket cancellation must await the server's launch, not its handshake.
       return (entry.starting = super.getBrowserForRequest(req, ...args));
     }
@@ -183,6 +216,7 @@ export function createBrowserLauncher({
       const entry: any = {
         sessionBoundary,
         managed: Boolean(workerExecutionId) && executionId === workerExecutionId,
+        signal,
         filesDir,
         exited: Promise.withResolvers(),
         cookies: cookieStore(WebSocket, {
@@ -229,6 +263,7 @@ export function createBrowserLauncher({
       if (extensions.length && Buffer.byteLength(url.pathname + url.search) > 12 * 1024)
         throw Error("browser_extensions_launch_request_too_large");
       launches.set(trackingId, entry);
+      entry.socketStarted = performance.now();
       const held = new WebSocket(url, { handshakeTimeout: 1800000 });
       held.on("error", entry.disconnected.resolve);
       held.on("close", entry.disconnected.resolve);
@@ -324,10 +359,22 @@ export function createBrowserLauncher({
           endpoint: entry.browser.wsEndpoint(),
           close,
           closed: entry.disconnected.promise,
+          ...(entry.managed
+            ? {
+                launchTimings: {
+                  ...entry.launchTimings,
+                  browserlessHandshakeMs: performance.now() - entry.hookFinished,
+                },
+              }
+            : {}),
         };
       } catch {
         await close();
-        throw Error("browser_session_failed");
+        throw Error(
+          entry.probeFailed
+            ? "browser_renderer_probe_failed"
+            : "browser_session_failed",
+        );
       }
     },
   };

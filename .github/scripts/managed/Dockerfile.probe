@@ -1,0 +1,10 @@
+ARG BROWSER_IMAGE=browser-sandbox:managed
+FROM ${BROWSER_IMAGE} AS startup
+RUN cd /opt/browser-sandbox/dist \
+    && grep -Fx 'const probeAtStartup = !workerExecutionId;' local-main.js \
+    && sed -i 's/^const probeAtStartup = !workerExecutionId;$/const probeAtStartup = true;/' local-main.js
+
+FROM ${BROWSER_IMAGE} AS failure
+RUN cd /opt/browser-sandbox/dist \
+    && grep -F 'await captureRenderer(cdp.call, browserContextId);' probe.js \
+    && sed -i 's/await captureRenderer(cdp.call, browserContextId);/await captureRenderer((method, params, sessionId) => cdp.call(method, method === "Page.captureScreenshot" ? { format: "invalid" } : params, sessionId), browserContextId);/' probe.js

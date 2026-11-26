@@ -151,6 +151,7 @@ function fixture(
   cookieStore = () => ({ restore: async () => {}, save: async () => {} }),
   extensionsDir = undefined,
   workerExecutionId = undefined,
+  verifyRenderer = undefined,
 ) {
   const sockets = [],
     requests = [];
@@ -188,6 +189,7 @@ function fixture(
     privacyArgs: [],
     extensionsDir,
     workerExecutionId,
+    verifyRenderer,
     cookieStore,
   });
   const req = (index) => ({ parsed: sockets[index].url });
@@ -235,6 +237,37 @@ function fixture(
     socketCreated: socketCreated.promise,
   };
 }
+
+test("a rejected managed renderer probe prevents Browserless admission", async () => {
+  const gate = deferred();
+  gate.promise.catch(() => {});
+  const started = deferred();
+  const f = fixture(undefined, undefined, "same-workspace", async () => {
+    started.resolve();
+    await gate.promise;
+  });
+  const pending = f.start(new AbortController().signal);
+  await f.socketCreated;
+  const browser = f.browser();
+  const browserless = f.browserManager.getBrowserForRequest(f.req(0)).then(
+    () => f.sockets[0].emit("open"),
+    async () => {
+      browser.exit();
+      f.sockets[0].emit("close");
+    },
+  );
+  f.requests[0].resolve(browser);
+  try {
+    await Promise.race([started.promise, browserless]);
+    gate.reject(Error("test renderer failure"));
+    await assert.rejects(pending, /browser_renderer_probe_failed/);
+  } finally {
+    gate.resolve();
+    browser.exit();
+    f.sockets[0].terminate();
+    await browserless;
+  }
+});
 
 for (const order of ["exit first", "CDP disconnect first", "requested shutdown"]) {
   test(`managed Chrome exit logging with ${order}`, async (t) => {

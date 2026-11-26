@@ -12,13 +12,14 @@ import {
   storageDestinations,
 } from "./network-policy.js";
 import { BROWSER_PRIVACY_ARGS } from "./privacy.js";
-import { verifyTarget } from "./probe.js";
+import { verifyExecutionRenderer, verifyTarget } from "./probe.js";
 import { logWorkerLifecycle } from "./worker-lifecycle.js";
 import { createWorkerFence } from "./worker-protocol.js";
 import { createWorkerStorage } from "./worker-storage.js";
 
 const workerExecutionId =
   process.argv[2] === "worker" ? process.env.BROWSER_EXECUTION_ID : undefined;
+const probeAtStartup = !workerExecutionId;
 if (process.env.PORT !== "3001") throw Error("browser_internal_port_invalid");
 if (process.getuid() !== 0) throw Error("browser_provider_identity_required");
 installBrowserNetworkPolicy();
@@ -55,6 +56,7 @@ const { hooks, browserManager, launch } = createBrowserLauncher({
   token: process.env.TOKEN,
   privacyArgs: BROWSER_PRIVACY_ARGS,
   workerExecutionId,
+  verifyRenderer: probeAtStartup ? undefined : verifyExecutionRenderer,
   extensionsDir: process.env.BROWSER_EXTENSIONS_DIR,
 });
 const metrics = new Metrics(),
@@ -119,48 +121,49 @@ const gateway = await createGateway({
         }
       : undefined,
 });
-const probeStarted = performance.now();
-try {
-  const timing = await verifyTarget(gateway, WebSocket);
-  if (workerExecutionId)
-    logWorkerLifecycle("worker_probe_succeeded", {
-      durationMs: performance.now() - probeStarted,
-      ...timing,
-    });
-  verified = true;
-} catch (error) {
-  if (workerExecutionId) {
-    const code =
-      error instanceof Error &&
-      (EXTENSION_STARTUP_ERRORS.has(error.message) ||
-        [
-          "browser_probe_failed",
-          "browser_probe_disconnected",
-          "browser_probe_timeout",
-          "browser_renderer_probe_failed",
-        ].includes(error.message))
-        ? error.message
-        : "browser_sandbox_probe_failed";
-    logWorkerLifecycle(
-      "worker_probe_failed",
-      {
-        code,
-        durationMs: performance.now() - probeStarted,
-      },
-      true,
-    );
-  } else {
-    console.error(
-      "Browser startup probe failed:",
-      String(error.message).replace(/[a-f0-9]{32,}/g, "[redacted]"),
-    );
-  }
+if (probeAtStartup) {
+  const probeStarted = performance.now();
   try {
-    await gateway.stop();
-  } finally {
-    await backend.stop();
+    const timing = await verifyTarget(gateway, WebSocket);
+    if (workerExecutionId)
+      logWorkerLifecycle("worker_probe_succeeded", {
+        durationMs: performance.now() - probeStarted,
+        ...timing,
+      });
+  } catch (error) {
+    if (workerExecutionId) {
+      const code =
+        error instanceof Error &&
+        (EXTENSION_STARTUP_ERRORS.has(error.message) ||
+          [
+            "browser_probe_failed",
+            "browser_probe_disconnected",
+            "browser_probe_timeout",
+            "browser_renderer_probe_failed",
+          ].includes(error.message))
+          ? error.message
+          : "browser_sandbox_probe_failed";
+      logWorkerLifecycle(
+        "worker_probe_failed",
+        {
+          code,
+          durationMs: performance.now() - probeStarted,
+        },
+        true,
+      );
+    } else {
+      console.error(
+        "Browser startup probe failed:",
+        String(error.message).replace(/[a-f0-9]{32,}/g, "[redacted]"),
+      );
+    }
+    try {
+      await gateway.stop();
+    } finally {
+      await backend.stop();
+    }
+    throw Error("browser_sandbox_probe_failed");
   }
-  throw Error("browser_sandbox_probe_failed");
 }
 const workerStorage = createWorkerStorage(
   process.env.BROWSER_CONTROL_SOCKET ?? "/run/browser-sandbox/control.sock",
@@ -183,6 +186,7 @@ const networkControl = workerExecutionId
       ),
     })
   : undefined;
+verified = true;
 for (const signal of ["SIGINT", "SIGTERM"])
   process.once(signal, async () => {
     try {

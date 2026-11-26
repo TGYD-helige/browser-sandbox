@@ -99,7 +99,7 @@ jobs:
       fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
-        suite: [fresh-node, single-controller, journal, active-active]
+        suite: [fresh-node, single-controller, journal, active-active, probe-ab]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:

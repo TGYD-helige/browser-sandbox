@@ -30,6 +30,7 @@ interface BrowserHandle {
   endpoint: string;
   close(): Promise<void>;
   closed?: Promise<unknown>;
+  launchTimings?: Record<string, number>;
 }
 export interface ExecutionPeer {
   client: WebSocket;
@@ -622,6 +623,7 @@ export async function createExecutions({
               logWorkerLifecycle("browser_launch_succeeded", {
                 preparationMs: launchStarted - preparationStarted,
                 ...phases,
+                ...browser.launchTimings,
               });
             if (preparationTiming.hasSubscribers)
               preparationTiming.publish({

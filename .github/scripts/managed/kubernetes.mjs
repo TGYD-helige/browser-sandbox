@@ -10,12 +10,18 @@ import { verifyJournalRollback } from "./journal-rollback.mjs";
 
 const suite = process.argv[2] ?? "all";
 assert(
-  ["all", "fresh-node", "single-controller", "journal", "active-active"].includes(
-    suite,
-  ),
+  [
+    "all",
+    "fresh-node",
+    "single-controller",
+    "journal",
+    "active-active",
+    "probe-ab",
+  ].includes(suite),
   `Unknown Kubernetes suite: ${suite}`,
 );
-const runFreshNode = suite === "all" || suite === "fresh-node";
+const probeAB = suite === "probe-ab";
+const runFreshNode = suite === "all" || suite === "fresh-node" || probeAB;
 const runSingleController = suite === "all" || suite === "single-controller";
 
 const directory = await mkdtemp(join(tmpdir(), "browser-kubernetes-"));
@@ -25,6 +31,9 @@ const namespace = `browser-${suffix}`;
 const release = "trial";
 const deployment = "trial-browser";
 const image = process.env.BROWSER_IMAGE ?? "browser-sandbox:managed";
+const probeImages = ["probe-startup", "probe-failure"].map(
+  (variant) => `browser-sandbox:${variant}-${suffix}`,
+);
 const nextImage = `browser-sandbox:protocol-${suffix}`;
 const clientImage =
   process.env.BROWSER_CLIENT_IMAGE ?? "browser-sandbox-client:managed";
@@ -208,17 +217,19 @@ const jsonLogRecords = (output) =>
     }
   });
 
-const workerLifecycle = async (pod) => {
+const workerLifecycle = async (pod, startupProbe) => {
   const records = jsonLogRecords(
     await kubectl("logs", pod.metadata.name, "-c", "worker", "--timestamps"),
   );
   const events = [
     "worker_starting",
-    "worker_probe_succeeded",
+    ...(startupProbe ? ["worker_probe_succeeded"] : []),
     "worker_ready",
     "browser_launch_succeeded",
   ];
-  const lifecycle = records.filter(({ event }) => events.includes(event));
+  const lifecycle = records.filter(
+    ({ event }) => event === "worker_probe_succeeded" || events.includes(event),
+  );
   assert.deepEqual(
     lifecycle.map(({ event }) => event),
     events,
@@ -226,9 +237,9 @@ const workerLifecycle = async (pod) => {
   return Object.fromEntries(lifecycle.map((record) => [record.event, record]));
 };
 
-const benchmarkColdStart = async (node) => {
+const benchmarkColdStart = async (node, startupProbe = false, count = 10) => {
   const samples = [];
-  for (let index = 0; index < 10; index++) {
+  for (let index = 0; index < count; index++) {
     const executionId = randomUUID();
     try {
       const clientTiming = await client("cold-start", executionId);
@@ -236,7 +247,7 @@ const benchmarkColdStart = async (node) => {
         (pod) => pod.metadata.labels["browser-sandbox.io/execution"] === executionId,
       );
       assert.equal(worker?.spec.nodeName, node.metadata.name);
-      const logs = await workerLifecycle(worker);
+      const logs = await workerLifecycle(worker, startupProbe);
       const controllerReady = jsonLogRecords(
         await kubectl(
           "logs",
@@ -280,9 +291,14 @@ const benchmarkColdStart = async (node) => {
         podToContainerMs: started - created,
         containerToPodReadyMs: ready - started,
         workerStartupMs: logs.worker_ready.durationMs,
-        probeMs: probe.durationMs,
-        rendererProbeMs: probe.rendererProbeMs,
-        probeCleanupMs: probe.probeCleanupMs,
+        probeMs: startupProbe ? probe.durationMs : launch.executionRendererProbeMs,
+        startupRendererProbeMs: startupProbe ? probe.rendererProbeMs : 0,
+        probeCleanupMs: startupProbe ? probe.probeCleanupMs : null,
+        browserlessAdmissionMs: launch.browserlessAdmissionMs,
+        chromeStartupMs: launch.chromeStartupMs,
+        browserHookSetupMs: launch.browserHookSetupMs,
+        executionRendererProbeMs: launch.executionRendererProbeMs,
+        browserlessHandshakeMs: launch.browserlessHandshakeMs,
         controllerReadyMs: controllerReady.elapsedMs,
         runtimeReadyToControllerReadyMs: controllerReady.time - logs.worker_ready.time,
         preparationMs: launch.preparationMs,
@@ -384,6 +400,27 @@ const runSuite = async () => {
   const candidates = [image];
   if (suite !== "journal") candidates.push(clientImage);
   if (runSingleController) candidates.push(nextImage);
+  if (probeAB) {
+    for (const [index, target] of ["startup", "failure"].entries()) {
+      await run(
+        "docker",
+        [
+          "build",
+          "--build-arg",
+          `BROWSER_IMAGE=${image}`,
+          "--target",
+          target,
+          "-f",
+          ".github/scripts/managed/Dockerfile.probe",
+          "-t",
+          probeImages[index],
+          ".",
+        ],
+        { timeout: 300000 },
+      );
+      candidates.push(probeImages[index]);
+    }
+  }
   await run("k3d", ["image", "import", ...candidates, "-c", cluster], {
     timeout: 300000,
   });
@@ -438,40 +475,25 @@ const runSuite = async () => {
     "images",
     "ls",
   ]);
-  const normalized = image.includes("/") ? image : `docker.io/library/${image}`;
-  const row = images.split("\n").find((line) => line.split(/\s+/)[0] === normalized);
-  assert(row, "Imported worker image was not found in containerd");
-  const digest = row.split(/\s+/)[2];
-  assert(/^sha256:[a-f0-9]{64}$/.test(digest));
-  const repository = normalized.slice(0, normalized.lastIndexOf(":"));
-  const pinned = `${repository}@${digest}`;
-  const nextNormalized = `docker.io/library/${nextImage}`;
-  const nextRepository = nextNormalized.slice(0, nextNormalized.lastIndexOf(":"));
-  let nextDigest;
-  if (runSingleController) {
-    const nextRow = images
-      .split("\n")
-      .find((line) => line.split(/\s+/)[0] === nextNormalized);
-    nextDigest = nextRow?.split(/\s+/)[2];
+  const reference = (tag) => {
+    const name = tag.includes("/") ? tag : `docker.io/library/${tag}`;
+    const row = images.split("\n").find((line) => line.split(/\s+/)[0] === name);
+    const digest = row?.split(/\s+/)[2];
     assert(
-      nextDigest && /^sha256:[a-f0-9]{64}$/.test(nextDigest),
-      "Invalid protocol image digest",
+      digest && /^sha256:[a-f0-9]{64}$/.test(digest),
+      "Invalid imported image digest",
     );
-  }
+    const repository = name.slice(0, name.lastIndexOf(":"));
+    return { name, repository, digest, pinned: `${repository}@${digest}` };
+  };
+  const primary = reference(image);
+  const { name: normalized, repository, digest, pinned } = primary;
+  const next = runSingleController ? reference(nextImage) : undefined;
+  const nextDigest = next?.digest;
+  const nextRepository = next?.repository;
+  const variants = probeAB ? probeImages.map(reference) : [];
   for (const node of nodes) {
-    await run("docker", [
-      "exec",
-      node.metadata.name,
-      "ctr",
-      "-n",
-      "k8s.io",
-      "images",
-      "tag",
-      "--force",
-      normalized,
-      pinned,
-    ]);
-    if (nextDigest)
+    for (const ref of [primary, ...(next ? [next] : []), ...variants])
       await run("docker", [
         "exec",
         node.metadata.name,
@@ -481,8 +503,8 @@ const runSuite = async () => {
         "images",
         "tag",
         "--force",
-        nextNormalized,
-        `${nextRepository}@${nextDigest}`,
+        ref.name,
+        ref.pinned,
       ]);
   }
   if (runFreshNode) {
@@ -669,9 +691,60 @@ const runSuite = async () => {
     });
     await client("finish", shared.executionId);
     stage = "managed worker cold-start benchmark";
-    freshNodeResults.coldStart = await benchmarkColdStart(
-      nodes.find((node) => node.metadata.name === workerNode),
-    );
+    const benchmarkNode = nodes.find((node) => node.metadata.name === workerNode);
+    if (probeAB) {
+      const selectImage = async (ref) => {
+        await run("helm", [
+          "upgrade",
+          release,
+          "charts/browser-sandbox",
+          "-n",
+          namespace,
+          "--reuse-values",
+          "--set-string",
+          `image.repository=${ref.repository},image.digest=${ref.digest}`,
+          "--wait",
+          "--timeout",
+          "120s",
+        ]);
+        await controllerReady();
+      };
+      const reports = [];
+      for (const startup of [true, false, false, true]) {
+        stage = `managed worker A/B ${startup ? "startup" : "execution"}`;
+        await selectImage(startup ? variants[0] : { repository, digest });
+        const report = await benchmarkColdStart(benchmarkNode, startup, 5);
+        assert.equal(
+          report.cached?.registrationToFirstCdpMs.samples,
+          5,
+          "Image must be cached",
+        );
+        reports.push({ probe: startup ? "startup" : "execution", ...report });
+      }
+      freshNodeResults.probeAB = reports;
+      stage = "execution renderer failure blocks external CDP";
+      await selectImage(variants[1]);
+      const executionId = randomUUID();
+      try {
+        assert.deepEqual(await client("probe-failure", executionId), {
+          rejected: true,
+        });
+        const worker = (await pods()).find(
+          (pod) => pod.metadata.labels["browser-sandbox.io/execution"] === executionId,
+        );
+        assert(worker, "Probe failure did not reach a worker");
+        const events = jsonLogRecords(
+          await kubectl("logs", worker.metadata.name, "-c", "worker", "--timestamps"),
+        ).map(({ event }) => event);
+        assert(events.includes("browser_renderer_probe_failed"));
+        assert(!events.includes("browser_launch_succeeded"));
+        freshNodeResults.probeFailureBlockedCdp = true;
+      } finally {
+        await client("finish", executionId);
+      }
+    } else {
+      freshNodeResults.coldStart = await benchmarkColdStart(benchmarkNode);
+    }
     await run("helm", [
       "uninstall",
       release,
@@ -682,7 +755,7 @@ const runSuite = async () => {
       "120s",
     ]);
     installed = false;
-    if (suite === "fresh-node") {
+    if (suite === "fresh-node" || probeAB) {
       await writeReport(freshNodeResults);
       return;
     }
@@ -1302,8 +1375,11 @@ try {
       "-p",
       JSON.stringify({ metadata: { finalizers: [] } }),
     ).catch(() => {});
-  if (runSingleController)
-    await run("docker", ["image", "rm", nextImage]).catch(() => {});
+  for (const fixture of [
+    ...(runSingleController ? [nextImage] : []),
+    ...(probeAB ? probeImages : []),
+  ])
+    await run("docker", ["image", "rm", fixture]).catch(() => {});
   if (cordoned) await run("kubectl", ["uncordon", cordoned]).catch(() => {});
   if (installed)
     await run("helm", [
