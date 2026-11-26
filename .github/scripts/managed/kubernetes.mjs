@@ -23,6 +23,8 @@ assert(
 );
 const probeAB = suite === "probe-ab";
 const startupBreakdown = suite === "startup-breakdown";
+const smallWorker = startupBreakdown && process.env.TEST_STARTUP_SMALL_WORKER === "1";
+const workerBudget = { cpu: "1", memory: "1Gi" };
 const runFreshNode =
   suite === "all" || suite === "fresh-node" || probeAB || startupBreakdown;
 const runSingleController = suite === "all" || suite === "single-controller";
@@ -263,6 +265,11 @@ const benchmarkColdStart = async (
         (pod) => pod.metadata.labels["browser-sandbox.io/execution"] === executionId,
       );
       assert.equal(worker?.spec.nodeName, node.metadata.name);
+      const { resources } = worker.spec.containers.find(
+        ({ name }) => name === "worker",
+      );
+      if (smallWorker)
+        assert.deepEqual(resources, { requests: workerBudget, limits: workerBudget });
       const logs = await workerLifecycle(worker, startupProbe);
       const controllerReady = jsonLogRecords(
         await kubectl(
@@ -362,6 +369,35 @@ const benchmarkColdStart = async (
             hookAt - (wrapperSpawnAt + wrapperSpawnToDebuggerMs),
         });
       }
+      if (smallWorker) {
+        const [cpuMax, memoryMax, memoryPeak, ...counters] = (
+          await kubectl(
+            "exec",
+            worker.metadata.name,
+            "-c",
+            "worker",
+            "--",
+            "cat",
+            "/sys/fs/cgroup/cpu.max",
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory.peak",
+            "/sys/fs/cgroup/cpu.stat",
+            "/sys/fs/cgroup/memory.events",
+          )
+        ).split("\n");
+        const [quota, period] = cpuMax.split(/\s+/).map(Number);
+        const statistics = Object.fromEntries(
+          counters.map((line) => line.split(/\s+/)),
+        );
+        assert.equal(quota / period, 1);
+        assert.equal(Number(memoryMax), 2 ** 30);
+        assert.equal(Number(statistics.oom_kill), 0);
+        Object.assign(sample, {
+          workerMemoryPeakBytes: Number(memoryPeak),
+          workerCpuThrottledPeriods: Number(statistics.nr_throttled),
+          workerCpuThrottledUs: Number(statistics.throttled_usec),
+        });
+      }
       for (const value of Object.values(sample))
         assert(value === null || Number.isFinite(value));
       samples.push(sample);
@@ -402,6 +438,9 @@ const benchmarkColdStart = async (
   return {
     node: node.status.nodeInfo,
     allocatable: node.status.allocatable,
+    ...(smallWorker
+      ? { workerResources: { requests: workerBudget, limits: workerBudget } }
+      : {}),
     samples,
     ...(cached.length ? { cached: summarize(cached) } : {}),
     ...(pulled.length ? { pulled: summarize(pulled) } : {}),
@@ -643,6 +682,9 @@ const runSuite = async () => {
       worker: {
         nodeSelector: { "kubernetes.io/hostname": workerNode },
         terminationGracePeriodSeconds: 15,
+        ...(smallWorker
+          ? { resources: { requests: workerBudget, limits: workerBudget } }
+          : {}),
       },
     }),
   );

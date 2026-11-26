@@ -11,6 +11,10 @@ on:
         description: Run only the managed startup diagnostic
         type: boolean
         default: false
+      startup_small_worker:
+        description: Limit startup diagnostic workers to 1 CPU and 1 GiB
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -133,6 +137,7 @@ jobs:
       - name: Run Kubernetes suite
         env:
           KUBERNETES_SUITE: ${{ matrix.suite }}
+          TEST_STARTUP_SMALL_WORKER: ${{ inputs.startup_small_worker && '1' || '0' }}
         run: node .github/scripts/managed/kubernetes.mjs "$KUBERNETES_SUITE"
       - uses: actions/upload-artifact@v4
         if: always()
