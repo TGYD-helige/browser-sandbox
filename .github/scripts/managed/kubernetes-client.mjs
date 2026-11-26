@@ -31,6 +31,12 @@ async function connect(endpoint) {
   cdp = await connectCdp(endpoint);
   return cdp;
 }
+async function prepareWorker(wsEndpoint) {
+  const response = await fetch(`${wsEndpoint.replace(/^ws/, "http")}/files/missing`);
+  assert.equal(response.status, 404);
+  await response.arrayBuffer();
+  assert.equal((await sessionRequest(wsEndpoint)).state, "unused");
+}
 try {
   if (["unschedulable", "image-failure", "quota"].includes(action)) {
     const expected = {
@@ -56,13 +62,8 @@ try {
     let workerPreparationMs = 0;
     if (action === "worker-ready") {
       const prepareStarted = performance.now();
-      const response = await fetch(
-        `${wsEndpoint.replace(/^ws/, "http")}/files/missing`,
-      );
-      assert.equal(response.status, 404);
-      await response.arrayBuffer();
+      await prepareWorker(wsEndpoint);
       workerPreparationMs = performance.now() - prepareStarted;
-      assert.equal((await sessionRequest(wsEndpoint)).state, "unused");
     }
     const firstCdp = async () => {
       const start = performance.now();
@@ -88,8 +89,9 @@ try {
         registrationToFirstCdpMs,
       }),
     );
-  } else if (action === "probe-failure") {
+  } else if (action === "probe-failure" || action === "probe-failure-prepared") {
     const { wsEndpoint } = await runtime.request({ op: "register", executionId });
+    if (action === "probe-failure-prepared") await prepareWorker(wsEndpoint);
     await connect(wsEndpoint);
     const outcomes = await Promise.allSettled([
       cdp.call("Browser.getVersion"),

@@ -17,13 +17,17 @@ assert(
     "journal",
     "active-active",
     "probe-ab",
+    "probe-clip-ab",
     "startup-breakdown",
   ].includes(suite),
   `Unknown Kubernetes suite: ${suite}`,
 );
 const probeAB = suite === "probe-ab";
-const startupBreakdown = suite === "startup-breakdown";
-const smallWorker = startupBreakdown && process.env.TEST_STARTUP_SMALL_WORKER === "1";
+const probeClipAB = suite === "probe-clip-ab";
+const compareProbes = probeAB || probeClipAB;
+const startupBreakdown = suite === "startup-breakdown" || probeClipAB;
+const smallWorker =
+  probeClipAB || (startupBreakdown && process.env.TEST_STARTUP_SMALL_WORKER === "1");
 const workerBudget = { cpu: "1", memory: "1Gi" };
 const runFreshNode =
   suite === "all" || suite === "fresh-node" || probeAB || startupBreakdown;
@@ -36,8 +40,9 @@ const namespace = `browser-${suffix}`;
 const release = "trial";
 const deployment = "trial-browser";
 const image = process.env.BROWSER_IMAGE ?? "browser-sandbox:managed";
-const probeImages = ["probe-startup", "probe-failure"].map(
-  (variant) => `browser-sandbox:${variant}-${suffix}`,
+const probeTargets = probeClipAB ? ["clip", "clip-failure"] : ["startup", "failure"];
+const probeImages = probeTargets.map(
+  (variant) => `browser-sandbox:probe-${variant}-${suffix}`,
 );
 const nextImage = `browser-sandbox:protocol-${suffix}`;
 const clientImage =
@@ -398,6 +403,28 @@ const benchmarkColdStart = async (
           workerCpuThrottledUs: Number(statistics.throttled_usec),
         });
       }
+      if (probeClipAB) {
+        const {
+          rendererConnectMs,
+          rendererContextMs,
+          rendererTargetMs,
+          rendererAttachMs,
+          rendererScreenshotMs,
+          rendererScreenshotChars,
+          rendererDisposeContextMs,
+          rendererDisconnectMs,
+        } = launch;
+        Object.assign(sample, {
+          rendererConnectMs,
+          rendererContextMs,
+          rendererTargetMs,
+          rendererAttachMs,
+          rendererScreenshotMs,
+          rendererScreenshotChars,
+          rendererDisposeContextMs,
+          rendererDisconnectMs,
+        });
+      }
       for (const value of Object.values(sample))
         assert(value === null || Number.isFinite(value));
       samples.push(sample);
@@ -494,8 +521,8 @@ const runSuite = async () => {
   const candidates = [image];
   if (suite !== "journal") candidates.push(clientImage);
   if (runSingleController) candidates.push(nextImage);
-  if (probeAB) {
-    for (const [index, target] of ["startup", "failure"].entries()) {
+  if (compareProbes) {
+    for (const [index, target] of probeTargets.entries()) {
       await run(
         "docker",
         [
@@ -585,7 +612,7 @@ const runSuite = async () => {
   const next = runSingleController ? reference(nextImage) : undefined;
   const nextDigest = next?.digest;
   const nextRepository = next?.repository;
-  const variants = probeAB ? probeImages.map(reference) : [];
+  const variants = compareProbes ? probeImages.map(reference) : [];
   for (const node of nodes) {
     for (const ref of [primary, ...(next ? [next] : []), ...variants])
       await run("docker", [
@@ -789,7 +816,7 @@ const runSuite = async () => {
     await client("finish", shared.executionId);
     stage = "managed worker cold-start benchmark";
     const benchmarkNode = nodes.find((node) => node.metadata.name === workerNode);
-    if (probeAB) {
+    if (compareProbes) {
       const selectImage = async (ref) => {
         await run("helm", [
           "upgrade",
@@ -807,25 +834,57 @@ const runSuite = async () => {
         await controllerReady();
       };
       const reports = [];
-      for (const startup of [true, false, false, true]) {
-        stage = `managed worker A/B ${startup ? "startup" : "execution"}`;
-        await selectImage(startup ? variants[0] : { repository, digest });
-        const report = await benchmarkColdStart(benchmarkNode, startup, 5);
+      const count = probeClipAB ? 10 : 5;
+      for (const useVariant of probeClipAB
+        ? [false, true, true, false]
+        : [true, false, false, true]) {
+        const probe = probeClipAB
+          ? useVariant
+            ? "clip"
+            : "full"
+          : useVariant
+            ? "startup"
+            : "execution";
+        stage = `managed worker A/B ${probe}`;
+        await selectImage(useVariant ? variants[0] : primary);
+        const report = await benchmarkColdStart(
+          benchmarkNode,
+          probeAB && useVariant,
+          count,
+          probeClipAB ? "worker-ready" : "cold-start",
+        );
         assert.equal(
           report.cached?.registrationToFirstCdpMs.samples,
-          5,
+          count,
           "Image must be cached",
         );
-        reports.push({ probe: startup ? "startup" : "execution", ...report });
+        reports.push({ probe, ...report });
       }
-      freshNodeResults.probeAB = reports;
+      if (probeClipAB) {
+        const sizes = (probe) =>
+          reports
+            .filter((report) => report.probe === probe)
+            .flatMap((report) =>
+              report.samples.map((sample) => sample.rendererScreenshotChars),
+            );
+        assert(Math.max(...sizes("clip")) < Math.min(...sizes("full")));
+        freshNodeResults.probeClipAB = reports;
+      } else {
+        freshNodeResults.probeAB = reports;
+      }
       stage = "execution renderer failure blocks external CDP";
       await selectImage(variants[1]);
       const executionId = randomUUID();
       try {
-        assert.deepEqual(await client("probe-failure", executionId), {
-          rejected: true,
-        });
+        assert.deepEqual(
+          await client(
+            probeClipAB ? "probe-failure-prepared" : "probe-failure",
+            executionId,
+          ),
+          {
+            rejected: true,
+          },
+        );
         const worker = (await pods()).find(
           (pod) => pod.metadata.labels["browser-sandbox.io/execution"] === executionId,
         );
@@ -1489,7 +1548,7 @@ try {
     ).catch(() => {});
   for (const fixture of [
     ...(runSingleController ? [nextImage] : []),
-    ...(probeAB ? probeImages : []),
+    ...(compareProbes ? probeImages : []),
   ])
     await run("docker", ["image", "rm", fixture]).catch(() => {});
   if (cordoned) await run("kubectl", ["uncordon", cordoned]).catch(() => {});

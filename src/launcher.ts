@@ -55,7 +55,10 @@ export function createBrowserLauncher({
   cookieStore = createCookieStore,
   workerExecutionId = undefined as string | undefined,
   verifyRenderer = undefined as
-    | ((endpoint: string, signal: AbortSignal) => Promise<void>)
+    | ((
+        endpoint: string,
+        signal: AbortSignal,
+      ) => Promise<Record<string, number> | undefined>)
     | undefined,
 }) {
   const launches = new Map();
@@ -155,9 +158,10 @@ export function createBrowserLauncher({
       };
       if (entry.managed) {
         const probeStarted = performance.now();
+        let rendererTimings: Record<string, number> | undefined;
         if (verifyRenderer) {
           try {
-            await verifyRenderer(browser.wsEndpoint(), entry.signal);
+            rendererTimings = await verifyRenderer(browser.wsEndpoint(), entry.signal);
           } catch {
             entry.probeFailed = true;
             logWorkerLifecycle(
@@ -173,6 +177,7 @@ export function createBrowserLauncher({
         entry.signal.throwIfAborted();
         entry.hookFinished = performance.now();
         entry.launchTimings = {
+          ...rendererTimings,
           browserlessAdmissionMs: entry.browserlessStarted - entry.socketStarted,
           chromeStartupMs: hookStarted - entry.browserlessStarted,
           browserHookSetupMs: probeStarted - hookStarted,

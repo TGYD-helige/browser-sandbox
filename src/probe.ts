@@ -76,38 +76,73 @@ export async function verifyTarget(gateway, WebSocket) {
 async function captureRenderer(
   call: Awaited<ReturnType<typeof connectCdp>>["call"],
   browserContextId?: string,
+  screenshotOptions = {},
 ) {
+  const started = performance.now();
   const { targetId } = await call("Target.createTarget", {
     url: "about:blank",
     ...(browserContextId ? { browserContextId } : {}),
   });
+  const createdAt = performance.now();
   const { sessionId } = await call("Target.attachToTarget", {
     targetId,
     flatten: true,
   });
-  const { data } = await call("Page.captureScreenshot", {}, sessionId);
+  const attachedAt = performance.now();
+  const { data } = await call("Page.captureScreenshot", screenshotOptions, sessionId);
+  const capturedAt = performance.now();
   if (typeof data !== "string" || data.length < 100)
     throw Error("browser_renderer_probe_failed");
+  return {
+    rendererTargetMs: createdAt - started,
+    rendererAttachMs: attachedAt - createdAt,
+    rendererScreenshotMs: capturedAt - attachedAt,
+    rendererScreenshotChars: data.length,
+  };
 }
 
+const executionScreenshotOptions = {};
+
 export async function verifyExecutionRenderer(endpoint: string, signal: AbortSignal) {
+  const started = performance.now();
   const cdp = await connectCdp(
     endpoint,
     AbortSignal.any([signal, AbortSignal.timeout(15000)]),
   );
+  const connectedAt = performance.now();
+  let connectAndCapture: Record<string, number>;
+  let contextDisposedAt: number;
   try {
     const { browserContextId } = await cdp.call("Target.createBrowserContext", {
       disposeOnDetach: true,
     });
     if (typeof browserContextId !== "string" || browserContextId.length === 0)
       throw Error("browser_renderer_probe_failed");
+    const contextCreatedAt = performance.now();
     try {
-      await captureRenderer(cdp.call, browserContextId);
+      const capture = cdp.call;
+      connectAndCapture = {
+        rendererConnectMs: connectedAt - started,
+        rendererContextMs: contextCreatedAt - connectedAt,
+        ...(await captureRenderer(
+          capture,
+          browserContextId,
+          executionScreenshotOptions,
+        )),
+      };
     } finally {
+      const cleanupStarted = performance.now();
       await cdp.call("Target.disposeBrowserContext", { browserContextId });
+      contextDisposedAt = performance.now();
+      if (connectAndCapture)
+        connectAndCapture.rendererDisposeContextMs = contextDisposedAt - cleanupStarted;
     }
   } finally {
     cdp.close();
     await cdp.closed;
   }
+  return {
+    ...connectAndCapture,
+    rendererDisconnectMs: performance.now() - contextDisposedAt,
+  };
 }

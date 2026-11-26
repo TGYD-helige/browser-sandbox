@@ -7,8 +7,18 @@ RUN cd /opt/browser-sandbox/dist \
 FROM ${BROWSER_IMAGE} AS failure
 COPY .github/scripts/managed/probe-failure.mjs /opt/browser-sandbox/dist/probe-failure.mjs
 RUN cd /opt/browser-sandbox/dist \
-    && grep -F 'await captureRenderer(cdp.call, browserContextId);' probe.js \
-    && sed -i 's/await captureRenderer(cdp.call, browserContextId);/const { rejectScreenshot } = await import(".\/probe-failure.mjs"); await captureRenderer(rejectScreenshot.bind(null, cdp), browserContextId);/' probe.js
+    && grep -F 'const capture = cdp.call;' probe.js \
+    && sed -i 's/const capture = cdp.call;/const { rejectScreenshot } = await import(".\/probe-failure.mjs"); const capture = rejectScreenshot.bind(null, cdp);/' probe.js
+
+FROM ${BROWSER_IMAGE} AS clip
+RUN cd /opt/browser-sandbox/dist \
+    && grep -Fx 'const executionScreenshotOptions = {};' probe.js \
+    && sed -i 's/^const executionScreenshotOptions = {};$/const executionScreenshotOptions = { clip: { x: 0, y: 0, width: 64, height: 64, scale: 1 } };/' probe.js
+
+FROM failure AS clip-failure
+RUN cd /opt/browser-sandbox/dist \
+    && grep -Fx 'const executionScreenshotOptions = {};' probe.js \
+    && sed -i 's/^const executionScreenshotOptions = {};$/const executionScreenshotOptions = { clip: { x: 0, y: 0, width: 64, height: 64, scale: 1 } };/' probe.js
 
 FROM ${BROWSER_IMAGE} AS diagnostics
 COPY .github/scripts/managed/startup-diagnostics.mjs /opt/browser-sandbox/dist/startup-diagnostics.mjs

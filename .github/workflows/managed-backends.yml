@@ -15,6 +15,10 @@ on:
         description: Limit startup diagnostic workers to 1 CPU and 1 GiB
         type: boolean
         default: false
+      probe_clip_ab:
+        description: Compare full and clipped renderer screenshots on ARM64 with a one-CPU worker
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
@@ -25,7 +29,7 @@ permissions:
 
 jobs:
   docker:
-    if: ${{ !inputs.startup_breakdown }}
+    if: ${{ !inputs.startup_breakdown && !inputs.probe_clip_ab }}
     name: Docker (${{ matrix.runner }})
     strategy:
       fail-fast: false
@@ -57,7 +61,7 @@ jobs:
           if-no-files-found: ignore
 
   kubernetes-fixtures:
-    if: ${{ !inputs.startup_breakdown }}
+    if: ${{ !inputs.startup_breakdown && !inputs.probe_clip_ab }}
     name: Kubernetes fixtures
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -79,7 +83,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+        runner: ${{ inputs.probe_clip_ab && fromJSON('["ubuntu-24.04-arm"]') || fromJSON('["ubuntu-24.04","ubuntu-24.04-arm"]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
     steps:
@@ -93,7 +97,7 @@ jobs:
       - run: docker build -f .github/scripts/managed/Dockerfile.client -t browser-sandbox-client:managed .
       - run: bash .github/scripts/verify-image.sh browser-sandbox:managed
       - name: Build the diagnostic worker
-        if: ${{ inputs.startup_breakdown }}
+        if: ${{ inputs.startup_breakdown || inputs.probe_clip_ab }}
         run: |
           docker build -f .github/scripts/managed/Dockerfile.probe --target diagnostics -t browser-sandbox:diagnostics .
           docker tag browser-sandbox:diagnostics browser-sandbox:managed
@@ -114,8 +118,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, ubuntu-24.04-arm]
-        suite: ${{ inputs.startup_breakdown && fromJSON('["startup-breakdown"]') || fromJSON('["fresh-node","single-controller","journal","active-active","probe-ab"]') }}
+        runner: ${{ inputs.probe_clip_ab && fromJSON('["ubuntu-24.04-arm"]') || fromJSON('["ubuntu-24.04","ubuntu-24.04-arm"]') }}
+        suite: ${{ inputs.probe_clip_ab && fromJSON('["probe-clip-ab"]') || inputs.startup_breakdown && fromJSON('["startup-breakdown"]') || fromJSON('["fresh-node","single-controller","journal","active-active","probe-ab"]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:

@@ -8,5 +8,5 @@ export async function rejectScreenshot(cdp, method, params, sessionId) {
   const { targetInfos } = await cdp.call("Target.getTargets");
   assert(!targetInfos.some(({ url }) => url === "data:text/plain,probe-failure-cdp"));
   console.log(JSON.stringify({ event: "test_probe_cdp_target_absent" }));
-  return cdp.call(method, { format: "invalid" }, sessionId);
+  return cdp.call(method, { ...params, format: "invalid" }, sessionId);
 }
