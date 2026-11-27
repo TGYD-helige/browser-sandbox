@@ -21,6 +21,29 @@ def render(*arguments, release="trial", chart=ROOT / "charts/browser-sandbox"):
 
 
 class ChartTest(unittest.TestCase):
+    def test_private_storage_domain_is_scoped_to_workers_and_configured_port(self):
+        addresses = [{"address": "10.42.1.2", "port": 9083}]
+        domains = [{"hostname": "s3.example.com", "port": 443}]
+        resources = render("--set-json", "networkPolicy.storageEgress=" + json.dumps(addresses),
+                           "--set-json", "networkPolicy.storageEgressDomains=" + json.dumps(domains))
+        domain_policy = next(item["spec"] for item in resources if item["kind"] == "CiliumNetworkPolicy")
+        network_policy = next(item["spec"] for item in resources if item["metadata"]["name"] == "trial-browser-workers")
+        self.assertEqual(domain_policy["endpointSelector"], network_policy["podSelector"])
+        self.assertEqual(domain_policy["egress"][1], {
+            "toFQDNs": [{"matchName": "s3.example.com"}],
+            "toPorts": [{"ports": [{"port": "443", "protocol": "TCP"}]}],
+        })
+        self.assertEqual(network_policy["egress"][-1], {
+            "to": [{"ipBlock": {"cidr": "10.42.1.2/32"}}],
+            "ports": [{"protocol": "TCP", "port": 9083}],
+        })
+        deploy = next(item for item in resources if item["kind"] == "Deployment")
+        env = deploy["spec"]["template"]["spec"]["containers"][0]["env"]
+        self.assertEqual(json.loads(next(e["value"] for e in env if e["name"] == "BROWSER_STORAGE_EGRESS")), addresses + domains)
+        self.assertFalse(any(item["kind"] == "CiliumNetworkPolicy" for item in render()))
+        with self.assertRaises(subprocess.CalledProcessError):
+            render("--set-json", 'networkPolicy.storageEgressDomains=[{"hostname":"*.example.com","port":443}]')
+
     def test_image_reference_is_shared_by_controller_workers_and_drain(self):
         digest = "sha256:" + "a" * 64
         for settings, image in (

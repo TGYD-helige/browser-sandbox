@@ -1,3 +1,15 @@
+{{- $storageDomains := .Values.networkPolicy.storageEgressDomains }}
+{{- range $storageDomains }}
+  {{- if or (hasKey . "address") (not (kindIs "string" .hostname)) }}
+    {{- fail "networkPolicy.storageEgressDomains entries must specify a hostname and port" }}
+  {{- end }}
+  {{- if or (gt (len .hostname) 253) (not (regexMatch `^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$` .hostname)) }}
+    {{- fail "networkPolicy.storageEgressDomains hostname must be an exact fully qualified DNS name" }}
+  {{- end }}
+  {{- if or (not (regexMatch "^[0-9]{1,5}$" (toJson .port))) (lt (int .port) 1) (gt (int .port) 65535) }}
+    {{- fail "networkPolicy.storageEgressDomains port must be an integer between 1 and 65535" }}
+  {{- end }}
+{{- end }}
 {{- if not .Values.networkPolicy.apiServerCidrs }}
 {{- fail "networkPolicy.apiServerCidrs must list every Kubernetes API endpoint CIDR" }}
 {{- end }}
@@ -87,3 +99,38 @@ spec:
         - protocol: TCP
           port: 8084
     {{- end }}
+
+{{- if $storageDomains }}
+---
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "browser-sandbox.name" . }}-storage-dns
+spec:
+  endpointSelector:
+    matchLabels:
+      {{- include "browser-sandbox.labels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            "k8s:io.kubernetes.pod.namespace": {{ .Values.networkPolicy.dnsNamespace | quote }}
+            {{- range $key, $value := .Values.networkPolicy.dnsLabels }}
+            {{ printf "k8s:%s" $key | quote }}: {{ $value | quote }}
+            {{- end }}
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: ANY
+          rules:
+            dns:
+              - matchPattern: "*"
+    {{- range $storageDomains }}
+    - toFQDNs:
+        - matchName: {{ .hostname | quote }}
+      toPorts:
+        - ports:
+            - port: {{ .port | quote }}
+              protocol: TCP
+    {{- end }}
+{{- end }}
