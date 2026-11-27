@@ -41,7 +41,7 @@ const probeImages = ["probe-startup", "probe-failure"].map(
 const fixtureRefs = probeAB
   ? probeImages.map((name) => `docker.io/library/${name}`)
   : [];
-const nextImage = `browser-sandbox:protocol-${suffix}`;
+const nextImage = `browser-sandbox-protocol-${suffix}:fixture`;
 const clientImage =
   process.env.BROWSER_CLIENT_IMAGE ?? "browser-sandbox-client:managed";
 const kubeconfig = process.env.TEST_K3D_CLUSTER
@@ -411,7 +411,10 @@ const runSuite = async () => {
   }
   const candidates = [image];
   if (suite !== "journal") candidates.push(clientImage);
-  if (runSingleController) candidates.push(nextImage);
+  if (runSingleController) {
+    candidates.push(nextImage);
+    fixtureRefs.push(`docker.io/library/${nextImage}`);
+  }
   if (probeAB) {
     for (const [index, target] of ["startup", "failure"].entries()) {
       await run(
@@ -439,7 +442,7 @@ const runSuite = async () => {
       );
     }
   }
-  if ((probeAB || releaseImageTag) && !clusterAttempted)
+  if (fixtureRefs.length && !clusterAttempted)
     fixtureNodes = nodes.map((node) => node.metadata.name);
   await run("k3d", ["image", "import", ...candidates, "-c", cluster], {
     timeout: 300000,
@@ -513,6 +516,7 @@ const runSuite = async () => {
   const nextRepository = next?.repository;
   const variants = probeAB ? probeImages.map(reference) : [];
   if (releaseImageTag) fixtureRefs.push(pinned);
+  if (next) fixtureRefs.push(next.pinned);
   fixtureRefs.push(...variants.map(({ pinned }) => pinned));
   for (const node of nodes) {
     for (const ref of [primary, ...(next ? [next] : []), ...variants])
