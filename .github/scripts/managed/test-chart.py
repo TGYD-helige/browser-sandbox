@@ -45,11 +45,24 @@ class ChartTest(unittest.TestCase):
             render("--set-json", 'networkPolicy.storageEgressDomains=[{"hostname":"*.example.com","port":443}]')
 
     def test_storage_domain_rejects_cluster_local_hostnames(self):
-        for hostname in ("minio.storage.svc.cluster.local", "minio.storage.svc",
-                         "minio.storage.svc.kube.internal", "10-42-1-2.storage.pod.kube.internal"):
+        for hostname, cluster_domain in (
+            ("minio.storage.svc.cluster.local", "cluster.local"),
+            ("minio.storage.svc", "cluster.local"),
+            ("10-42-1-2.storage.pod", "cluster.local"),
+            ("minio.storage.svc.kube.internal", "kube.internal"),
+            ("10-42-1-2.storage.pod.kube.internal", "kube.internal"),
+        ):
             with self.subTest(hostname=hostname), self.assertRaises(subprocess.CalledProcessError):
-                render("--set-json", "networkPolicy.storageEgressDomains=" +
+                render("--set-string", "networkPolicy.clusterDomain=" + cluster_domain,
+                       "--set-json", "networkPolicy.storageEgressDomains=" +
                        json.dumps([{"hostname": hostname, "port": 443}]))
+
+    def test_storage_domain_allows_external_svc_and_pod_labels(self):
+        hostnames = ["s3.prod.svc.example.com", "s3.prod.pod.example.com"]
+        resources = render("--set-json", "networkPolicy.storageEgressDomains=" +
+                           json.dumps([{"hostname": hostname, "port": 443} for hostname in hostnames]))
+        policy = next(item["spec"] for item in resources if item["kind"] == "CiliumNetworkPolicy")
+        self.assertEqual([rule["toFQDNs"][0]["matchName"] for rule in policy["egress"][1:]], hostnames)
 
     def test_image_reference_is_shared_by_controller_workers_and_drain(self):
         digest = "sha256:" + "a" * 64

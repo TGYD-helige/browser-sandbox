@@ -75,6 +75,8 @@ networkPolicy:
   storageEgress: []
   # Exact storage hostnames outside the Kubernetes cluster and their TCP ports. Requires Cilium DNS policy.
   storageEgressDomains: []
+  # Kubernetes DNS suffix used to reject in-cluster storage names.
+  clusterDomain: cluster.local
   dnsNamespace: kube-system
   dnsLabels:
     k8s-app: kube-dns

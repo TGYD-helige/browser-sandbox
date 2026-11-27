@@ -1,4 +1,5 @@
 {{- $storageDomains := .Values.networkPolicy.storageEgressDomains }}
+{{- $clusterDomain := default "cluster.local" .Values.networkPolicy.clusterDomain | lower | trimSuffix "." }}
 {{- range $storageDomains }}
   {{- if or (hasKey . "address") (not (kindIs "string" .hostname)) }}
     {{- fail "networkPolicy.storageEgressDomains entries must specify a hostname and port" }}
@@ -6,7 +7,7 @@
   {{- if or (gt (len .hostname) 253) (not (regexMatch `^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$` .hostname)) }}
     {{- fail "networkPolicy.storageEgressDomains hostname must be an exact fully qualified DNS name" }}
   {{- end }}
-  {{- if or (hasSuffix ".cluster.local" .hostname) (regexMatch `(^|\.)[^.]+\.[^.]+\.(svc|pod)(\.|$)` .hostname) }}
+  {{- if or (eq .hostname $clusterDomain) (hasSuffix (printf ".%s" $clusterDomain) .hostname) (regexMatch `(^|\.)[^.]+\.[^.]+\.(svc|pod)$` .hostname) }}
     {{- fail "networkPolicy.storageEgressDomains only supports external storage hostnames, use a cluster policy for Kubernetes Services and Pods" }}
   {{- end }}
   {{- if or (not (regexMatch "^[0-9]{1,5}$" (toJson .port))) (lt (int .port) 1) (gt (int .port) 65535) }}
