@@ -1,6 +1,7 @@
 # One image for the controller and every newly allocated worker.
 image:
   repository: amaster/browser-sandbox
+  tag: ""
   digest: ""
   pullPolicy: IfNotPresent
 imagePullSecrets: []

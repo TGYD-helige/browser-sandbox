@@ -68,7 +68,12 @@ export async function createKubernetesBackend(
     !dnsName(options.namespace) ||
     !dnsName(options.installation) ||
     !dnsName(options.ownerName) ||
-    !/^[^\s]+@sha256:[a-f0-9]{64}$/.test(options.image) ||
+    !(
+      /^[^\s@]+@sha256:[a-f0-9]{64}$/.test(options.image) ||
+      /^(?:[^/\s@]+\/)*[^/:\s@]+:(?:v[0-9]+\.[0-9]+\.[0-9]+|sha-[a-f0-9]{40})$/.test(
+        options.image,
+      )
+    ) ||
     !Number.isSafeInteger(maxExecutionMs) ||
     maxExecutionMs < 1 ||
     maxExecutionMs > 2147483647 ||

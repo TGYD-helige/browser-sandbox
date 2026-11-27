@@ -21,6 +21,37 @@ def render(*arguments, release="trial", chart=ROOT / "charts/browser-sandbox"):
 
 
 class ChartTest(unittest.TestCase):
+    def test_image_reference_is_shared_by_controller_workers_and_drain(self):
+        digest = "sha256:" + "a" * 64
+        for settings, image in (
+            ((), f"amaster/browser-sandbox@{digest}"),
+            (("--set-string", "image.digest=,image.tag=v0.2.3"), "amaster/browser-sandbox:v0.2.3"),
+            (("--set-string", "image.digest=,image.tag=sha-" + "b" * 40), "amaster/browser-sandbox:sha-" + "b" * 40),
+            (("--set-string", "image.tag=v0.2.3"), f"amaster/browser-sandbox@{digest}"),
+        ):
+            with self.subTest(settings=settings):
+                resources = render(*settings)
+                workloads = {item["kind"]: item["spec"]["template"]["spec"]["containers"][0]
+                             for item in resources if item["kind"] in ("Deployment", "Job")}
+                self.assertEqual(workloads["Deployment"]["image"], image)
+                self.assertEqual(workloads["Job"]["image"], image)
+                env = {item["name"]: item.get("value") for item in workloads["Deployment"]["env"]}
+                self.assertEqual(env["BROWSER_IMAGE"], image)
+
+    def test_missing_and_floating_image_references_fail_at_render_time(self):
+        for tag in ("", "latest", "sha-abc", "v0.2.3-rc.1"):
+            with self.subTest(tag=tag), self.assertRaises(subprocess.CalledProcessError):
+                render("--set-string", f"image.digest=,image.tag={tag}")
+
+    def test_image_reference_requires_repository(self):
+        for settings in (
+            "image.repository=",
+            "image.repository=,image.digest=,image.tag=v0.2.3",
+            "image.repository= ,image.digest=,image.tag=v0.2.3",
+        ):
+            with self.subTest(settings=settings), self.assertRaises(subprocess.CalledProcessError):
+                render("--set-string", settings)
+
     def test_active_active_matrix_uses_an_independent_journal(self):
         with tempfile.TemporaryDirectory() as directory:
             values = pathlib.Path(directory) / "values.json"

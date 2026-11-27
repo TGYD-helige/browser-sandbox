@@ -115,6 +115,7 @@ jobs:
             image.tar
             image.tar.sha256
           compression-level: 1
+          overwrite: true
           retention-days: 1
           if-no-files-found: error
 
@@ -150,6 +151,7 @@ jobs:
         with:
           name: browser-build-digest-${{ matrix.architecture }}
           path: ${{ matrix.architecture }}.txt
+          overwrite: true
           if-no-files-found: error
       - name: Remove downloaded image archive
         if: always()

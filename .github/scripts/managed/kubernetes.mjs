@@ -30,12 +30,18 @@ const cluster = process.env.TEST_K3D_CLUSTER ?? `browser-${suffix}`;
 const namespace = `browser-${suffix}`;
 const release = "trial";
 const deployment = "trial-browser";
-const image = process.env.BROWSER_IMAGE ?? "browser-sandbox:managed";
+const sourceImage = process.env.BROWSER_IMAGE ?? "browser-sandbox:managed";
+const releaseImageTag = suite === "fresh-node" ? "v0.0.0" : undefined;
+const image = releaseImageTag
+  ? `browser-sandbox-${suffix}:${releaseImageTag}`
+  : sourceImage;
 const probeImages = ["probe-startup", "probe-failure"].map(
   (variant) => `browser-sandbox-${variant}-${suffix}:fixture`,
 );
-const probeRefs = probeImages.map((name) => `docker.io/library/${name}`);
-const nextImage = `browser-sandbox:protocol-${suffix}`;
+const fixtureRefs = probeAB
+  ? probeImages.map((name) => `docker.io/library/${name}`)
+  : [];
+const nextImage = `browser-sandbox-protocol-${suffix}:fixture`;
 const clientImage =
   process.env.BROWSER_CLIENT_IMAGE ?? "browser-sandbox-client:managed";
 const kubeconfig = process.env.TEST_K3D_CLUSTER
@@ -47,7 +53,7 @@ let stage = "cluster setup";
 let installed = false;
 let hostStorageAddress;
 let clusterAttempted = false;
-let probeNodes = [];
+let fixtureNodes = [];
 let cordoned;
 let heldFinalizer;
 let extraction;
@@ -399,9 +405,16 @@ const runSuite = async () => {
       ],
       { timeout: 300000 },
     );
+  if (releaseImageTag) {
+    await run("docker", ["tag", sourceImage, image]);
+    fixtureRefs.push(`docker.io/library/${image}`);
+  }
   const candidates = [image];
   if (suite !== "journal") candidates.push(clientImage);
-  if (runSingleController) candidates.push(nextImage);
+  if (runSingleController) {
+    candidates.push(nextImage);
+    fixtureRefs.push(`docker.io/library/${nextImage}`);
+  }
   if (probeAB) {
     for (const [index, target] of ["startup", "failure"].entries()) {
       await run(
@@ -424,13 +437,13 @@ const runSuite = async () => {
       );
       const fixture = probeImages[index];
       candidates.push(fixture);
-      probeRefs.push(
+      fixtureRefs.push(
         await run("docker", ["image", "inspect", "--format", "{{.Id}}", fixture]),
       );
     }
   }
-  if (probeAB && !clusterAttempted)
-    probeNodes = nodes.map((node) => node.metadata.name);
+  if (fixtureRefs.length && !clusterAttempted)
+    fixtureNodes = nodes.map((node) => node.metadata.name);
   await run("k3d", ["image", "import", ...candidates, "-c", cluster], {
     timeout: 300000,
   });
@@ -502,7 +515,9 @@ const runSuite = async () => {
   const nextDigest = next?.digest;
   const nextRepository = next?.repository;
   const variants = probeAB ? probeImages.map(reference) : [];
-  probeRefs.push(...variants.map(({ pinned }) => pinned));
+  if (releaseImageTag) fixtureRefs.push(pinned);
+  if (next) fixtureRefs.push(next.pinned);
+  fixtureRefs.push(...variants.map(({ pinned }) => pinned));
   for (const node of nodes) {
     for (const ref of [primary, ...(next ? [next] : []), ...variants])
       await run("docker", [
@@ -573,7 +588,9 @@ const runSuite = async () => {
   await writeFile(
     values,
     JSON.stringify({
-      image: { repository, digest },
+      image: releaseImageTag
+        ? { repository, tag: releaseImageTag }
+        : { repository, digest },
       profileStore: { enabled: true },
       capacity: {
         maxWorkers: 2,
@@ -679,6 +696,10 @@ const runSuite = async () => {
     const shared = await client("hold");
     const [sharedWorker] = await pods();
     assert.equal(sharedWorker?.spec.nodeName, workerNode);
+    assert.equal(
+      sharedWorker.spec.containers[0].image,
+      releaseImageTag ? normalized : pinned,
+    );
     assert.equal(sharedWorker.spec.automountServiceAccountToken, false);
     const { securityContext } = sharedWorker.spec.containers[0];
     assert.deepEqual(securityContext.seccompProfile, { type: "Unconfined" });
@@ -1388,6 +1409,7 @@ try {
       JSON.stringify({ metadata: { finalizers: [] } }),
     ).catch(() => {});
   for (const fixture of [
+    ...(releaseImageTag ? [image] : []),
     ...(runSingleController ? [nextImage] : []),
     ...(probeAB ? probeImages : []),
   ])
@@ -1411,10 +1433,10 @@ try {
     "--wait=false",
   ).catch(() => {});
   await Promise.all(
-    probeNodes.map((node) =>
+    fixtureNodes.map((node) =>
       run(
         "docker",
-        ["exec", node, "ctr", "-n", "k8s.io", "images", "rm", ...probeRefs],
+        ["exec", node, "ctr", "-n", "k8s.io", "images", "rm", ...fixtureRefs],
         {
           timeout: 15_000,
         },
