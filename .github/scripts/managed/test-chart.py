@@ -43,6 +43,15 @@ class ChartTest(unittest.TestCase):
             with self.subTest(tag=tag), self.assertRaises(subprocess.CalledProcessError):
                 render("--set-string", f"image.digest=,image.tag={tag}")
 
+    def test_image_reference_requires_repository(self):
+        for settings in (
+            "image.repository=",
+            "image.repository=,image.digest=,image.tag=v0.2.3",
+            "image.repository= ,image.digest=,image.tag=v0.2.3",
+        ):
+            with self.subTest(settings=settings), self.assertRaises(subprocess.CalledProcessError):
+                render("--set-string", settings)
+
     def test_active_active_matrix_uses_an_independent_journal(self):
         with tempfile.TemporaryDirectory() as directory:
             values = pathlib.Path(directory) / "values.json"

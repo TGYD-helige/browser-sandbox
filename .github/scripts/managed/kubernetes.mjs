@@ -30,7 +30,11 @@ const cluster = process.env.TEST_K3D_CLUSTER ?? `browser-${suffix}`;
 const namespace = `browser-${suffix}`;
 const release = "trial";
 const deployment = "trial-browser";
-const image = process.env.BROWSER_IMAGE ?? "browser-sandbox:managed";
+const sourceImage = process.env.BROWSER_IMAGE ?? "browser-sandbox:managed";
+const releaseImageTag = suite === "fresh-node" ? "v0.0.0" : undefined;
+const image = releaseImageTag
+  ? `browser-sandbox-${suffix}:${releaseImageTag}`
+  : sourceImage;
 const probeImages = ["probe-startup", "probe-failure"].map(
   (variant) => `browser-sandbox-${variant}-${suffix}:fixture`,
 );
@@ -399,6 +403,7 @@ const runSuite = async () => {
       ],
       { timeout: 300000 },
     );
+  if (releaseImageTag) await run("docker", ["tag", sourceImage, image]);
   const candidates = [image];
   if (suite !== "journal") candidates.push(clientImage);
   if (runSingleController) candidates.push(nextImage);
@@ -573,7 +578,9 @@ const runSuite = async () => {
   await writeFile(
     values,
     JSON.stringify({
-      image: { repository, digest },
+      image: releaseImageTag
+        ? { repository, tag: releaseImageTag }
+        : { repository, digest },
       profileStore: { enabled: true },
       capacity: {
         maxWorkers: 2,
@@ -679,6 +686,10 @@ const runSuite = async () => {
     const shared = await client("hold");
     const [sharedWorker] = await pods();
     assert.equal(sharedWorker?.spec.nodeName, workerNode);
+    assert.equal(
+      sharedWorker.spec.containers[0].image,
+      releaseImageTag ? normalized : pinned,
+    );
     assert.equal(sharedWorker.spec.automountServiceAccountToken, false);
     const { securityContext } = sharedWorker.spec.containers[0];
     assert.deepEqual(securityContext.seccompProfile, { type: "Unconfined" });
@@ -1388,6 +1399,7 @@ try {
       JSON.stringify({ metadata: { finalizers: [] } }),
     ).catch(() => {});
   for (const fixture of [
+    ...(releaseImageTag ? [image] : []),
     ...(runSingleController ? [nextImage] : []),
     ...(probeAB ? probeImages : []),
   ])

@@ -7,17 +7,18 @@
 {{- $name -}}
 {{- end -}}
 {{- define "browser-sandbox.image" -}}
+{{- $repository := required "image.repository is required" (trim (.Values.image.repository | default "")) -}}
 {{- if .Values.image.digest -}}
   {{- if not (regexMatch "^sha256:[a-f0-9]{64}$" .Values.image.digest) -}}
     {{- fail "image.digest must use sha256:<64 lowercase hex digits>" -}}
   {{- end -}}
-  {{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+  {{- printf "%s@%s" $repository .Values.image.digest -}}
 {{- else -}}
   {{- $tag := .Values.image.tag | default "" -}}
   {{- if not (regexMatch "^(v[0-9]+\\.[0-9]+\\.[0-9]+|sha-[a-f0-9]{40})$" $tag) -}}
     {{- fail "set image.digest or use image.tag with vX.Y.Z or sha-<40 lowercase hex digits>" -}}
   {{- end -}}
-  {{- printf "%s:%s" .Values.image.repository $tag -}}
+  {{- printf "%s:%s" $repository $tag -}}
 {{- end -}}
 {{- end -}}
 {{- define "browser-sandbox.labels" -}}

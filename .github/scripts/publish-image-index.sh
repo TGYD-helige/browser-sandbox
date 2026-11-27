@@ -2,28 +2,44 @@
 set -euo pipefail
 read -ra names <<< "$IMAGE_NAMES"
 base_image="$REGISTRY/$NAMESPACE/${names[0]}"
-index_tag="$base_image:build-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-index"
-crane index append --docker-empty-base \
-  --manifest "$(cat amd64.txt)" --manifest "$(cat arm64.txt)" --tag "$index_tag"
-digest="$(crane digest "$index_tag")"
-if [[ ! "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
-  echo "Invalid published image digest" >&2
-  exit 1
-fi
-sha_tag="sha-$SOURCE_SHA"
-check_tag() {
-  local name="$1" tag="$2" existing
+read_digest() {
+  local name="$1" tag="$2" output
   local image="$REGISTRY/$NAMESPACE/$name"
-  if existing="$(crane digest "$image:$tag" 2>&1)"; then
-    if [[ "${existing##*$'\n'}" != "$digest" ]]; then
-      echo "Refusing to move $image:$tag to a different manifest." >&2
+  if output="$(crane digest "$image:$tag" 2>&1)"; then
+    output="${output##*$'\n'}"
+    if [[ ! "$output" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+      echo "Invalid digest for $image:$tag; publication stopped." >&2
       return 1
     fi
-    printf '%s\n' "$digest"
-  elif ! [[ "${existing##*$'\n'}" =~ ^Error:\ GET\ https?://"$REGISTRY/v2/$NAMESPACE/$name/manifests/$tag":\ (MANIFEST_UNKNOWN|NAME_UNKNOWN): ]]; then
+    printf '%s\n' "$output"
+  elif ! [[ "${output##*$'\n'}" =~ ^Error:\ GET\ https?://"$REGISTRY/v2/$NAMESPACE/$name/manifests/$tag":\ (MANIFEST_UNKNOWN|NAME_UNKNOWN): ]]; then
     echo "Unable to confirm that $image:$tag is absent; publication stopped." >&2
     return 1
   fi
+}
+
+# Keep the verified index stable across attempts of the same run.
+index_tag="build-$GITHUB_RUN_ID-$SOURCE_SHA-index"
+digest="$(read_digest "${names[0]}" "$index_tag")"
+if [[ -z "$digest" ]]; then
+  crane index append --docker-empty-base \
+    --manifest "$(cat amd64.txt)" --manifest "$(cat arm64.txt)" --tag "$base_image:$index_tag"
+  digest="$(read_digest "${names[0]}" "$index_tag")"
+  if [[ -z "$digest" ]]; then
+    echo "Published image index is missing." >&2
+    exit 1
+  fi
+fi
+
+sha_tag="sha-$SOURCE_SHA"
+check_tag() {
+  local name="$1" tag="$2" existing
+  existing="$(read_digest "$name" "$tag")" || return 1
+  if [[ -n "$existing" && "$existing" != "$digest" ]]; then
+    echo "Refusing to move $REGISTRY/$NAMESPACE/$name:$tag to a different manifest." >&2
+    return 1
+  fi
+  printf '%s' "$existing"
 }
 
 for i in "${!names[@]}"; do
