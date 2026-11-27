@@ -182,11 +182,20 @@ test("publication combines both architectures and tags the source commit, with l
     "crane",
     `printf '%s\\n' "$*" >> "$TRACE"
 if [[ "$1" == index ]]; then
-  touch staged
+  tag="\${*: -1}"
+  touch "staged-\${tag##*:}"
+fi
+if [[ "$1" == ls ]]; then
+  case "\${VERSION_STATE:-missing}" in
+    denied) exit 1 ;;
+    lookup-unavailable-existing) echo v1.0.0 ;;
+    *) echo v0.2.3 ;;
+  esac
+  exit 0
 fi
 if [[ "$1" == digest ]]; then
   if [[ "$2" == *:build-* ]]; then
-    if [[ -f staged ]]; then echo '${digest}'; exit 0; fi
+    if [[ -f "staged-\${2##*:}" ]]; then echo '${digest}'; exit 0; fi
   else
   case "\${VERSION_STATE:-missing}" in
     same) echo '${digest}'; exit 0 ;;
@@ -195,6 +204,10 @@ if [[ "$1" == digest ]]; then
     sha-conflict) if [[ "$2" == */browser-alias:sha-* ]]; then echo 'sha256:${"c".repeat(64)}'; exit 0; fi ;;
     denied) echo "Error: GET https://registry.example.com/v2/example/browser/manifests/v1.0.0: UNAUTHORIZED: authentication required" >&2; exit 1 ;;
   esac
+  fi
+  if [[ "\${DIGEST_MISSING_STYLE:-}" == generic ]]; then
+    echo 'Registry manifest lookup failed' >&2
+    exit 1
   fi
   ref="\${2#*/}"
   echo "Error: GET https://registry.example.com/v2/\${ref%:*}/manifests/\${ref##*:}: MANIFEST_UNKNOWN: manifest unknown" >&2
@@ -258,6 +271,25 @@ if [[ "$1" == copy && "\${FAIL_COPY:-false}" == true ]]; then exit 9; fi`,
     retryCalls,
     new RegExp(`^tag ${env.IMAGE}-alias@${digest} v1.0.0$`, "m"),
   );
+  await writeFile(env.TRACE, "");
+  await publish({
+    GITHUB_RUN_ID: "124",
+    DIGEST_MISSING_STYLE: "generic",
+    PUBLISH_LATEST: "false",
+  });
+  const fallbackCalls = await readFile(env.TRACE, "utf8");
+  assert.match(fallbackCalls, /^ls registry[.]example[.]com\/example\/browser$/m);
+  assert.match(fallbackCalls, /^tag .* v1[.]0[.]0$/m);
+  await writeFile(env.TRACE, "");
+  await assert.rejects(
+    publish({
+      VERSION_STATE: "lookup-unavailable-existing",
+      DIGEST_MISSING_STYLE: "generic",
+      PUBLISH_LATEST: "false",
+    }),
+    /publication stopped/,
+  );
+  assert.doesNotMatch(await readFile(env.TRACE, "utf8"), /^(copy|tag) /m);
   for (const state of ["version-conflict", "sha-conflict", "denied"]) {
     await writeFile(env.TRACE, "");
     await assert.rejects(publish({ VERSION_STATE: state }));

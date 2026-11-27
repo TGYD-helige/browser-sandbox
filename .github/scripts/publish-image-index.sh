@@ -3,7 +3,7 @@ set -euo pipefail
 read -ra names <<< "$IMAGE_NAMES"
 base_image="$REGISTRY/$NAMESPACE/${names[0]}"
 read_digest() {
-  local name="$1" tag="$2" output
+  local name="$1" tag="$2" output tags
   local image="$REGISTRY/$NAMESPACE/$name"
   if output="$(crane digest "$image:$tag" 2>&1)"; then
     output="${output##*$'\n'}"
@@ -13,6 +13,10 @@ read_digest() {
     fi
     printf '%s\n' "$output"
   elif ! [[ "${output##*$'\n'}" =~ ^Error:\ GET\ https?://"$REGISTRY/v2/$NAMESPACE/$name/manifests/$tag":\ (MANIFEST_UNKNOWN|NAME_UNKNOWN): ]]; then
+    # Some registries return a different error for an absent manifest.
+    if tags="$(crane ls "$image" 2>/dev/null)" && ! grep -Fxq -- "$tag" <<< "$tags"; then
+      return 0
+    fi
     echo "Unable to confirm that $image:$tag is absent; publication stopped." >&2
     return 1
   fi
