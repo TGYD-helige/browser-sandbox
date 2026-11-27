@@ -7,6 +7,31 @@ import { WorkerCleanupFailure } from "../dist/lifecycle-errors.js";
 
 const executionId = "11111111-1111-4111-8111-111111111111";
 const incarnation = "22222222-2222-4222-8222-222222222222";
+const releaseImage = "registry.example.com:5000/amaster/browser-sandbox:v0.2.3";
+const digestImage = `amaster/browser-sandbox@sha256:${"a".repeat(64)}`;
+const shaImage = `amaster/browser-sandbox:sha-${"b".repeat(40)}`;
+
+test("Kubernetes rejects missing and floating image references before calling its API", async () => {
+  for (const image of [
+    undefined,
+    "browser-sandbox",
+    "browser-sandbox:latest",
+    "browser-sandbox:sha-abc",
+    "browser-sandbox:v0.2.3-rc.1",
+  ]) {
+    await assert.rejects(
+      createKubernetesBackend({
+        apiServer: "http://127.0.0.1:0",
+        namespace: "test",
+        ownerName: "trial-browser-workers",
+        installation: "trial",
+        image,
+        template: { securityContext: { seccompProfile: { type: "Unconfined" } } },
+      }),
+      { message: "browser_kubernetes_configuration_invalid" },
+    );
+  }
+});
 
 test("Kubernetes creates an owned single-execution Pod and fences deletion by UID", async (t) => {
   let pod;
@@ -60,7 +85,7 @@ test("Kubernetes creates an owned single-execution Pod and fences deletion by UI
     namespace: "test",
     ownerName: "trial-browser-workers",
     installation: "trial",
-    image: `amaster/browser-sandbox@sha256:${"a".repeat(64)}`,
+    image: releaseImage,
     environment: { TIMEOUT: "10000", PRIVATE_SECRET: "never-project" },
     maxExecutionMs: 20000,
     template: {
@@ -95,10 +120,7 @@ test("Kubernetes creates an owned single-execution Pod and fences deletion by UI
   assert.equal(env.TIMEOUT, "10000");
   assert.equal(env.BROWSER_EXECUTION_ID, executionId);
   assert.equal(env.CONCURRENT, "1");
-  assert.equal(
-    pod.spec.containers[0].image,
-    `amaster/browser-sandbox@sha256:${"a".repeat(64)}`,
-  );
+  assert.equal(pod.spec.containers[0].image, releaseImage);
   await backend.remove(worker, AbortSignal.timeout(5000));
   assert.deepEqual(deleted.preconditions, { uid: "pod-uid" });
 });
@@ -111,6 +133,7 @@ async function fixture(
     createStatus,
     waitingReason,
     ownership,
+    image = digestImage,
     seccompProfile = { type: "Localhost", localhostProfile: "browser-sandbox.json" },
   } = {},
 ) {
@@ -284,7 +307,7 @@ async function fixture(
     namespace: "test",
     installation: "trial",
     ownerName: "trial-browser-workers",
-    image: `amaster/browser-sandbox@sha256:${"a".repeat(64)}`,
+    image,
     template: {
       terminationGracePeriodSeconds: 1,
       securityContext: { seccompProfile },
@@ -292,6 +315,19 @@ async function fixture(
   });
   return { backend, state };
 }
+
+test("Kubernetes preserves digest and commit SHA references on worker Pods", async (t) => {
+  for (const image of [digestImage, shaImage]) {
+    const { backend, state } = await fixture(t, { image });
+    const worker = await backend.create(
+      { executionId, incarnation },
+      AbortSignal.timeout(5000),
+    );
+    t.after(() => worker.runtime.close());
+    assert.equal(state.pod.spec.containers[0].image, image);
+    await backend.remove(worker, AbortSignal.timeout(5000));
+  }
+});
 
 test("Unconfined skips the worker profile and preserves Pod protections", async (t) => {
   const { backend, state } = await fixture(t, {

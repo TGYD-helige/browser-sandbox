@@ -181,7 +181,18 @@ test("publication combines both architectures and tags the source commit, with l
     root,
     "crane",
     `printf '%s\\n' "$*" >> "$TRACE"
-if [[ "$1" == digest ]]; then echo '${digest}'; fi
+if [[ "$1" == digest ]]; then
+  if [[ "$2" == *:build-* ]]; then echo '${digest}'; exit 0; fi
+  case "\${VERSION_STATE:-missing}" in
+    same) echo '${digest}'; exit 0 ;;
+    version-conflict) if [[ "$2" == */browser-alias:v1.0.0 ]]; then echo 'sha256:${"c".repeat(64)}'; exit 0; fi ;;
+    sha-conflict) if [[ "$2" == */browser-alias:sha-* ]]; then echo 'sha256:${"c".repeat(64)}'; exit 0; fi ;;
+    denied) echo "Error: GET https://registry.example.com/v2/example/browser/manifests/v1.0.0: UNAUTHORIZED: authentication required" >&2; exit 1 ;;
+  esac
+  ref="\${2#*/}"
+  echo "Error: GET https://registry.example.com/v2/\${ref%:*}/manifests/\${ref##*:}: MANIFEST_UNKNOWN: manifest unknown" >&2
+  exit 1
+fi
 if [[ "$1" == copy && "\${FAIL_COPY:-false}" == true ]]; then exit 9; fi`,
   );
   const publish = (overrides = {}) =>
@@ -197,6 +208,10 @@ if [[ "$1" == copy && "\${FAIL_COPY:-false}" == true ]]; then exit 9; fi`,
     assert.deepEqual(calls, [
       `index append --docker-empty-base --manifest ${env.IMAGE}@sha256:amd64 --manifest ${env.IMAGE}@sha256:arm64 --tag ${staging}`,
       `digest ${staging}`,
+      ...env.IMAGE_NAMES.split(" ").flatMap((name) => [
+        `digest ${env.REGISTRY}/${env.NAMESPACE}/${name}:v1.0.0`,
+        `digest ${env.REGISTRY}/${env.NAMESPACE}/${name}:sha-${env.SOURCE_SHA}`,
+      ]),
       ...env.IMAGE_NAMES.split(" ").flatMap((name) => {
         const image = `${env.REGISTRY}/${env.NAMESPACE}/${name}`;
         return [
@@ -214,6 +229,14 @@ if [[ "$1" == copy && "\${FAIL_COPY:-false}" == true ]]; then exit 9; fi`,
       .split("\n")
       .some((line) => line.startsWith("tag ")),
   );
+  await writeFile(env.TRACE, "");
+  await publish({ VERSION_STATE: "same", PUBLISH_LATEST: "false" });
+  assert.doesNotMatch(await readFile(env.TRACE, "utf8"), /^(copy|tag) /m);
+  for (const state of ["version-conflict", "sha-conflict", "denied"]) {
+    await writeFile(env.TRACE, "");
+    await assert.rejects(publish({ VERSION_STATE: state }));
+    assert.doesNotMatch(await readFile(env.TRACE, "utf8"), /^(copy|tag) /m);
+  }
 });
 
 test("release publication creates public releases, publishes drafts, and preserves published notes", async (t) => {

@@ -4,15 +4,17 @@ The Kubernetes backend lazily creates one bare worker Pod per execution behind o
 
 ## Install
 
-Build or select one browser-sandbox image and resolve its immutable manifest digest. The same image runs the controller and all new workers. Provision the image's generated `/opt/browser-sandbox/seccomp.json` as `browser-sandbox.json` in the kubelet seccomp directory on every eligible worker node; this profile is architecture-specific. Set `worker.securityContext.seccompProfile.localhostProfile` if your provisioned filename differs. The chart creates no node installer or worker Deployment. For pools without a per-node seccomp file, see [running workers without an outer seccomp filter](#running-workers-without-an-outer-seccomp-filter). An administrative Job runs only during uninstall, using the same pinned image without browser privileges.
+Select a browser-sandbox image by its release tag (`vX.Y.Z`), full Git commit tag (`sha-<40 lowercase hex digits>`), or manifest digest (`sha256:<64 lowercase hex digits>`). The controller, new workers, and uninstall drain Job use the same image reference. Provision the image's generated `/opt/browser-sandbox/seccomp.json` as `browser-sandbox.json` in the kubelet seccomp directory on every eligible worker node; this profile is architecture-specific. Set `worker.securityContext.seccompProfile.localhostProfile` if your provisioned filename differs. The chart creates no node installer or worker Deployment. For pools without a per-node seccomp file, see [running workers without an outer seccomp filter](#running-workers-without-an-outer-seccomp-filter).
 
 ```sh
 helm install browser charts/browser-sandbox --namespace browsers --create-namespace \
   --set image.repository=amaster/browser-sandbox \
-  --set image.digest="${BROWSER_IMAGE_DIGEST}" \
+  --set-string image.tag="${BROWSER_IMAGE_TAG}" \
   --set 'networkPolicy.apiServerCidrs[0]=10.43.0.1/32' \
   --set 'networkPolicy.apiServerCidrs[1]=192.168.1.10/32'
 ```
+
+Set `image.digest` for digest-based deployments. A configured digest takes precedence over `image.tag`; clear the digest when switching a release to a tag. Standalone Kubernetes controllers take the full reference from `BROWSER_IMAGE`. The chart and controller require an explicit release tag, commit tag, or digest and reject floating tags such as `latest`. Use tags from a registry or publication workflow that prevents reassignment. Images built before tag support require a digest for their controller's `BROWSER_IMAGE`.
 
 Use a release name that starts with a lowercase letter and contains only lowercase letters, digits and hyphens, ending with a letter or digit. Prefer names of at most 43 characters so the `-browser` base fits without truncation. Longer names retain the existing naming scheme for upgrade compatibility: the chart truncates `RELEASE-browser` to 51 characters and removes one trailing hyphen; an invalid result fails rendering. Different releases can therefore share the same generated base, and Helm rejects the resulting resource ownership conflict. Ensure generated names are unique within the namespace. No hash is appended because renaming existing Services and the stable owner ConfigMap during an upgrade could break endpoints and garbage-collect live workers.
 
@@ -22,7 +24,7 @@ The agent Service defaults to ClusterIP. A separate, always-ClusterIP `RELEASE-b
 
 ## Worker configuration
 
-Operators configure one Helm release and one image digest. `runtime` accepts only `TIMEOUT`, `TZ`, `BROWSER_STARTUP_TIMEOUT` and `LANG`; the chart rejects every other key. Controller-owned image, role, identity, credentials and listener settings cannot be overridden through this shared environment. Workers inherit the same allowlisted settings, exact `BROWSER_STORAGE_EGRESS` destinations and the non-secret `BROWSER_PROFILE_STORE_ORIGIN` derived by the controller when its store is enabled. Controller credentials, backend settings and ServiceAccount tokens are excluded. The controller reads `worker-template.json` from its configuration ConfigMap and projects only these worker settings:
+`runtime` accepts only `TIMEOUT`, `TZ`, `BROWSER_STARTUP_TIMEOUT` and `LANG`; the chart rejects every other key. Controller-owned image, role, identity, credentials and listener settings cannot be overridden through this shared environment. Workers inherit the same allowlisted settings, exact `BROWSER_STORAGE_EGRESS` destinations and the non-secret `BROWSER_PROFILE_STORE_ORIGIN` derived by the controller when its store is enabled. Controller credentials, backend settings and ServiceAccount tokens are excluded. The controller reads `worker-template.json` from its configuration ConfigMap and projects only these worker settings:
 
 | Value | Worker behavior |
 |---|---|

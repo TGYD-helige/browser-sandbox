@@ -7,10 +7,18 @@
 {{- $name -}}
 {{- end -}}
 {{- define "browser-sandbox.image" -}}
-{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" .Values.image.digest) -}}
-{{- fail "image.digest must pin the controller and worker image with sha256:<64 lowercase hex digits>" -}}
+{{- if .Values.image.digest -}}
+  {{- if not (regexMatch "^sha256:[a-f0-9]{64}$" .Values.image.digest) -}}
+    {{- fail "image.digest must use sha256:<64 lowercase hex digits>" -}}
+  {{- end -}}
+  {{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- else -}}
+  {{- $tag := .Values.image.tag | default "" -}}
+  {{- if not (regexMatch "^(v[0-9]+\\.[0-9]+\\.[0-9]+|sha-[a-f0-9]{40})$" $tag) -}}
+    {{- fail "set image.digest or use image.tag with vX.Y.Z or sha-<40 lowercase hex digits>" -}}
+  {{- end -}}
+  {{- printf "%s:%s" .Values.image.repository $tag -}}
 {{- end -}}
-{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
 {{- end -}}
 {{- define "browser-sandbox.labels" -}}
 app.kubernetes.io/name: browser-sandbox
