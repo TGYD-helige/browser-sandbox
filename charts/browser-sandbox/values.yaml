@@ -73,7 +73,7 @@ networkPolicy:
   # Exact host-issued storage destinations, shared by CNI and the trusted runtime.
   # Example: [{address: "10.42.1.2", port: 9083}]
   storageEgress: []
-  # Exact private storage hostname and TCP port pairs. Requires Cilium DNS policy.
+  # Exact storage hostnames outside the Kubernetes cluster and their TCP ports. Requires Cilium DNS policy.
   storageEgressDomains: []
   dnsNamespace: kube-system
   dnsLabels:
