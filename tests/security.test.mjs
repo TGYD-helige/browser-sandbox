@@ -85,17 +85,24 @@ test("storage egress resolves the configured origin and validates explicit endpo
   assert.deepEqual(
     await storageDestinations(
       {
-        BROWSER_STORAGE_EGRESS: JSON.stringify([{ address: "fd00::1", port: 9083 }]),
+        BROWSER_STORAGE_EGRESS: JSON.stringify([
+          { address: "fd00::1", port: 9083 },
+          { hostname: "s3.example.com", port: 443 },
+        ]),
         BROWSER_PROFILE_STORE_ORIGIN: "https://storage.example:9443/",
       },
       async (hostname, options) => {
-        assert.equal(hostname, "storage.example");
         assert.deepEqual(options, { all: true });
+        if (hostname === "s3.example.com.")
+          return [{ address: "100.64.80.160" }, { address: "100.97.57.233" }];
+        assert.equal(hostname, "storage.example");
         return [{ address: "10.42.1.2" }];
       },
     ),
     [
       { address: "fd00::1", port: 9083 },
+      { address: "100.64.80.160", port: 443 },
+      { address: "100.97.57.233", port: 443 },
       { address: "10.42.1.2", port: 9443 },
     ],
   );
@@ -104,6 +111,8 @@ test("storage egress resolves the configured origin and validates explicit endpo
     "{}",
     '[{"address":"10.0.0.0/8","port":8082}]',
     '[{"address":"127.0.0.1","port":0}]',
+    '[{"hostname":"*.example.com","port":443}]',
+    '[{"hostname":"s3.example.com","address":"100.64.80.160","port":443}]',
   ])
     await assert.rejects(
       storageDestinations({ BROWSER_STORAGE_EGRESS: value }),

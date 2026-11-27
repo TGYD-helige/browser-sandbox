@@ -21,6 +21,49 @@ def render(*arguments, release="trial", chart=ROOT / "charts/browser-sandbox"):
 
 
 class ChartTest(unittest.TestCase):
+    def test_private_storage_domain_is_scoped_to_workers_and_configured_port(self):
+        addresses = [{"address": "10.42.1.2", "port": 9083}]
+        domains = [{"hostname": "s3.example.com", "port": 443}]
+        resources = render("--set-json", "networkPolicy.storageEgress=" + json.dumps(addresses),
+                           "--set-json", "networkPolicy.storageEgressDomains=" + json.dumps(domains))
+        domain_policy = next(item["spec"] for item in resources if item["kind"] == "CiliumNetworkPolicy")
+        network_policy = next(item["spec"] for item in resources if item["metadata"]["name"] == "trial-browser-workers")
+        self.assertEqual(domain_policy["endpointSelector"], network_policy["podSelector"])
+        self.assertEqual(domain_policy["egress"][1], {
+            "toFQDNs": [{"matchName": "s3.example.com"}],
+            "toPorts": [{"ports": [{"port": "443", "protocol": "TCP"}]}],
+        })
+        self.assertEqual(network_policy["egress"][-1], {
+            "to": [{"ipBlock": {"cidr": "10.42.1.2/32"}}],
+            "ports": [{"protocol": "TCP", "port": 9083}],
+        })
+        deploy = next(item for item in resources if item["kind"] == "Deployment")
+        env = deploy["spec"]["template"]["spec"]["containers"][0]["env"]
+        self.assertEqual(json.loads(next(e["value"] for e in env if e["name"] == "BROWSER_STORAGE_EGRESS")), addresses + domains)
+        self.assertFalse(any(item["kind"] == "CiliumNetworkPolicy" for item in render()))
+        with self.assertRaises(subprocess.CalledProcessError):
+            render("--set-json", 'networkPolicy.storageEgressDomains=[{"hostname":"*.example.com","port":443}]')
+
+    def test_storage_domain_rejects_cluster_local_hostnames(self):
+        for hostname, cluster_domain in (
+            ("minio.storage.svc.cluster.local", "cluster.local"),
+            ("minio.storage.svc", "cluster.local"),
+            ("10-42-1-2.storage.pod", "cluster.local"),
+            ("minio.storage.svc.kube.internal", "kube.internal"),
+            ("10-42-1-2.storage.pod.kube.internal", "kube.internal"),
+        ):
+            with self.subTest(hostname=hostname), self.assertRaises(subprocess.CalledProcessError):
+                render("--set-string", "networkPolicy.clusterDomain=" + cluster_domain,
+                       "--set-json", "networkPolicy.storageEgressDomains=" +
+                       json.dumps([{"hostname": hostname, "port": 443}]))
+
+    def test_storage_domain_allows_external_svc_and_pod_labels(self):
+        hostnames = ["s3.prod.svc.example.com", "s3.prod.pod.example.com"]
+        resources = render("--set-json", "networkPolicy.storageEgressDomains=" +
+                           json.dumps([{"hostname": hostname, "port": 443} for hostname in hostnames]))
+        policy = next(item["spec"] for item in resources if item["kind"] == "CiliumNetworkPolicy")
+        self.assertEqual([rule["toFQDNs"][0]["matchName"] for rule in policy["egress"][1:]], hostnames)
+
     def test_image_reference_is_shared_by_controller_workers_and_drain(self):
         digest = "sha256:" + "a" * 64
         for settings, image in (

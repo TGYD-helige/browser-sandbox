@@ -69,22 +69,50 @@ export async function storageDestinations(
   environment = process.env,
   resolve = lookup,
 ): Promise<StorageDestination[]> {
-  let destinations: StorageDestination[];
+  const destinations: StorageDestination[] = [];
+  const resolveDestination = async (hostname: string, port: number) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const addresses = await Promise.race([
+      resolve(hostname, { all: true }),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(Error("timeout")), 30000);
+      }),
+    ]).finally(() => clearTimeout(timer));
+    if (!addresses.length) throw Error();
+    for (const { address } of addresses) {
+      if (!isIP(address) || destinations.length >= 64) throw Error();
+      destinations.push({ address, port });
+    }
+  };
   try {
-    destinations = JSON.parse(environment.BROWSER_STORAGE_EGRESS ?? "[]");
+    const configured = JSON.parse(environment.BROWSER_STORAGE_EGRESS ?? "[]");
+    const hostnamePattern =
+      /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
     if (
-      !Array.isArray(destinations) ||
-      destinations.length > 32 ||
-      destinations.some(
+      !Array.isArray(configured) ||
+      configured.length > 32 ||
+      configured.some(
         (item) =>
           !item ||
-          !isIP(item.address) ||
           !Number.isInteger(item.port) ||
           item.port < 1 ||
-          item.port > 65535,
+          item.port > 65535 ||
+          (item.hostname === undefined
+            ? !isIP(item.address)
+            : item.address !== undefined ||
+              typeof item.hostname !== "string" ||
+              item.hostname.length > 253 ||
+              !hostnamePattern.test(item.hostname)),
       )
     )
       throw Error();
+    for (const { address, port, hostname } of configured) {
+      if (hostname) await resolveDestination(`${hostname}.`, port);
+      else {
+        if (destinations.length >= 64) throw Error();
+        destinations.push({ address, port });
+      }
+    }
     if (environment.BROWSER_PROFILE_STORE_ORIGIN) {
       const url = new URL(environment.BROWSER_PROFILE_STORE_ORIGIN);
       if (
@@ -96,20 +124,10 @@ export async function storageDestinations(
         url.hash
       )
         throw Error();
-      let timer: ReturnType<typeof setTimeout>;
-      const addresses = await Promise.race([
-        resolve(url.hostname.replace(/^\[|\]$/g, ""), { all: true }),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(Error("timeout")), 30000);
-        }),
-      ]).finally(() => clearTimeout(timer));
-      for (const { address } of addresses) {
-        if (!isIP(address) || destinations.length >= 64) throw Error();
-        destinations.push({
-          address,
-          port: Number(url.port || (url.protocol === "https:" ? 443 : 80)),
-        });
-      }
+      await resolveDestination(
+        url.hostname.replace(/^\[|\]$/g, ""),
+        Number(url.port || (url.protocol === "https:" ? 443 : 80)),
+      );
     }
     return destinations;
   } catch {

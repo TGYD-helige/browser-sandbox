@@ -132,7 +132,7 @@ spec:
               value: {{ $value | quote }}
             {{- end }}
             - name: BROWSER_STORAGE_EGRESS
-              value: {{ .Values.networkPolicy.storageEgress | toJson | quote }}
+              value: {{ concat (default (list) .Values.networkPolicy.storageEgress) (default (list) .Values.networkPolicy.storageEgressDomains) | toJson | quote }}
             {{- if .Values.profileStore.enabled }}
             - name: BROWSER_PROFILE_STORE_ROOT
               value: /var/lib/browser-sandbox/profiles
